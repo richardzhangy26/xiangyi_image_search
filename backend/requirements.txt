@@ -48,3 +48,4 @@ python-dateutil>=2.8.2
 pandas>=2.2.0    # 数据处理
 openpyxl>=3.1.2  # Excel文件支持
 python-magic>=0.4.27  # 文件类型检测
+qiniu>=7.13.0  # 七牛云存储

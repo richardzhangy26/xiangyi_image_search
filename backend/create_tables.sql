@@ -107,6 +107,8 @@ CREATE TABLE IF NOT EXISTS product_images (
   product_id INT NOT NULL,
   image_path VARCHAR(255) NOT NULL,
   vector BLOB NOT NULL,
+  original_path TEXT,
+  oss_path TEXT,
   PRIMARY KEY (id),
   UNIQUE KEY unique_image_path (image_path),
   KEY idx_product_id (product_id),

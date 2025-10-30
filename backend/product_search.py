@@ -28,7 +28,7 @@ DB_CONFIG = {
     'port': int(os.getenv('DB_PORT', 3306)),
     'user': os.getenv('DB_USER', 'root'),
     'password': os.getenv('DB_PASSWORD', 'zhang7481592630'),
-    'database': os.getenv('DB_NAME', 'product_crm'),
+    'database': os.getenv('DB_NAME', 'xiangyipackage'),
     'charset': 'utf8mb4'
 }
 
@@ -52,7 +52,7 @@ class VectorProductIndex:
         
         # 初始化FAISS索引
         self.index = faiss.IndexFlatL2(dimension)  # L2距离的平面索引
-        self.faiss_id_to_db_id_map = {} # 用于存储product_images.id
+        self.faiss_id_to_db_id_map = [] # 用于存储product_images.id
         # 创建数据库表
         self.conn = pymysql.connect(**DB_CONFIG)
         # self._create_tables()
@@ -115,20 +115,53 @@ class VectorProductIndex:
         """获取MySQL数据库连接"""
         return pymysql.connect(**DB_CONFIG)
         
-    def _image_to_base64(self, image_path: str) -> str:
-        """将图片转换为base64格式"""
-        # 读取图片并转换为jpg格式（如果不是jpg）
+    def _image_to_base64(self, image_path: str, max_size_mb: float = 2.5) -> str:
+        """
+        将图片转换为base64格式，如果图片太大会自动压缩
+        Args:
+            image_path: 图片路径
+            max_size_mb: 最大文件大小（MB），超过此大小会压缩
+        """
+        # 读取图片
         image = Image.open(image_path)
-        if image.format != 'JPEG':
+
+        # 转换为RGB（如果需要）
+        if image.mode not in ('RGB', 'L'):
             image = image.convert('RGB')
+
+        # 先尝试以原始质量保存
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format='JPEG', quality=95)
+        img_bytes = img_byte_arr.getvalue()
+
+        # 如果图片太大，进行压缩
+        max_size_bytes = int(max_size_mb * 1024 * 1024)
+        if len(img_bytes) > max_size_bytes:
+            print(f"  图片大小 {len(img_bytes)/1024/1024:.2f}MB，需要压缩...")
+            # 计算需要缩小的比例
+            width, height = image.size
+            scale_factor = (max_size_bytes / len(img_bytes)) ** 0.5 * 0.9  # 0.9 作为安全系数
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+
+            # 调整图片大小
+            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+            # 重新保存
             img_byte_arr = io.BytesIO()
-            image.save(img_byte_arr, format='JPEG')
-            img_byte_arr = img_byte_arr.getvalue()
-        else:
-            with open(image_path, "rb") as image_file:
-                img_byte_arr = image_file.read()
-                
-        base64_image = base64.b64encode(img_byte_arr).decode('utf-8')
+            quality = 85
+            while quality > 50:
+                img_byte_arr.seek(0)
+                img_byte_arr.truncate()
+                image.save(img_byte_arr, format='JPEG', quality=quality)
+                img_bytes = img_byte_arr.getvalue()
+                if len(img_bytes) <= max_size_bytes:
+                    break
+                quality -= 5
+
+            print(f"  压缩后大小: {len(img_bytes)/1024/1024:.2f}MB，质量: {quality}")
+
+        base64_image = base64.b64encode(img_bytes).decode('utf-8')
         return f"data:image/jpeg;base64,{base64_image}"
     
     def extract_feature(self, image_path: str) -> np.ndarray:
@@ -217,9 +250,16 @@ class VectorProductIndex:
                 self.index.add(feature.reshape(1, -1))
                 
                 # 存储图片信息和向量ID的映射
+                original_path_value = image_path
                 cursor.execute(
-                    "INSERT INTO product_images (product_id, image_path, vector) VALUES (%s, %s, %s) ON CONFLICT (image_path) DO UPDATE SET product_id = %s, vector = %s",
-                    (product.id, image_path, feature.tobytes(), product.id, feature.tobytes())
+                    """
+                    INSERT INTO product_images (product_id, image_path, vector, original_path)
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE product_id = VALUES(product_id),
+                                            vector = VALUES(vector),
+                                            original_path = VALUES(original_path)
+                    """,
+                    (product.id, image_path, feature.tobytes(), original_path_value)
                 )
                 
                 self.conn.commit()
@@ -255,8 +295,12 @@ class VectorProductIndex:
                 if vector_id == -1:  # 没有找到匹配的向量
                     continue
                     
-                # 查询匹配图片的商品信息 (vector_id 是从0开始的索引，而数据库ID从1开始)
-                product_image = ProductImage.query.filter_by(id=int(vector_id) + 1).first()
+                faiss_idx = int(vector_id)
+                if faiss_idx < 0 or faiss_idx >= len(self.faiss_id_to_db_id_map):
+                    continue
+
+                product_image_id = self.faiss_id_to_db_id_map[faiss_idx]
+                product_image = ProductImage.query.get(product_image_id)
                 
                 if product_image:
                     # 获取关联的产品
@@ -267,7 +311,9 @@ class VectorProductIndex:
                         results.append({
                             'product_id': product.id,
                             'similarity': similarity_score,
-                            'image_path': product_image.image_path
+                            'image_path': product_image.image_path,
+                            'original_path': product_image.original_path,
+                            'oss_path': product_image.oss_path
                         })
             
         except Exception as e:
@@ -314,7 +360,7 @@ class VectorProductIndex:
             with self.conn.cursor(pymysql.cursors.DictCursor) as cursor:
                 # 为 IN 子句构建占位符
                 placeholders = ','.join(['%s'] * len(product_images_ids_to_fetch))
-                sql = f"SELECT id, product_id, image_path FROM product_images WHERE id IN ({placeholders})"
+                sql = f"SELECT id, product_id, image_path, original_path,oss_path FROM product_images WHERE id IN ({placeholders})"
                 
                 cursor.execute(sql, tuple(product_images_ids_to_fetch))
                 db_rows = cursor.fetchall()
@@ -328,6 +374,8 @@ class VectorProductIndex:
                         final_results.append({
                             'product_id': row['product_id'],       # products.id
                             'image_path': row['image_path'], # product_images.image_path
+                            'original_path': row.get('original_path') or row['image_path'],
+                            'oss_path': row.get('oss_path'),
                             'similarity': similarity
                         })
         except pymysql.Error as e:
@@ -347,6 +395,10 @@ class VectorProductIndex:
     def load_index(self, index_path: str):
         """从文件加载FAISS索引"""
         self.index = faiss.read_index(index_path)
+    
+    def refresh_from_database(self):
+        """重新从数据库加载向量并刷新内存中的索引。"""
+        self._load_vectors()
 
     def __del__(self):
         if hasattr(self, 'conn'):

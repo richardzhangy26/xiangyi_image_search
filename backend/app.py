@@ -1,13 +1,21 @@
 import os
-from flask import Flask, send_from_directory, request, jsonify
+from flask import Flask, send_from_directory, request, jsonify, abort
 from flask_cors import CORS
 from pathlib import Path
 from models import db
 from blueprints.customers import customers_bp
 from blueprints.products import products_bp
 from blueprints.orders import orders_bp
+from blueprints.product_search import product_search_bp
 from product_search import VectorProductIndex
-
+DB_CONFIG = {
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'port': int(os.getenv('DB_PORT', 3306)),
+    'user': os.getenv('DB_USER', 'root'),
+    'password': os.getenv('DB_PASSWORD', 'zhang7481592630'),
+    'database': os.getenv("DB_NAME", "xiangyipackage"),
+    'charset': 'utf8mb4'
+}
 def create_app(config_name='development'):
     app = Flask(__name__)
     
@@ -16,14 +24,12 @@ def create_app(config_name='development'):
         app.config['TESTING'] = True
         app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
     else:
-        # 从环境变量获取数据库配置
-        db_host = os.getenv('DB_HOST', 'localhost')
-        db_port = os.getenv('DB_PORT', '3306')
-        db_name = os.getenv('DB_NAME', 'product_crm')
-        db_user = os.getenv('DB_USER', 'root')
-        db_password = os.getenv('DB_PASSWORD', '')
-        
-        app.config['SQLALCHEMY_DATABASE_URI'] = f'mysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}'
+        # 使用统一的数据库配置
+        app.config['SQLALCHEMY_DATABASE_URI'] = (
+            f"mysql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
+            f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+            f"?charset={DB_CONFIG['charset']}"
+        )
     
     # 配置CORS
     CORS(app, resources={
@@ -44,6 +50,10 @@ def create_app(config_name='development'):
     app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
     app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    app.config['DATASET_ROOT'] = os.getenv(
+        'DATASET_ROOT',
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', '摄像师拍摄素材')
+    )
     
     # 确保上传目录存在
     if not app.config['TESTING']:
@@ -59,14 +69,10 @@ def create_app(config_name='development'):
 
     # 初始化向量索引
     if not app.config['TESTING']:
+        # VectorProductIndex 初始化时会自动从数据库加载向量
+        # 不再使用文件持久化，因为数据库是唯一的数据源
         product_index = VectorProductIndex()
-        # 如果索引文件存在，加载它
-        if os.path.exists(app.config['INDEX_PATH']):
-            try:
-                product_index.load_index(app.config['INDEX_PATH'])
-                app.logger.info(f"已加载向量索引: {app.config['INDEX_PATH']}")
-            except Exception as e:
-                app.logger.error(f"加载向量索引时出错: {e}")
+        app.logger.info(f"向量索引已从数据库加载，共 {product_index.index.ntotal} 个向量")
         app.config['PRODUCT_INDEX'] = product_index
         
         # 确保向量索引目录存在
@@ -76,12 +82,42 @@ def create_app(config_name='development'):
     app.register_blueprint(customers_bp)
     app.register_blueprint(products_bp)
     app.register_blueprint(orders_bp)
+    app.register_blueprint(product_search_bp)
     
     # 添加静态文件路由
     @app.route('/uploads/<path:filename>')
     def serve_upload(filename):
         return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-    
+
+    @app.route('/dataset-images/<path:filename>')
+    def serve_dataset_image(filename):
+        dataset_root = app.config.get('DATASET_ROOT')
+        if not dataset_root or not os.path.isdir(dataset_root):
+            abort(404)
+        safe_root = os.path.realpath(dataset_root)
+        requested_path = os.path.realpath(os.path.join(dataset_root, filename))
+        if not requested_path.startswith(safe_root) or not os.path.isfile(requested_path):
+            abort(404)
+        directory, basename = os.path.split(requested_path)
+        return send_from_directory(directory, basename)
+
+    # 健康检查接口
+    @app.route('/api/health', methods=['GET'])
+    def health_check():
+        """健康检查接口,用于 Docker 容器健康检查"""
+        try:
+            # 检查数据库连接
+            db.session.execute('SELECT 1')
+            return jsonify({
+                'status': 'healthy',
+                'database': 'connected'
+            }), 200
+        except Exception as e:
+            return jsonify({
+                'status': 'unhealthy',
+                'error': str(e)
+            }), 503
+
     return app
 
 app = create_app()

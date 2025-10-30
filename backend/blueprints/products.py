@@ -139,7 +139,8 @@ def add_product():
                         product_image = ProductImage(
                             product_id=product_id,
                             image_path=good_img_url['url'],
-                            vector=feature
+                            vector=feature.tobytes(),
+                            original_path=image_path
                         )
                         db.session.add(product_image)
                     db.session.commit()
@@ -333,21 +334,30 @@ def batch_delete_products():
 @cross_origin()
 def search_products():
     try:
+        print("=" * 60)
+        print("products.py: search_products() 被调用")
         # 检查是否配置了向量搜索
         if 'PRODUCT_INDEX' not in current_app.config:
+            print("ERROR: PRODUCT_INDEX 未配置")
             return jsonify({'error': '向量搜索未配置'}), 500
         product_index = current_app.config['PRODUCT_INDEX']
-        import pdb;pdb.set_trace()
+        print(f"product_index.index.ntotal = {product_index.index.ntotal}")
+        print(f"len(faiss_id_to_db_id_map) = {len(product_index.faiss_id_to_db_id_map)}")
         # 处理图片上传
         if 'image' in request.files:
             file = request.files['image']
+            print(f"接收到图片文件: {file.filename}")
             if file and allowed_file(file.filename):
                 filename = secure_filename(file.filename)
                 filepath = os.path.join(current_app.config['UPLOAD_FOLDER'], filename)
                 file.save(filepath)
-              
+                print(f"图片已保存到: {filepath}")
+
                 # 使用向量索引搜索相似产品
+                print("开始搜索相似产品...")
                 results = product_index.search_similar_images(filepath, top_k=10)
+                print(f"搜索结果数量: {len(results)}")
+                print("=" * 60)
   
                 # 清理上传的文件
                 os.remove(filepath)
@@ -361,6 +371,7 @@ def search_products():
                 products_dict = {p.id: p for p in products}
 
                 temp_product_list = [] # 临时列表，可能包含重复的 product_id
+        
                 for result in results:
                     product_id = result.get('product_id')
                     product = products_dict.get(product_id)
@@ -371,7 +382,9 @@ def search_products():
                             'description': product.description,
                             'price': product.price, 
                             'similarity': result.get('similarity'),
-                            'image_path': result.get('image_path') 
+                            'image_path': result.get('image_path'),
+                            'original_path': result.get('original_path'),
+                            'oss_path': result.get('oss_path')
                         }
                         temp_product_list.append(product_data)
                 
@@ -769,13 +782,14 @@ def _add_images_to_vector_index(product_id, good_img_urls):
                 continue
             
             try:
-                feature = product_index.extract_feature(filesystem_path)
-                product_image_record = ProductImage(
-                    product_id=product_id,
-                    image_path=web_path,  # 这是图片的 web 路径
-                    vector=feature
-                )
-                images_to_index.append(product_image_record)
+                    feature = product_index.extract_feature(filesystem_path)
+                    product_image_record = ProductImage(
+                        product_id=product_id,
+                        image_path=web_path,  # 这是图片的 web 路径
+                        vector=feature.tobytes(),
+                        original_path=filesystem_path
+                    )
+                    images_to_index.append(product_image_record)
             except Exception as feature_exc:
                 current_app.logger.error(f"Error extracting feature for image {filesystem_path} of product {product_id}: {feature_exc}")
                 continue # 继续处理其他图片

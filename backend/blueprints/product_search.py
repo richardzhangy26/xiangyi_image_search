@@ -8,8 +8,12 @@ from product_search import VectorProductIndex, ProductInfo
 
 product_search_bp = Blueprint('product_search', __name__)
 
-# 初始化产品搜索索引
-product_index = VectorProductIndex()
+def get_product_index():
+    """获取或创建产品索引实例"""
+    if 'PRODUCT_INDEX' not in current_app.config:
+        current_app.logger.info("创建新的产品索引实例")
+        current_app.config['PRODUCT_INDEX'] = VectorProductIndex()
+    return current_app.config['PRODUCT_INDEX']
 
 def allowed_file(filename):
     """检查文件扩展名是否允许"""
@@ -94,9 +98,15 @@ def search_products():
         os.makedirs(os.path.dirname(query_image_path), exist_ok=True)
         file.save(query_image_path)
         
+        # 获取产品索引实例
+        product_index = get_product_index()
+
         # 搜索相似商品
         top_k = int(request.form.get('top_k', 5))
+        current_app.logger.info(f"搜索图片: {query_image_path}, top_k={top_k}")
+        current_app.logger.info(f"索引中的向量数量: {product_index.index.ntotal}")
         results = product_index.search(query_image_path, top_k)
+        current_app.logger.info(f"找到 {len(results)} 个结果")
         
         return jsonify({
             'message': '搜索成功',

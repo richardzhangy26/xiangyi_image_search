@@ -4,7 +4,7 @@ import json
 
 class Product(db.Model):
     __tablename__ = 'products'
-    id = db.Column(db.Integer, primary_key=True, autoincrement=False)
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     name = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, nullable=True)
     price = db.Column(db.Float, nullable=False)
@@ -138,6 +138,8 @@ class ProductImage(db.Model):
     product_id = db.Column(db.Integer, db.ForeignKey('products.id', ondelete='CASCADE'), nullable=False)
     image_path = db.Column(db.String(255), nullable=False, unique=True)
     vector = db.Column(db.LargeBinary, nullable=False)  # BLOB类型用于存储向量
+    original_path = db.Column(db.Text, nullable=True)  # 图片的原始文件路径
+    oss_path = db.Column(db.Text, nullable=True)  # OSS 路径
     
     # 建立与Product的关系
     product = db.relationship('Product', backref=db.backref('images', lazy=True, cascade='all, delete-orphan'))
@@ -150,7 +152,9 @@ class ProductImage(db.Model):
         return {
             'id': self.id,
             'product_id': self.product_id,
-            'image_path': self.image_path
+            'image_path': self.image_path,
+            'original_path': self.original_path,
+            'oss_path': self.oss_path
         }
     
     @staticmethod

@@ -1,35 +1,74 @@
-FROM python:3.9-bullseye
+# 多阶段构建 - 构建阶段
+FROM python:3.11-slim AS builder
 
-WORKDIR /app
+WORKDIR /build
 
-# 使用中科大源
-RUN echo "deb https://mirrors.ustc.edu.cn/debian/ bullseye main contrib non-free" > /etc/apt/sources.list && \
-    echo "deb https://mirrors.ustc.edu.cn/debian/ bullseye-updates main contrib non-free" >> /etc/apt/sources.list && \
-    echo "deb https://mirrors.ustc.edu.cn/debian/ bullseye-backports main contrib non-free" >> /etc/apt/sources.list && \
-    echo "deb https://mirrors.ustc.edu.cn/debian-security/ bullseye-security main contrib non-free" >> /etc/apt/sources.list
-
-# Install system dependencies
+# 安装构建依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
     default-libmysqlclient-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file
+# 创建虚拟环境
+RUN python -m venv /opt/venv
+
+# 复制依赖文件
 COPY requirements.txt .
 
-# 使用豆瓣 PyPI 镜像源安装依赖，添加信任标志
-RUN pip install -r requirements.txt
+# 使用 venv 中的 pip 安装依赖
+# 这能确保所有包和可执行文件都在 /opt/venv 中
+RUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application
+# -------------------------------------------------------------------
+
+# 生产阶段 - 精简镜像
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    default-libmysqlclient-dev \
+    libgomp1 \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# 从构建阶段复制虚拟环境
+COPY --from=builder /opt/venv /opt/venv
+
+# 创建非 root 用户运行应用
+RUN useradd -m -s /bin/bash -u 1000 appuser && \
+    mkdir -p /app/data/product_search/images \
+             /app/data/product_search/db \
+             /app/data/product_search/index \
+             /app/uploads
+
+# 复制应用代码
+# 我们稍后会 chown 整个 /app 目录
 COPY . .
 
-# Create necessary directories
-RUN mkdir -p data/product_search/images data/product_search/db data/product_search/index
+# 更改 /app 和 /opt/venv 的所有權給 appuser
+# 這是解決權限問題的關鍵步驟
+RUN chown -R appuser:appuser /app && \
+    chown -R appuser:appuser /opt/venv
 
-# Expose the port the app runs on
+# 切换到非 root 用户
+USER appuser
+
+# 将 venv 的 bin 目录添加到 PATH
+# 这样 CMD 才能找到 gunicorn
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 暴露端口
 EXPOSE 5000
 
+# 健康检查
+# 注意：现在它會使用 venv 中的 python 和 requests
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:5000/api/health', timeout=5)" || exit 1
 
-# Command to run the application
-CMD ["python", "app.py"]
+# 使用 Gunicorn 运行生产环境应用
+# 由於 PATH 已經設定，系統會自動找到 /opt/venv/bin/gunicorn
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "--threads", "2", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-", "app:app"]

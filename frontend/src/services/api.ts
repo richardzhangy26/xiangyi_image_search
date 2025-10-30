@@ -45,6 +45,7 @@ export interface SearchResult extends ProductInfo {
   similarity: number;
   image_path: string;
   original_path?: string;
+  oss_path: string;
 }
 
 export interface ProductDetails extends ProductInfo {

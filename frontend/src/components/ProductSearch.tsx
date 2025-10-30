@@ -352,8 +352,8 @@ export const ProductSearch: React.FC = () => {
               >
                 <div className="w-full h-48 bg-gray-100 flex items-center justify-center">
                   <img
-                    src={getImageUrl(result.image_path)}
-                    alt={result.image_path ? `缩略图 ${result.id}` : '缩略图'}
+                    src={getImageUrl(result.oss_path)}
+                    alt={result.oss_path ? `缩略图 ${result.id}` : '缩略图'}
                     className="max-w-full max-h-full object-contain"
                   />
                 </div>
@@ -365,6 +365,16 @@ export const ProductSearch: React.FC = () => {
                   <p className="text-sm text-gray-600 mb-2">
                     相似度: {(result.similarity * 100).toFixed(2)}%
                   </p>
+                  {result.original_path && (
+                    <p className="text-xs text-gray-500 break-all mb-2">
+                      原始路径: {result.original_path}
+                    </p>
+                  )}
+                  {result.oss_path && (
+                    <p className="text-xs text-gray-500 break-all mb-2">
+                      OSS路径: {result.oss_path}
+                    </p>
+                  )}
                   <p 
                     className="text-lg font-bold text-blue-600 cursor-pointer hover:bg-blue-50 px-2 py-1 rounded transition-colors"
                     onClick={(e) => {

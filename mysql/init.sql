@@ -1,6 +1,9 @@
--- 创建数据库
-CREATE DATABASE IF NOT EXISTS product_crm;
-USE product_crm;
+-- 初始化数据库和表结构
+-- 该脚本会在 MySQL 容器首次启动时自动执行
+
+-- 设置字符集
+SET NAMES utf8mb4;
+SET CHARACTER SET utf8mb4;
 
 -- 创建客户表
 CREATE TABLE IF NOT EXISTS customers (
@@ -11,58 +14,89 @@ CREATE TABLE IF NOT EXISTS customers (
     default_address TEXT,
     address_history JSON,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP
-);
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    balance DECIMAL(10,2) NOT NULL DEFAULT 0 COMMENT '客户余额',
+    INDEX idx_name (name),
+    INDEX idx_phone (phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 创建产品表
 CREATE TABLE IF NOT EXISTS products (
-    id INT AUTO_INCREMENT PRIMARY KEY,
+    id INT PRIMARY KEY,
     name VARCHAR(200) NOT NULL,
     description TEXT,
     price FLOAT NOT NULL,
     sale_price FLOAT,
-    product_code VARCHAR(50),
-    pattern VARCHAR(100),
-    skirt_length VARCHAR(50),
-    clothing_length VARCHAR(50),
-    style VARCHAR(50),
-    pants_length VARCHAR(50),
-    sleeve_length VARCHAR(50),
-    fashion_elements VARCHAR(100),
-    craft VARCHAR(100),
-    launch_season VARCHAR(50),
-    main_material VARCHAR(100),
-    color VARCHAR(100),
-    size VARCHAR(100),
-    size_img TEXT,
-    good_img TEXT,
-    factory_name VARCHAR(200),
-    image_url VARCHAR(255),
-    image_path VARCHAR(255),
-    oss_path VARCHAR(255),
+
+    -- 产品详细信息
+    product_code VARCHAR(50) COMMENT '货号',
+    pattern VARCHAR(100) COMMENT '图案',
+    skirt_length VARCHAR(50) COMMENT '裙长',
+    clothing_length VARCHAR(50) COMMENT '衣长',
+    style VARCHAR(50) COMMENT '风格',
+    pants_length VARCHAR(50) COMMENT '裤长',
+    sleeve_length VARCHAR(50) COMMENT '袖长',
+    fashion_elements VARCHAR(100) COMMENT '流行元素',
+    craft VARCHAR(100) COMMENT '工艺',
+    launch_season VARCHAR(50) COMMENT '上市年份/季节',
+    main_material VARCHAR(100) COMMENT '主面料成分',
+    color VARCHAR(100) COMMENT '颜色',
+    size VARCHAR(100) COMMENT '尺码',
+
+    -- 图片信息
+    size_img TEXT COMMENT '尺码图片URL列表，JSON格式',
+    good_img TEXT COMMENT '商品图片URL列表，JSON格式',
+    factory_name VARCHAR(200) COMMENT '工厂名称',
+
+    -- OSS相关字段
+    image_url VARCHAR(255) COMMENT '主图URL',
+    image_path VARCHAR(255) COMMENT '本地图片路径',
+    oss_path VARCHAR(255) COMMENT 'OSS路径',
+    sales_status VARCHAR(20) NOT NULL DEFAULT 'on_sale' COMMENT '销售状态：sold_out-售罄, on_sale-在售, pre_sale-预售',
+
+    -- 时间戳
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP
-);
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    INDEX idx_product_code (product_code),
+    INDEX idx_sales_status (sales_status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 创建订单表
 CREATE TABLE IF NOT EXISTS orders (
     id INT AUTO_INCREMENT PRIMARY KEY,
-    order_number VARCHAR(50) NOT NULL UNIQUE,
-    customer_id INT NOT NULL,
-    total_amount DECIMAL(10, 2) NOT NULL,
-    status VARCHAR(50) NOT NULL DEFAULT 'pending',
-    payment_status VARCHAR(50) DEFAULT 'unpaid',
-    shipping_address TEXT NOT NULL,
-    products JSON,
-    customer_notes TEXT,
-    internal_notes TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NULL ON UPDATE CURRENT_TIMESTAMP,
-    paid_at TIMESTAMP NULL,
-    shipped_at TIMESTAMP NULL,
-    completed_at TIMESTAMP NULL,
-    FOREIGN KEY (customer_id) REFERENCES customers(id)
-);
+    order_number VARCHAR(50) NOT NULL UNIQUE COMMENT '订单编号',
+    customer_id INT NOT NULL COMMENT '客户ID',
+
+    -- 订单基本信息
+    total_amount DECIMAL(10, 2) NOT NULL COMMENT '订单总金额',
+    status VARCHAR(50) NOT NULL DEFAULT 'pending' COMMENT '订单状态：pending-待处理, processing-处理中, completed-已完成, cancelled-已取消',
+    payment_status VARCHAR(50) DEFAULT 'unpaid' COMMENT '支付状态：unpaid-未支付, partial-部分支付, paid-已支付',
+    shipping_address TEXT NOT NULL COMMENT '收货地址',
+
+    -- 产品信息 (JSON格式存储多个产品)
+    products JSON COMMENT '产品信息',
+
+    -- 备注信息
+    customer_notes TEXT COMMENT '客户备注',
+    internal_notes TEXT COMMENT '内部备注',
+
+    -- 时间信息
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    paid_at TIMESTAMP NULL COMMENT '支付时间',
+    shipped_at TIMESTAMP NULL COMMENT '发货时间',
+    completed_at TIMESTAMP NULL COMMENT '完成时间',
+
+    -- 外键约束
+    FOREIGN KEY (customer_id) REFERENCES customers(id),
+
+    -- 索引
+    INDEX idx_order_number (order_number),
+    INDEX idx_customer_id (customer_id),
+    INDEX idx_status (status),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 创建产品图片表
 CREATE TABLE IF NOT EXISTS product_images (
@@ -70,7 +104,22 @@ CREATE TABLE IF NOT EXISTS product_images (
     product_id INT NOT NULL,
     image_path VARCHAR(255) NOT NULL,
     vector BLOB NOT NULL,
+    original_path TEXT,
+    oss_path TEXT,
     PRIMARY KEY (id),
     UNIQUE KEY unique_image_path (image_path),
-    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
-);
+    KEY idx_product_id (product_id),
+    CONSTRAINT fk_product_images_product FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 创建客户余额交易表
+CREATE TABLE IF NOT EXISTS balance_transactions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    customer_id INT NOT NULL COMMENT '客户ID',
+    amount DECIMAL(10,2) NOT NULL COMMENT '交易金额，正数为充值，负数为消费',
+    note TEXT COMMENT '备注',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
+    INDEX idx_customer_id (customer_id),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

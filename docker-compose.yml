@@ -1,26 +1,39 @@
-version: '3.8'
-
 services:
+  # MySQL 数据库
   db:
     image: mysql:8.0
     container_name: fashion-crm-db
     environment:
-      - MYSQL_ROOT_PASSWORD=${DB_PASSWORD}
-      - MYSQL_DATABASE=${DB_NAME}
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_CHARACTER_SET_SERVER: utf8mb4
+      MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
+      TZ: Asia/Shanghai
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
       - ./mysql:/docker-entrypoint-initdb.d
-    restart: always
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - app-network
+    restart: unless-stopped
 
+  # Flask 后端服务
   backend:
-    build: ./backend
-    image: richardzhangy26/fashion-crm-backend:latest
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: fashion-crm-backend:latest
     container_name: fashion-crm-backend
     environment:
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DB_HOST=db
       - DB_PORT=3306
@@ -31,28 +44,60 @@ services:
       - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET}
       - OSS_ENDPOINT=${OSS_ENDPOINT}
       - OSS_BUCKET_NAME=${OSS_BUCKET_NAME}
+      - FLASK_ENV=production
+      - TZ=Asia/Shanghai
     ports:
-      - "5000:5000"
+      - "0.0.0.0:5000:5000"
     volumes:
       - upload_data:/app/uploads
       - vector_data:/app/data
     depends_on:
-      - db
-    restart: always
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - app-network
+    restart: unless-stopped
 
+  # React 前端服务
   frontend:
-    build: ./frontend
-    image: richardzhangy26/fashion-crm-frontend:latest
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: fashion-crm-frontend:latest
     container_name: fashion-crm-frontend
     ports:
-      - "80:80"
+      - "0.0.0.0:80:80"
     environment:
       - VITE_API_BASE_URL=${VITE_API_BASE_URL}
     depends_on:
-      - backend
-    restart: always
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - app-network
+    restart: unless-stopped
 
+# 持久化存储卷
 volumes:
   mysql_data:
+    driver: local
   upload_data:
+    driver: local
   vector_data:
+    driver: local
+
+# 网络配置
+networks:
+  app-network:
+    driver: bridge

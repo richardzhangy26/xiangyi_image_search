@@ -691,7 +691,8 @@ export const ProductUpload: React.FC = () => {
       title: '销售价',
       dataIndex: 'sale_price',
       key: 'sale_price',
-      render: (price: number) => `¥${price.toFixed(2)}`,
+      render: (price?: number | null) =>
+        typeof price === 'number' ? `¥${price.toFixed(2)}` : '--',
     },
     {
       title: '工厂名称',
@@ -992,7 +993,6 @@ export const ProductUpload: React.FC = () => {
                 });
                 return false; // 阻止默认删除行为
               }}
-              defaultFileList={form.getFieldValue('good_img')}
               itemRender={(originNode, file, fileList, actions) => {
                 return (
                   <div style={{ 

@@ -1,7 +1,10 @@
 services:
   # MySQL 数据库
   db:
-    image: mysql:8.0
+    build:
+      context: ./mysql
+      dockerfile: Dockerfile
+    image: fashion-crm-db:latest
     container_name: fashion-crm-db
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
@@ -13,7 +16,6 @@ services:
       - "127.0.0.1:3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
-      - ./mysql:/docker-entrypoint-initdb.d
     command: --default-authentication-plugin=mysql_native_password
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_PASSWORD}"]
@@ -49,8 +51,8 @@ services:
     ports:
       - "0.0.0.0:5000:5000"
     volumes:
-      - upload_data:/app/uploads
-      - vector_data:/app/data
+      - ./backend/uploads:/app/uploads
+      - ./backend/data:/app/data
     depends_on:
       db:
         condition: service_healthy
@@ -91,10 +93,6 @@ services:
 # 持久化存储卷
 volumes:
   mysql_data:
-    driver: local
-  upload_data:
-    driver: local
-  vector_data:
     driver: local
 
 # 网络配置

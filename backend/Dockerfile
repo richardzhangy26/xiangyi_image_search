@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 # 多阶段构建 - 构建阶段
 FROM python:3.11-slim AS builder
 
@@ -35,9 +37,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# 从构建阶段复制虚拟环境
-COPY --from=builder /opt/venv /opt/venv
-
 # 创建非 root 用户运行应用
 RUN useradd -m -s /bin/bash -u 1000 appuser && \
     mkdir -p /app/data/product_search/images \
@@ -45,14 +44,11 @@ RUN useradd -m -s /bin/bash -u 1000 appuser && \
              /app/data/product_search/index \
              /app/uploads
 
-# 复制应用代码
-# 我们稍后会 chown 整个 /app 目录
-COPY . .
+# 复制应用代码并直接赋予正确的所有权，避免额外 chown
+COPY --chown=appuser:appuser . /app
 
-# 更改 /app 和 /opt/venv 的所有權給 appuser
-# 這是解決權限問題的關鍵步驟
-RUN chown -R appuser:appuser /app && \
-    chown -R appuser:appuser /opt/venv
+# 从构建阶段复制虚拟环境，同样保留权限
+COPY --from=builder --chown=appuser:appuser /opt/venv /opt/venv
 
 # 切换到非 root 用户
 USER appuser

@@ -26,3 +26,12 @@ ENV/
 .vscode/
 *.swp
 *.swo
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.heic
+
+data/
+uploads/

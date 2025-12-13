@@ -8,7 +8,7 @@ import csv
 import io
 import time
 from product_search import VectorProductIndex# 导入向量搜索和产品信息
-from models import db, Product,ProductImage,Order# 导入Product模型
+from models import db, Product,ProductImage# 导入Product模型
 from .oss import get_oss_client  # 导入OSS客户端
 import hashlib
 import uuid

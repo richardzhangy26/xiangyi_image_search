@@ -28,18 +28,21 @@ DB_CONFIG = {
     'port': int(os.getenv('DB_PORT', 3306)),
     'user': os.getenv('DB_USER', 'root'),
     'password': os.getenv('DB_PASSWORD', 'zhang7481592630'),
-    'database': os.getenv('DB_NAME', 'xiangyipackage'),
+    'database': os.getenv('DB_NAME', 'xiangyipackage_test'),
     'charset': 'utf8mb4'
 }
 
 @dataclass
 class ProductInfo:
-    """商品信息数据类"""
-    id: int
-    name: str
-    attributes: Dict[str, Any]  # 存储颜色、尺寸等属性
-    price: float
-    description: str
+    """电子产品配件信息数据类"""
+    model_number: str  # 型号（主键）
+    photographer_file: str
+    alibaba_product_url: str
+    category: str
+    spec_cn: Optional[str] = None
+    spec_en: Optional[str] = None
+    product_size: Optional[str] = None
+    package_size: Optional[str] = None
 
 class VectorProductIndex:
     def __init__(self, dimension: int = 1024):  # DashScope embedding维度为1024
@@ -228,40 +231,53 @@ class VectorProductIndex:
         """
         try:
             with self.conn.cursor() as cursor:
-                # 存储商品信息
+                # 存储商品信息（MySQL语法，使用ON DUPLICATE KEY UPDATE）
                 cursor.execute(
-                    "INSERT INTO products (name, attributes, price, description) VALUES (%s, %s, %s, %s) ON CONFLICT (id) DO UPDATE SET name = %s, attributes = %s, price = %s, description = %s",
+                    """
+                    INSERT INTO products (
+                        model_number, photographer_file, alibaba_product_url, category,
+                        spec_cn, spec_en, product_size, package_size
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        photographer_file = VALUES(photographer_file),
+                        alibaba_product_url = VALUES(alibaba_product_url),
+                        category = VALUES(category),
+                        spec_cn = VALUES(spec_cn),
+                        spec_en = VALUES(spec_en),
+                        product_size = VALUES(product_size),
+                        package_size = VALUES(package_size)
+                    """,
                     (
-                        product.name,
-                        json.dumps(product.attributes),
-                        product.price,
-                        product.description,
-                        product.name,
-                        json.dumps(product.attributes),
-                        product.price,
-                        product.description
+                        product.model_number,
+                        product.photographer_file,
+                        product.alibaba_product_url,
+                        product.category,
+                        product.spec_cn,
+                        product.spec_en,
+                        product.product_size,
+                        product.package_size
                     )
                 )
-                
+
                 # 提取并存储图片特征
                 feature = self.extract_feature(image_path)
-                
+
                 # 批量添加到FAISS索引
                 self.index.add(feature.reshape(1, -1))
-                
+
                 # 存储图片信息和向量ID的映射
                 original_path_value = image_path
                 cursor.execute(
                     """
-                    INSERT INTO product_images (product_id, image_path, vector, original_path)
+                    INSERT INTO product_images (model_number, image_path, vector, original_path)
                     VALUES (%s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE product_id = VALUES(product_id),
+                    ON DUPLICATE KEY UPDATE model_number = VALUES(model_number),
                                             vector = VALUES(vector),
                                             original_path = VALUES(original_path)
                     """,
-                    (product.id, image_path, feature.tobytes(), original_path_value)
+                    (product.model_number, image_path, feature.tobytes(), original_path_value)
                 )
-                
+
                 self.conn.commit()
         except pymysql.Error as e:
             print(f"添加商品时发生错误: {e}")
@@ -305,11 +321,11 @@ class VectorProductIndex:
                 if product_image:
                     # 获取关联的产品
                     product = product_image.product
-                    
+
                     if product:
                         similarity_score = float(1 / (1 + distance)) # 确保转换为原生 float
                         results.append({
-                            'product_id': product.id,
+                            'model_number': product.model_number,
                             'similarity': similarity_score,
                             'image_path': product_image.image_path,
                             'original_path': product_image.original_path,
@@ -360,19 +376,19 @@ class VectorProductIndex:
             with self.conn.cursor(pymysql.cursors.DictCursor) as cursor:
                 # 为 IN 子句构建占位符
                 placeholders = ','.join(['%s'] * len(product_images_ids_to_fetch))
-                sql = f"SELECT id, product_id, image_path, original_path,oss_path FROM product_images WHERE id IN ({placeholders})"
-                
+                sql = f"SELECT id, model_number, image_path, original_path,oss_path FROM product_images WHERE id IN ({placeholders})"
+
                 cursor.execute(sql, tuple(product_images_ids_to_fetch))
                 db_rows = cursor.fetchall()
 
                 for row in db_rows:
                     product_image_id = row['id'] # product_images.id
                     distance = temp_distance_map.get(product_image_id)
-                    
+
                     if distance is not None:
                         similarity = self._distance_to_similarity(distance)
                         final_results.append({
-                            'product_id': row['product_id'],       # products.id
+                            'model_number': row['model_number'],       # products.model_number
                             'image_path': row['image_path'], # product_images.image_path
                             'original_path': row.get('original_path') or row['image_path'],
                             'oss_path': row.get('oss_path'),

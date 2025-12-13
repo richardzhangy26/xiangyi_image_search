@@ -3203,9 +3203,9 @@ tinyglobby@^0.2.13:
     picomatch "^4.0.2"
 
 tmp@^0.2.0:
-  version "0.2.3"
-  resolved "https://registry.npmjs.org/tmp/-/tmp-0.2.3.tgz"
-  integrity sha512-nZD7m9iCPC5g0pYmcaxogYKggSfLsdxl8of3Q/oIbqCqLLIO9IAF0GWjX1z9NZRHPiXv8Wex4yDCaZsgEw0Y8w==
+  version "0.2.5"
+  resolved "https://registry.npmjs.org/tmp/-/tmp-0.2.5.tgz"
+  integrity sha512-voyz6MApa1rQGUxT3E+BK7/ROe8itEx7vD8/HEvt4xwXucvQ5G5oeEiHkmHZJuBO21RpOf+YYm9MOivj709jow==
 
 to-regex-range@^5.0.1:
   version "5.0.1"
@@ -3293,9 +3293,9 @@ uuid@^8.3.0:
   integrity sha512-+NYs2QeMWy+GWFOEm9xnn6HCDp0l7QBD7ml8zLUmJ+93Q5NF0NocErnwkTkXVFNiX3/fpC6afS8Dhb/gz7R7eg==
 
 "vite@^4.2.0 || ^5.0.0 || ^6.0.0", vite@^6.3.5:
-  version "6.3.5"
-  resolved "https://registry.npmjs.org/vite/-/vite-6.3.5.tgz"
-  integrity sha512-cZn6NDFE7wdTpINgs++ZJ4N49W2vRp8LCKrn3Ob1kYNtOo21vfDoaV5GzBfLU4MovSAB8uNRm4jgzVQZ+mBzPQ==
+  version "6.4.1"
+  resolved "https://registry.npmjs.org/vite/-/vite-6.4.1.tgz"
+  integrity sha512-+Oxm7q9hDoLMyJOYfUYBuHQo+dkAloi33apOPP56pzj+vsdJDzr+j1NISE5pyaAuKL4A3UD34qd0lx5+kfKp2g==
   dependencies:
     esbuild "^0.25.0"
     fdir "^6.4.4"

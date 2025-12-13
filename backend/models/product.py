@@ -1,172 +1,132 @@
 from . import db
 from datetime import datetime
-import json
 
 class Product(db.Model):
+    """电子产品配件模型（相机肩带、挂绳等）"""
     __tablename__ = 'products'
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    name = db.Column(db.String(200), nullable=False)
-    description = db.Column(db.Text, nullable=True)
-    price = db.Column(db.Float, nullable=False)
-    sale_price = db.Column(db.Float, nullable=True)
-    
-    # 产品详细信息
-    product_code = db.Column(db.String(50), nullable=True)  # 货号
-    pattern = db.Column(db.String(100), nullable=True)  # 图案
-    skirt_length = db.Column(db.String(50), nullable=True)  # 裙长
-    clothing_length = db.Column(db.String(50), nullable=True)  # 衣长
-    style = db.Column(db.String(50), nullable=True)  # 风格
-    pants_length = db.Column(db.String(50), nullable=True)  # 裤长
-    sleeve_length = db.Column(db.String(50), nullable=True)  # 袖长
-    fashion_elements = db.Column(db.String(100), nullable=True)  # 流行元素
-    craft = db.Column(db.String(100), nullable=True)  # 工艺
-    launch_season = db.Column(db.String(50), nullable=True)  # 上市年份/季节
-    main_material = db.Column(db.String(100), nullable=True)  # 主面料成分
-    color = db.Column(db.String(100), nullable=True)  # 颜色
-    size = db.Column(db.String(100), nullable=True)  # 尺码
-    
-    # 图片信息
-    size_img = db.Column(db.Text, nullable=True)  # 尺码图片URL列表，JSON格式
-    good_img = db.Column(db.Text, nullable=True)  # 商品图片URL列表，JSON格式
-    factory_name = db.Column(db.String(200), nullable=True)  # 工厂名称
-    
-    # OSS相关字段
-    image_url = db.Column(db.String(255), nullable=True)  # 主图URL
-    image_path = db.Column(db.String(255), nullable=True)  # 本地图片路径
-    oss_path = db.Column(db.String(255), nullable=True)  # OSS路径
-    
-    # 销售状态
-    sales_status = db.Column(db.String(20), nullable=False, default='on_sale')  # 销售状态：sold_out-售罄, on_sale-在售, pre_sale-预售
-    
-    # 时间戳
-    created_at = db.Column(db.DateTime, default=datetime.now)
-    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
+
+    # 主键和必填字段
+    model_number = db.Column(db.String(100), primary_key=True, comment='型号（主键）')
+    photographer_file = db.Column(db.String(255), nullable=False, comment='摄影师文件')
+    alibaba_product_url = db.Column(db.String(500), nullable=False, comment='阿里产品链接')
+    category = db.Column(db.String(100), nullable=False, comment='分类')
+
+    # 产品参数
+    spec_cn_reference = db.Column(db.Text, nullable=True, comment='参数中文（参考）')
+    spec_cn = db.Column(db.Text, nullable=True, comment='参数中文')
+    spec_en = db.Column(db.Text, nullable=True, comment='参数英文')
+    product_size = db.Column(db.String(200), nullable=True, comment='产品尺寸')
+    package_size = db.Column(db.String(200), nullable=True, comment='包装尺寸')
+
+    # 价格相关（单位：美元）
+    price_1688 = db.Column(db.Numeric(10, 2), nullable=True, comment='1688价格')
+    fob_price_tier1 = db.Column(db.Numeric(10, 2), nullable=True, comment='FOB报价 300-1999')
+    fob_price_tier2 = db.Column(db.Numeric(10, 2), nullable=True, comment='FOB报价 2000-9999')
+    fob_price_tier3 = db.Column(db.Numeric(10, 2), nullable=True, comment='FOB报价 >=10000')
+    intl_platform_price = db.Column(db.Numeric(10, 2), nullable=True, comment='国际站定价')
+    competitor_price = db.Column(db.Numeric(10, 2), nullable=True, comment='国际站同行定价')
+
+    # 参考链接
+    ref_link_1 = db.Column(db.String(500), nullable=True, comment='链接1')
+    ref_link_2 = db.Column(db.String(500), nullable=True, comment='链接2')
+    ref_link_3 = db.Column(db.String(500), nullable=True, comment='链接3')
+    intl_platform_url = db.Column(db.String(500), nullable=True, comment='国际站')
+    intl_platform_url_1 = db.Column(db.String(500), nullable=True, comment='国际站1')
+    intl_platform_url_2 = db.Column(db.String(500), nullable=True, comment='国际站2')
+
+    # 系统字段
+    created_at = db.Column(db.DateTime, default=datetime.now, comment='创建时间')
+    updated_at = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now, comment='更新时间')
 
     def __repr__(self):
-        return f'<Product {self.name}>'
+        return f'<Product {self.model_number}>'
 
     def to_dict(self):
         """将产品信息转换为字典，用于API响应"""
-        # 解析JSON字段
-        size_img_list = []
-        good_img_list = []
-        
-        if self.size_img:
-            try:
-                size_img_list = json.loads(self.size_img)
-            except:
-                pass
-                
-        if self.good_img:
-            try:
-                good_img_list = json.loads(self.good_img)
-            except:
-                pass
-        
         return {
-            'id': self.id,
-            'name': self.name,
-            'description': self.description,
-            'price': self.price,
-            'sale_price': self.sale_price,
-            'product_code': self.product_code,
-            'pattern': self.pattern,
-            'skirt_length': self.skirt_length,
-            'clothing_length': self.clothing_length,
-            'style': self.style,
-            'pants_length': self.pants_length,
-            'sleeve_length': self.sleeve_length,
-            'fashion_elements': self.fashion_elements,
-            'craft': self.craft,
-            'launch_season': self.launch_season,
-            'main_material': self.main_material,
-            'color': self.color,
-            'size': self.size,
-            'size_img': size_img_list,
-            'good_img': good_img_list,
-            'factory_name': self.factory_name,
-            'image_url': self.image_url,
-            'image_path': self.image_path,
-            'oss_path': self.oss_path,
-            'sales_status': self.sales_status,
+            'model_number': self.model_number,
+            'photographer_file': self.photographer_file,
+            'alibaba_product_url': self.alibaba_product_url,
+            'category': self.category,
+            'spec_cn_reference': self.spec_cn_reference,
+            'spec_cn': self.spec_cn,
+            'spec_en': self.spec_en,
+            'product_size': self.product_size,
+            'package_size': self.package_size,
+            'price_1688': float(self.price_1688) if self.price_1688 else None,
+            'fob_price_tier1': float(self.fob_price_tier1) if self.fob_price_tier1 else None,
+            'fob_price_tier2': float(self.fob_price_tier2) if self.fob_price_tier2 else None,
+            'fob_price_tier3': float(self.fob_price_tier3) if self.fob_price_tier3 else None,
+            'intl_platform_price': float(self.intl_platform_price) if self.intl_platform_price else None,
+            'competitor_price': float(self.competitor_price) if self.competitor_price else None,
+            'ref_link_1': self.ref_link_1,
+            'ref_link_2': self.ref_link_2,
+            'ref_link_3': self.ref_link_3,
+            'intl_platform_url': self.intl_platform_url,
+            'intl_platform_url_1': self.intl_platform_url_1,
+            'intl_platform_url_2': self.intl_platform_url_2,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
-        
+
     @staticmethod
     def from_dict(data):
         """从字典创建产品对象"""
         product = Product()
-        
+
         for key, value in data.items():
-            # 允许设置自定义整形主键 id
-            if key == 'id':
-                # 仅当提供有效的整型值时才设置
-                try:
-                    if value is not None and str(value).strip() != '':
-                        product.id = int(value)
-                except (TypeError, ValueError):
-                    # 非法 id 将在上层校验报错，这里忽略设置
-                    pass
-                continue
-                
-            if key in ['size_img', 'good_img'] and value:
-                # 将列表转换为JSON字符串
-                if isinstance(value, list):
-                    setattr(product, key, json.dumps(value, ensure_ascii=False))
-                elif isinstance(value, str):
-                    # 如果已经是字符串，尝试解析确认是否是有效的JSON
-                    try:
-                        json.loads(value)
-                        setattr(product, key, value)
-                    except:
-                        # 如果解析失败，假设它是普通字符串，转换为JSON
-                        setattr(product, key, json.dumps([value], ensure_ascii=False))
-            else:
-                if hasattr(product, key):
-                    setattr(product, key, value)
-                    
+            if hasattr(product, key) and value is not None:
+                # 过滤空字符串
+                if isinstance(value, str) and value.strip() == '':
+                    continue
+                setattr(product, key, value)
+
         return product
 
+
 class ProductImage(db.Model):
-    """
-    产品图片模型，存储产品图片路径和向量表示
-    """
+    """产品图片模型，存储产品图片路径和向量表示"""
     __tablename__ = 'product_images'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    product_id = db.Column(db.Integer, db.ForeignKey('products.id', ondelete='CASCADE'), nullable=False)
-    image_path = db.Column(db.String(255), nullable=False, unique=True)
-    vector = db.Column(db.LargeBinary, nullable=False)  # BLOB类型用于存储向量
-    original_path = db.Column(db.Text, nullable=True)  # 图片的原始文件路径
-    oss_path = db.Column(db.Text, nullable=True)  # OSS 路径
-    
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    model_number = db.Column(db.String(100), db.ForeignKey('products.model_number', ondelete='CASCADE'), nullable=False, comment='关联产品型号')
+    image_path = db.Column(db.String(255), nullable=False, unique=True, comment='Web访问路径')
+    vector = db.Column(db.LargeBinary, nullable=False, comment='1024维图像向量')
+    original_path = db.Column(db.Text, nullable=True, comment='文件系统原始路径')
+    oss_path = db.Column(db.Text, nullable=True, comment='OSS云存储路径')
+    image_order = db.Column(db.Integer, default=0, comment='图片排序')
+    is_primary = db.Column(db.Boolean, default=False, comment='是否主图')
+    created_at = db.Column(db.DateTime, default=datetime.now, comment='创建时间')
+
     # 建立与Product的关系
     product = db.relationship('Product', backref=db.backref('images', lazy=True, cascade='all, delete-orphan'))
-    
+
     def __repr__(self):
-        return f'<ProductImage {self.id} for Product {self.product_id}>'
-    
+        return f'<ProductImage {self.id} for Product {self.model_number}>'
+
     def to_dict(self):
         """将图片信息转换为字典，用于API响应"""
         return {
             'id': self.id,
-            'product_id': self.product_id,
+            'model_number': self.model_number,
             'image_path': self.image_path,
             'original_path': self.original_path,
-            'oss_path': self.oss_path
+            'oss_path': self.oss_path,
+            'image_order': self.image_order,
+            'is_primary': self.is_primary,
+            'created_at': self.created_at.isoformat() if self.created_at else None
         }
-    
+
     @staticmethod
     def from_dict(data):
         """从字典创建图片对象"""
         image = ProductImage()
-        
+
         for key, value in data.items():
             if key == 'id':
                 continue  # 跳过id字段，让数据库自动生成
-                
-            if hasattr(image, key):
+
+            if hasattr(image, key) and value is not None:
                 setattr(image, key, value)
-                    
+
         return image

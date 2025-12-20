@@ -3,17 +3,14 @@ from flask import Flask, send_from_directory, request, jsonify, abort
 from flask_cors import CORS
 from pathlib import Path
 from models import db
-from blueprints.customers import customers_bp
-from blueprints.products import products_bp
-from blueprints.orders import orders_bp
-from blueprints.product_search import product_search_bp
+from blueprints.products_v2 import products_v2_bp  # 新版本
 from product_search import VectorProductIndex
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
     'port': int(os.getenv('DB_PORT', 3306)),
     'user': os.getenv('DB_USER', 'root'),
     'password': os.getenv('DB_PASSWORD', 'zhang7481592630'),
-    'database': os.getenv("DB_NAME", "xiangyipackage"),
+    'database': os.getenv("DB_NAME", "xiangyipackage_test"),
     'charset': 'utf8mb4'
 }
 def create_app(config_name='development'):
@@ -57,8 +54,7 @@ def create_app(config_name='development'):
     
     # 确保上传目录存在
     if not app.config['TESTING']:
-        os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'size_images'), exist_ok=True)
-        os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'good_images'), exist_ok=True)
+        os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'product_images'), exist_ok=True)
     
     # 向量索引配置
     app.config['INDEX_PATH'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
@@ -78,11 +74,8 @@ def create_app(config_name='development'):
         # 确保向量索引目录存在
         Path(os.path.dirname(app.config['INDEX_PATH'])).mkdir(parents=True, exist_ok=True)
     
-    # 注册蓝图
-    app.register_blueprint(customers_bp)
-    app.register_blueprint(products_bp)
-    app.register_blueprint(orders_bp)
-    app.register_blueprint(product_search_bp)
+    # 注册蓝图（使用新版本 products_v2）
+    app.register_blueprint(products_v2_bp)
     
     # 添加静态文件路由
     @app.route('/uploads/<path:filename>')

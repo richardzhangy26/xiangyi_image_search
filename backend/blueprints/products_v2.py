@@ -11,9 +11,6 @@ import csv
 import io
 from flask_cors import cross_origin
 from models import db, Product, ProductImage
-from product_search import VectorProductIndex
-from sqlalchemy import and_
-
 products_v2_bp = Blueprint('products_v2', __name__, url_prefix='/api/products')
 
 # ========================================
@@ -176,15 +173,15 @@ def create_product():
                 if web_path and filesystem_path:
                     # 生成向量
                     try:
-                        product_index = current_app.config.get('PRODUCT_INDEX')
-                        if product_index:
-                            feature = product_index.extract_feature(filesystem_path)
+                        product_search_service = current_app.config.get('PRODUCT_SEARCH_SERVICE')
+                        if product_search_service:
+                            feature = product_search_service.extract_feature(filesystem_path)
 
                             # 创建 ProductImage 记录
                             product_image = ProductImage(
                                 model_number=model_number,
                                 image_path=web_path,
-                                vector=feature.tobytes(),
+                                vector=feature.tolist(),  # Pgvector expects a list, not bytes
                                 original_path=filesystem_path,
                                 image_order=idx,
                                 is_primary=(idx == 0)  # 第一张为主图
@@ -198,9 +195,9 @@ def create_product():
 
         db.session.commit()
 
-        # 刷新向量索引
-        if uploaded_images and current_app.config.get('PRODUCT_INDEX'):
-            current_app.config['PRODUCT_INDEX'].refresh_from_database()
+        # 无需刷新向量索引 (Stateless)
+        # if uploaded_images and current_app.config.get('PRODUCT_INDEX'):
+        #     current_app.config['PRODUCT_INDEX'].refresh_from_database()
 
         return jsonify({
             'message': '产品创建成功',
@@ -247,14 +244,14 @@ def update_product(model_number):
 
                     if web_path and filesystem_path:
                         try:
-                            product_index = current_app.config.get('PRODUCT_INDEX')
-                            if product_index:
-                                feature = product_index.extract_feature(filesystem_path)
+                            product_search_service = current_app.config.get('PRODUCT_SEARCH_SERVICE')
+                            if product_search_service:
+                                feature = product_search_service.extract_feature(filesystem_path)
 
                                 product_image = ProductImage(
                                     model_number=model_number,
                                     image_path=web_path,
-                                    vector=feature.tobytes(),
+                                    vector=feature.tolist(),  # Pgvector expects a list, not bytes
                                     original_path=filesystem_path,
                                     image_order=current_max_order + idx + 1,
                                     is_primary=False
@@ -266,9 +263,9 @@ def update_product(model_number):
 
         db.session.commit()
 
-        # 刷新向量索引
-        if images and current_app.config.get('PRODUCT_INDEX'):
-            current_app.config['PRODUCT_INDEX'].refresh_from_database()
+        # 无需刷新向量索引 (Stateless)
+        # if images and current_app.config.get('PRODUCT_INDEX'):
+        #     current_app.config['PRODUCT_INDEX'].refresh_from_database()
 
         return jsonify({'message': '产品更新成功'})
 
@@ -290,9 +287,9 @@ def delete_product(model_number):
         db.session.delete(product)
         db.session.commit()
 
-        # 刷新向量索引
-        if current_app.config.get('PRODUCT_INDEX'):
-            current_app.config['PRODUCT_INDEX'].refresh_from_database()
+        # 无需刷新向量索引 (Stateless)
+        # if current_app.config.get('PRODUCT_INDEX'):
+        #     current_app.config['PRODUCT_INDEX'].refresh_from_database()
 
         return jsonify({'message': '产品删除成功'})
 
@@ -322,9 +319,9 @@ def batch_delete_products():
 
         db.session.commit()
 
-        # 刷新向量索引
-        if deleted_count > 0 and current_app.config.get('PRODUCT_INDEX'):
-            current_app.config['PRODUCT_INDEX'].refresh_from_database()
+        # 无需刷新向量索引 (Stateless)
+        # if deleted_count > 0 and current_app.config.get('PRODUCT_INDEX'):
+        #     current_app.config['PRODUCT_INDEX'].refresh_from_database()
 
         return jsonify({
             'message': f'成功删除 {deleted_count} 个产品',
@@ -361,9 +358,9 @@ def delete_product_image(model_number, image_id):
         db.session.delete(product_image)
         db.session.commit()
 
-        # 刷新向量索引
-        if current_app.config.get('PRODUCT_INDEX'):
-            current_app.config['PRODUCT_INDEX'].refresh_from_database()
+        # 无需刷新向量索引 (Stateless)
+        # if current_app.config.get('PRODUCT_INDEX'):
+        #     current_app.config['PRODUCT_INDEX'].refresh_from_database()
 
         return jsonify({'message': '图片删除成功'})
 
@@ -551,68 +548,11 @@ HL-002,photographer_002,https://detail.1688.com/offer/654321.html,相机挂绳,�
 @cross_origin()
 def build_vector_index():
     """
-    构建向量索引（SSE 流式推送进度）
-    为所有没有向量的产品图片生成向量
+    (Deprecated) 构建向量索引
+    此接口在 Stateless 架构下已不再需要，保留仅为兼容性或手动触发向量生成（如果需要）
+    目前主要用于确保旧数据有向量
     """
-    def event_stream():
-        try:
-            # 获取向量索引
-            product_index = current_app.config.get('PRODUCT_INDEX')
-            if not product_index:
-                yield f"data: {json.dumps({'type': 'error', 'message': '向量索引未配置'})}\n\n"
-                return
-
-            # 查找所有产品
-            products = Product.query.all()
-            total_products = len(products)
-
-            yield f"data: {json.dumps({'type': 'total', 'value': total_products})}\n\n"
-
-            if total_products == 0:
-                yield f"data: {json.dumps({'type': 'complete', 'message': '没有产品需要处理'})}\n\n"
-                return
-
-            processed_count = 0
-            error_list = []
-
-            for product in products:
-                try:
-                    model_number = product.model_number
-
-                    # 检查是否已有图片记录
-                    existing_images = ProductImage.query.filter_by(model_number=model_number).count()
-
-                    if existing_images > 0:
-                        # 已有向量，跳过
-                        processed_count += 1
-                        yield f"data: {json.dumps({'type': 'progress', 'processed': processed_count, 'total': total_products, 'model_number': model_number, 'status': 'skipped'})}\n\n"
-                        continue
-
-                    # 处理产品图片
-                    # 注意：这里需要有实际的图片文件才能生成向量
-                    # 如果没有图片文件，标记为跳过
-
-                    processed_count += 1
-                    yield f"data: {json.dumps({'type': 'progress', 'processed': processed_count, 'total': total_products, 'model_number': model_number, 'status': 'no_images'})}\n\n"
-
-                except Exception as e:
-                    error_msg = f"处理产品 {product.model_number} 时出错: {str(e)}"
-                    current_app.logger.error(error_msg)
-                    error_list.append(error_msg)
-                    processed_count += 1
-                    yield f"data: {json.dumps({'type': 'progress', 'processed': processed_count, 'total': total_products, 'model_number': product.model_number, 'status': 'error'})}\n\n"
-
-            final_message = f'向量索引构建完成，处理了 {processed_count}/{total_products} 个产品'
-            if error_list:
-                final_message += f"，发生 {len(error_list)} 个错误"
-
-            yield f"data: {json.dumps({'type': 'complete', 'message': final_message, 'processed': processed_count, 'errors': error_list})}\n\n"
-
-        except Exception as e:
-            current_app.logger.error(f"构建向量索引失败: {str(e)}")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-
-    return Response(stream_with_context(event_stream()), mimetype='text/event-stream')
+    return jsonify({'message': 'Stateless architecture does not need explicit index building.'}), 200
 
 
 # ========================================
@@ -624,11 +564,11 @@ def build_vector_index():
 def search_products():
     """以图搜图功能"""
     try:
-        # 检查向量索引
-        if 'PRODUCT_INDEX' not in current_app.config:
+        # 检查搜索服务
+        if 'PRODUCT_SEARCH_SERVICE' not in current_app.config:
             return jsonify({'error': '向量搜索未配置'}), 500
 
-        product_index = current_app.config['PRODUCT_INDEX']
+        search_service = current_app.config['PRODUCT_SEARCH_SERVICE']
 
         # 处理上传的图片
         if 'image' not in request.files:
@@ -646,7 +586,7 @@ def search_products():
         try:
             # 执行搜索
             top_k = request.form.get('top_k', 10, type=int)
-            results = product_index.search_similar_images(temp_path, top_k=top_k)
+            results = search_service.search_similar_images(temp_path, top_k=top_k)
 
             # 获取产品详情
             model_numbers = [result.get('model_number') for result in results]

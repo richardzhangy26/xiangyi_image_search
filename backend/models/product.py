@@ -1,5 +1,6 @@
 from . import db
 from datetime import datetime
+from pgvector.sqlalchemy import Vector
 
 class Product(db.Model):
     """电子产品配件模型（相机肩带、挂绳等）"""
@@ -91,7 +92,7 @@ class ProductImage(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     model_number = db.Column(db.String(100), db.ForeignKey('products.model_number', ondelete='CASCADE'), nullable=False, comment='关联产品型号')
     image_path = db.Column(db.String(255), nullable=False, unique=True, comment='Web访问路径')
-    vector = db.Column(db.LargeBinary, nullable=False, comment='1024维图像向量')
+    vector = db.Column(Vector(1024), nullable=False, comment='1024维图像向量')
     original_path = db.Column(db.Text, nullable=True, comment='文件系统原始路径')
     oss_path = db.Column(db.Text, nullable=True, comment='OSS云存储路径')
     image_order = db.Column(db.Integer, default=0, comment='图片排序')

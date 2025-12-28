@@ -16,25 +16,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Backend (Flask + Python)
 - **Framework**: Flask with SQLAlchemy ORM
-- **Database**: MySQL (`xiangyipackage_test`)
+- **Database**: PostgreSQL with pgvector extension (default: `image_search`)
+  - **Note**: Legacy MySQL support available via `init_database.sql` (see `README_DATABASE.md`)
 - **AI Pipeline**:
   - DashScope multimodal embedding API generates 1024-dimensional vectors
-  - FAISS IndexFlatL2 performs L2 distance similarity search
-  - Vector index rebuilt from database on application startup
+  - pgvector performs in-database vector similarity search (L2 distance or cosine similarity)
+  - **Stateless architecture**: No in-memory index, vectors stored natively in PostgreSQL
 - **Storage**: Local filesystem (`backend/uploads/product_images/{model_number}/`)
 - **Optional**: Aliyun OSS cloud storage support
 
 **Critical Files**:
 - [app.py](backend/app.py) - Flask app initialization, database config, CORS, blueprint registration
-- [product_search.py](backend/product_search.py) - `VectorProductIndex` class: FAISS indexing and similarity search
+- [product_search.py](backend/product_search.py) - `ImageSearchService` class: Stateless vector search service
 - [blueprints/products_v2.py](backend/blueprints/products_v2.py) - Product CRUD API (currently active version)
-- [blueprints/product_search.py](backend/blueprints/product_search.py) - Image search API endpoints
-- [models/product.py](backend/models/product.py) - `Product` and `ProductImage` SQLAlchemy models
+- [blueprints/product_search.py](backend/blueprints/product_search.py) - Legacy image search API (deprecated)
+- [models/product.py](backend/models/product.py) - `Product` and `ProductImage` SQLAlchemy models with pgvector support
 
-**Vector Search Workflow**:
-1. **Indexing**: Image upload → DashScope API → 1024-dim vector → Store in `product_images.vector` (BLOB)
-2. **Search**: Query image → Generate embedding → FAISS similarity search → Return top-k products
-3. **Startup**: Application loads all vectors from MySQL into in-memory FAISS index
+**Vector Search Workflow (pgvector)**:
+1. **Indexing**: Image upload → DashScope API → 1024-dim vector → Store in `product_images.vector` (native pgvector type)
+2. **Search**: Query image → Generate embedding → SQL vector similarity query → Return top-k products
+3. **Startup**: No index loading required (stateless design)
+
+**Legacy Architecture (FAISS + MySQL)**:
+- Previously used FAISS IndexFlatL2 with in-memory vector index
+- See `main` branch for FAISS-based implementation
+- Migration path: Use data export/import scripts to migrate BLOB vectors to pgvector
 
 ### Frontend (React + TypeScript)
 - **Framework**: React 18 with TypeScript, React Router
@@ -116,8 +122,9 @@ Create `backend/.env` from `.env.example`:
 
 **Required**:
 - `DASHSCOPE_API_KEY` - Aliyun DashScope API key for image embeddings
-- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` - MySQL connection config
-  - Default database name: `xiangyipackage_test`
+- `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` - PostgreSQL connection config
+  - Default database name: `image_search` (pgvector)
+  - Legacy MySQL database name: `xiangyipackage_test`
 
 **Optional**:
 - `OSS_ACCESS_KEY_ID`, `OSS_ACCESS_KEY_SECRET`, `OSS_ENDPOINT`, `OSS_BUCKET_NAME` - Aliyun OSS storage
@@ -127,8 +134,10 @@ Create `backend/.env` from `.env.example`:
 
 ## Database Schema
 
-**Database Name**: `xiangyipackage_test`
-**Character Set**: `utf8mb4_unicode_ci`
+### PostgreSQL with pgvector (Current)
+
+**Database Name**: `image_search` (default)
+**Extension**: `CREATE EXTENSION vector;` required
 
 ### `products` Table (Electronic Accessories)
 
@@ -167,7 +176,7 @@ Create `backend/.env` from `.env.example`:
 | id | INT | PK, AUTO_INCREMENT | Image ID |
 | model_number | VARCHAR(100) | FK, NOT NULL | Links to product |
 | image_path | VARCHAR(255) | UNIQUE, NOT NULL | Web-accessible path |
-| vector | BLOB | NOT NULL | 1024-dim embedding (numpy array) |
+| vector | Vector(1024) | NOT NULL | 1024-dim embedding (pgvector) |
 | original_path | TEXT | NULL | Filesystem absolute path |
 | oss_path | TEXT | NULL | Aliyun OSS path (optional) |
 | image_order | INT | DEFAULT 0 | Display order |
@@ -176,30 +185,52 @@ Create `backend/.env` from `.env.example`:
 
 **Indexes**: `unique_image_path`, `idx_model_number`, `idx_is_primary`
 
+### MySQL with BLOB (Legacy)
+
+See `init_database.sql` and `README_DATABASE.md` for legacy MySQL schema.
+The `vector` column uses `BLOB` type instead of `Vector(1024)` for storing serialized numpy arrays.
+
 ## Vector Search Implementation
 
-**Core Class**: `VectorProductIndex` ([backend/product_search.py](backend/product_search.py))
+### Current: pgvector + PostgreSQL (Stateless)
+
+**Core Class**: `ImageSearchService` ([backend/product_search.py](backend/product_search.py))
 
 **Key Methods**:
 ```python
 extract_feature(image_path: str) -> np.ndarray
     # Calls DashScope API to generate 1024-dim embedding
 
-add_product(product_info: ProductInfo, image_path: str) -> dict
-    # Adds product with image vector to MySQL + FAISS index
+search_similar_images(image_path: str, top_k: int = 10) -> list
+    # Performs SQL vector similarity search, returns top-k products
+    # Uses: ProductImage.vector.l2_distance(query_vector)
+```
 
-search_similar_images(image_path: str, top_k: int = 5) -> List[dict]
-    # Performs FAISS similarity search, returns top-k products
-
-_load_vectors()
-    # Loads all vectors from MySQL into FAISS index at startup
+**SQL Query Pattern**:
+```python
+results = db.session.query(ProductImage, ProductImage.vector.l2_distance(query_vector))
+    .join(Product)
+    .order_by(ProductImage.vector.l2_distance(query_vector))
+    .limit(top_k)
+    .all()
 ```
 
 **Important Implementation Details**:
-- FAISS index is **not persisted to disk** - database is single source of truth
+- **Stateless**: No in-memory index, all vector operations in-database
+- Vectors stored as native `Vector(1024)` type in PostgreSQL
+- Uses pgvector's `l2_distance()` operator for similarity search
+- Similarity score: `1 / (1 + distance)` for 0-1 range
+- No startup index loading required
+
+### Legacy: FAISS + MySQL (Stateful)
+
+**Core Class**: `VectorProductIndex` (see `main` branch)
+
+**Key Differences**:
+- FAISS `IndexFlatL2` for in-memory similarity search
 - Vectors stored as BLOB in MySQL (serialized numpy arrays)
-- Index rebuilt from scratch on each application startup
-- Uses L2 distance metric (`IndexFlatL2`)
+- Index rebuilt from database on application startup
+- Required manual index refresh (`refresh_from_database()`)
 
 ## CSV Import Format
 
@@ -217,6 +248,26 @@ model_number,photographer_file,alibaba_product_url,category,图片路径,参数�
 5. `图片路径` - Image path (relative to dataset root or absolute)
 
 ## Database Initialization
+
+### PostgreSQL with pgvector (Current)
+
+```bash
+# 1. Create database and enable pgvector extension
+psql -U postgres -c "CREATE DATABASE image_search;"
+psql -U postgres -d image_search -c "CREATE EXTENSION vector;"
+
+# 2. Run SQLAlchemy migration (if using Alembic)
+cd backend
+python init_new_db.py
+
+# 3. Verify installation
+psql -U postgres -d image_search -c "\dx"  # Check pgvector extension
+psql -U postgres -d image_search -c "\dt"  # List tables
+```
+
+### MySQL (Legacy)
+
+See `README_DATABASE.md` for detailed MySQL setup instructions.
 
 ### Method 1: SQL Script (Recommended)
 ```bash
@@ -259,7 +310,28 @@ python -m pytest test/test_product_search.py -v
 
 # With coverage
 python -m pytest test/ --cov=. --cov-report=html
+
+# pgvector benchmark test
+python test/test_pgvector.py
 ```
+
+### pgvector Benchmark (`test/test_pgvector.py`)
+
+Compares IVFFlat vs HNSW indexing performance:
+
+```python
+# Run benchmark with custom data size
+python test/test_pgvector.py  # Default: 10k vectors
+
+# Edit the script to test larger datasets:
+# benchmark.run_benchmark(num_rows=100000)  # 100k vectors
+```
+
+**Metrics tracked**:
+- Index build time
+- Query latency
+- Recall accuracy (vs brute force)
+- Index disk size
 
 ## Important Architecture Notes
 
@@ -275,18 +347,16 @@ python -m pytest test/ --cov=. --cov-report=html
 
 **Blueprint Versions**:
 - `products_v2.py` is the **active** blueprint (registered in app.py)
-- `products.py` is legacy code (may need deletion or archival)
-- `customers.py`, `orders.py` are **legacy** - no longer used (product-only system)
+- `product_search.py` is **legacy** - uses old `VectorProductIndex` class
+- `products.py`, `customers.py`, `orders.py` are **legacy** - no longer used
 
-**FAISS Index Behavior**:
-- Index is ephemeral (in-memory only)
-- Database is authoritative source
-- Application restart triggers full rebuild from MySQL
-- No separate index persistence files
+**Stateless vs Stateful Architecture**:
+- **Current (pgvector)**: No index loading, no refresh needed, database handles everything
+- **Legacy (FAISS)**: Required `refresh_from_database()` after data changes
 
 **Deployment Architecture** (Docker):
-- `db` service: MySQL 8 with custom config in `mysql/conf.d/`
+- `db` service: PostgreSQL with pgvector extension OR MySQL 8
 - `backend` service: Flask app with Gunicorn (production) or Flask dev server
 - `frontend` service: Nginx serving static Vite build
-- Port mapping: Frontend (80), Backend (5000), MySQL (3307→3306)
-- Data persistence: `mysql_data` volume, `backend/uploads/` bind mount
+- Port mapping: Frontend (80), Backend (5000), Database (3307→3306)
+- Data persistence: Database volume, `backend/uploads/` bind mount

@@ -1,17 +1,20 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()  # Load environment variables from .env file
+
 from flask import Flask, send_from_directory, request, jsonify, abort
 from flask_cors import CORS
 from pathlib import Path
 from models import db
 from blueprints.products_v2 import products_v2_bp  # 新版本
-from product_search import VectorProductIndex
+from product_search import ImageSearchService
+# 数据库配置（默认使用 PostgreSQL + pgvector）
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
-    'port': int(os.getenv('DB_PORT', 3306)),
-    'user': os.getenv('DB_USER', 'root'),
-    'password': os.getenv('DB_PASSWORD', 'zhang7481592630'),
-    'database': os.getenv("DB_NAME", "xiangyipackage_test"),
-    'charset': 'utf8mb4'
+    'port': int(os.getenv('DB_PORT', 5432)),
+    'database': os.getenv("DB_NAME", "image_search"),
+    'user': os.getenv('DB_USER', 'postgres'),
+    'password': os.getenv('DB_PASSWORD', ''),
 }
 def create_app(config_name='development'):
     app = Flask(__name__)
@@ -21,11 +24,10 @@ def create_app(config_name='development'):
         app.config['TESTING'] = True
         app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
     else:
-        # 使用统一的数据库配置
+        # 使用统一的数据库配置（PostgreSQL + pgvector）
         app.config['SQLALCHEMY_DATABASE_URI'] = (
-            f"mysql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
+            f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
             f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
-            f"?charset={DB_CONFIG['charset']}"
         )
     
     # 配置CORS
@@ -55,24 +57,16 @@ def create_app(config_name='development'):
     # 确保上传目录存在
     if not app.config['TESTING']:
         os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'product_images'), exist_ok=True)
-    
-    # 向量索引配置
-    app.config['INDEX_PATH'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
-                                          'data', 'product_search', 'product_index.bin')
-    
+
     # 初始化扩展
     db.init_app(app)
 
-    # 初始化向量索引
+    # 初始化向量搜索服务
     if not app.config['TESTING']:
-        # VectorProductIndex 初始化时会自动从数据库加载向量
-        # 不再使用文件持久化，因为数据库是唯一的数据源
-        product_index = VectorProductIndex()
-        app.logger.info(f"向量索引已从数据库加载，共 {product_index.index.ntotal} 个向量")
-        app.config['PRODUCT_INDEX'] = product_index
-        
-        # 确保向量索引目录存在
-        Path(os.path.dirname(app.config['INDEX_PATH'])).mkdir(parents=True, exist_ok=True)
+        # ImageSearchService 是无状态的
+        search_service = ImageSearchService()
+        app.config['PRODUCT_SEARCH_SERVICE'] = search_service
+        app.logger.info("ImageSearchService 初始化完成 (Stateless)")
     
     # 注册蓝图（使用新版本 products_v2）
     app.register_blueprint(products_v2_bp)
@@ -100,7 +94,8 @@ def create_app(config_name='development'):
         """健康检查接口,用于 Docker 容器健康检查"""
         try:
             # 检查数据库连接
-            db.session.execute('SELECT 1')
+            from sqlalchemy import text
+            db.session.execute(text('SELECT 1'))
             return jsonify({
                 'status': 'healthy',
                 'database': 'connected'

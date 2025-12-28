@@ -5,12 +5,12 @@ werkzeug>=3.0.0
 
 # 数据库相关
 flask-sqlalchemy>=3.1.1
-mysqlclient>=2.2.4
-pymysql>=1.1.0
+psycopg2-binary>=2.9.9
+pgvector>=0.2.5
 SQLAlchemy>=2.0.0
 
 # AI 和图像处理
-faiss-cpu>=1.7.4
+# faiss-cpu>=1.7.4  # Removed in favor of pgvector
 numpy>=1.24.0
 Pillow>=10.0.0
 dashscope>=1.13.3

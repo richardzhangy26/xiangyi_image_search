@@ -1,61 +1,40 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-// import { Link } from 'react-router-dom';
-import { searchProducts, SearchResult, getImageUrl, getProductById, API_BASE_URL, ProductInfo } from '../services/api';
-import { Input, Card, Image, Descriptions, message } from 'antd';
+/**
+ * 产品图片搜索组件 - 电子产品配件
+ */
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { Card, Button, message, Spin, Empty, Descriptions, Image, Tag } from 'antd';
+import { UploadOutlined, SearchOutlined, ClearOutlined } from '@ant-design/icons';
+import type { ProductSearchResult } from '../types/product';
+import { searchProductsByImage, getImageUrl } from '../services/productApi';
 
 export const ProductSearch: React.FC = () => {
   const [searchImage, setSearchImage] = useState<File | null>(null);
-  const [results, setResults] = useState<SearchResult[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [results, setResults] = useState<ProductSearchResult[]>([]);
+  const [loading, setLoading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
-  const [product, setProduct] = useState<ProductInfo | null>(null);
-  const [forceUpdate, setForceUpdate] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const dropAreaRef = useRef<HTMLDivElement>(null);
-
-  // Debug: 监控 searchImage 状态变化
-  useEffect(() => {
-    console.log('🔍 searchImage 状态变化:', {
-      hasImage: !!searchImage,
-      fileName: searchImage?.name,
-      fileSize: searchImage?.size,
-      fileType: searchImage?.type,
-      timestamp: new Date().toISOString()
-    });
-  }, [searchImage]);
 
   // 统一的图片处理函数
-  const handleImageFile = useCallback((file: File, source: string) => {
-    console.log(`📸 处理图片文件 [${source}]:`, {
-      fileName: file.name,
-      fileSize: file.size,
-      fileType: file.type,
-      timestamp: new Date().toISOString()
-    });
+  const handleImageFile = useCallback(
+    (file: File, source: string) => {
+      console.log(`处理图片文件 [${source}]:`, file.name);
 
-    // 清理旧的预览URL
-    if (previewUrl) {
-      console.log(`📸 [${source}] 清理旧的预览URL`);
-      URL.revokeObjectURL(previewUrl);
-    }
+      // 清理旧的预览URL
+      if (previewUrl) {
+        URL.revokeObjectURL(previewUrl);
+      }
 
-    // 创建新的预览URL
-    const newPreviewUrl = URL.createObjectURL(file);
-    console.log(`📸 [${source}] 创建新的预览URL:`, newPreviewUrl);
+      // 创建新的预览URL
+      const newPreviewUrl = URL.createObjectURL(file);
 
-    // 同时设置两个状态
-    setSearchImage(file);
-    setPreviewUrl(newPreviewUrl);
-    
-    // 强制重新渲染
-    setForceUpdate(prev => prev + 1);
-    
-    console.log(`📸 [${source}] 图片处理完成`);
-  }, [previewUrl]);
+      setSearchImage(file);
+      setPreviewUrl(newPreviewUrl);
+    },
+    [previewUrl]
+  );
 
-  // Clean up object URLs when component unmounts
+  // 清理 URL
   useEffect(() => {
     return () => {
       if (previewUrl) {
@@ -64,51 +43,33 @@ export const ProductSearch: React.FC = () => {
     };
   }, [previewUrl]);
 
-  // Add paste event listener to the document
+  // 粘贴事件监听
   useEffect(() => {
     const handlePaste = (e: ClipboardEvent) => {
-      console.log('📋 粘贴事件触发');
-      console.log('📋 剪贴板数据:', e.clipboardData);
-      console.log('📋 文件数量:', e.clipboardData?.files.length || 0);
-      
       if (e.clipboardData && e.clipboardData.files.length > 0) {
         const file = e.clipboardData.files[0];
-        console.log('📋 检测到文件:', {
-          name: file.name,
-          type: file.type,
-          size: file.size
-        });
-        
         if (file.type.startsWith('image/')) {
-          console.log('📋 确认是图片文件，开始处理');
           e.preventDefault();
           handleImageFile(file, '粘贴');
-        } else {
-          console.log('📋 不是图片文件，忽略');
+          message.success('图片已从剪贴板粘贴');
         }
-      } else {
-        console.log('📋 剪贴板中没有文件');
       }
     };
 
-    console.log('📋 添加粘贴事件监听器');
     document.addEventListener('paste', handlePaste);
     return () => {
-      console.log('📋 移除粘贴事件监听器');
       document.removeEventListener('paste', handlePaste);
     };
   }, [handleImageFile]);
 
-  const handleFileSelected = useCallback((file: File) => {
-    handleImageFile(file, '文件选择');
-  }, [handleImageFile]);
-
-  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // 文件选择
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
-      handleFileSelected(e.target.files[0]);
+      handleImageFile(e.target.files[0], '文件选择');
     }
   };
 
+  // 拖拽处理
   const handleDragEnter = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
@@ -126,372 +87,185 @@ export const ProductSearch: React.FC = () => {
     e.stopPropagation();
   };
 
-  const handleDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-    
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      const file = e.dataTransfer.files[0];
-      if (file.type.startsWith('image/')) {
-        handleImageFile(file, '拖拽');
+  const handleDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDragging(false);
+
+      if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+        const file = e.dataTransfer.files[0];
+        if (file.type.startsWith('image/')) {
+          handleImageFile(file, '拖拽');
+          message.success('图片已上传');
+        } else {
+          message.error('请上传图片文件');
+        }
       }
-    }
-  }, [handleImageFile]);
+    },
+    [handleImageFile]
+  );
 
-  const handleBrowseClick = () => {
-    if (fileInputRef.current) {
-      fileInputRef.current.click();
-    }
-  };
-
-  const handleSearch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    console.log('搜索按钮被点击');
-    console.log('搜索图片状态:', searchImage ? '已选择' : '未选择');
-    
+  // 搜索
+  const handleSearch = async () => {
     if (!searchImage) {
-      console.log('未选择图片，搜索终止');
+      message.warning('请先上传搜索图片');
       return;
     }
 
     setLoading(true);
-    setError(null);
-    console.log('开始搜索，图片大小:', searchImage.size, '字节');
-    
     try {
-      console.log('发送搜索请求到:', `${API_BASE_URL}/api/products/search`);
-      const searchRes = await searchProducts(searchImage);
-      console.log('搜索结果:', searchRes);
-      setResults(searchRes);
+      const searchResults = await searchProductsByImage(searchImage, 10);
+      setResults(searchResults);
+      if (searchResults.length === 0) {
+        message.info('未找到相似产品');
+      } else {
+        message.success(`找到 ${searchResults.length} 个相似产品`);
+      }
     } catch (err) {
-      console.error('搜索错误:', err); 
-      setError(err instanceof Error ? err.message : '搜索失败');
+      message.error(err instanceof Error ? err.message : '搜索失败');
     } finally {
       setLoading(false);
-      console.log('搜索完成');
     }
   };
 
-  // const handleImageError = (e: React.SyntheticEvent<HTMLImageElement, Event>, result: SearchResult) => {
-  //   console.error(`Error loading image for product ${result.id}`, e);
-  //   console.log('Image path that failed:', result.image_path);
-  //   console.log('Original path:', result.original_path);
-  //   const imgElement = e.target as HTMLImageElement;
-  //   if (result.image_path && result.image_path.includes('商品信息/商品图')) {
-  //     console.log('Trying alternative path for product image');
-  //     const pathParts = result.original_path?.split('/') || [];
-  //     const filename = pathParts[pathParts.length - 1];
-  //     if (filename) {
-  //       const altPath = `/api/images/${filename}`;
-  //       console.log('Trying alternative path:', altPath);
-  //       imgElement.src = altPath;
-  //       return;
-  //     }
-  //   }
-  //   imgElement.src = '/placeholder-image.png';
-  //   imgElement.alt = 'Image not available';
-  //   imgElement.className = `${imgElement.className} image-error`;
-  // };
-
-  const handleIdSearch = async (productId: string) => {
-    if (!productId.trim()) {
-      message.warning('请输入商品ID');
-      return;
+  // 清除
+  const handleClear = () => {
+    setSearchImage(null);
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
     }
-
-    setLoading(true);
-    try {
-      const data = await getProductById(productId);
-      setProduct(data);
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : '搜索失败');
-      setProduct(null);
-    } finally {
-      setLoading(false);
-    }
+    setPreviewUrl(null);
+    setResults([]);
   };
 
   return (
-    <div className="max-w-4xl mx-auto p-4">
-      <h2 className="text-2xl font-bold mb-4">搜索商品</h2>
-      
-      <div className="mb-4">
-        <Input.Search
-          placeholder="请输入商品ID"
-          enterButton="搜索"
-          size="large"
-          loading={loading}
-          onSearch={handleIdSearch}
-        />
-      </div>
+    <div className="p-6">
+      <h2 className="text-2xl font-bold mb-6">以图搜款</h2>
 
-      <form onSubmit={handleSearch} className="mb-8">
-        <div className="mb-4">
-          <label className="block text-sm font-medium mb-1">上传图片搜索</label>
-          
-          <div 
-            ref={dropAreaRef}
-            className={`border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-colors ${
-              isDragging 
-                ? 'border-blue-500 bg-blue-50' 
-                : 'border-gray-300 hover:border-blue-400'
-            }`}
-            onDragEnter={handleDragEnter}
-            onDragLeave={handleDragLeave}
-            onDragOver={handleDragOver}
-            onDrop={handleDrop}
-            onClick={handleBrowseClick}
-          >
-            <input
-              type="file"
-              ref={fileInputRef}
-              onChange={handleImageChange}
-              className="hidden"
-              accept="image/*"
-            />
-            
-            {previewUrl ? (
-              <div className="flex flex-col items-center">
-                <img
-                  src={previewUrl}
-                  alt="Search preview"
-                  className="max-h-48 rounded shadow mb-2"
-                />
-                <p className="text-sm text-gray-500">点击更换图片</p>
-              </div>
-            ) : (
-              <div className="py-4">
-                <svg className="mx-auto h-12 w-12 text-gray-400" stroke="currentColor" fill="none" viewBox="0 0 48 48" aria-hidden="true">
-                  <path d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                <p className="mt-2 text-sm font-medium text-gray-900">
-                  点击选择图片或拖拽图片到此处
-                </p>
-                <p className="mt-1 text-xs text-gray-500">
-                  支持 PNG, JPG, JPEG, GIF 格式
-                </p>
-                <p className="mt-1 text-xs text-blue-500">
-                  也可以使用 Cmd+V/Ctrl+V直接粘贴图片
-                </p>
-              </div>
-            )}
-          </div>
-        </div>
-
-        {error && (
-          <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-4">
-            <div className="flex items-start">
-              <div className="flex-shrink-0">
-                <svg className="w-5 h-5 text-red-400" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
-                </svg>
-              </div>
-              <div className="ml-3">
-                <h3 className="text-sm font-medium text-red-800">操作失败</h3>
-                <div className="mt-2 text-sm text-red-700">
-                  <p>{error}</p>
-                  {error.includes('CORS跨域错误') && (
-                    <div className="mt-2 p-2 bg-red-100 rounded border-l-4 border-red-400">
-                      <p className="text-xs">
-                        <strong>解决方案：</strong><br/>
-                        1. 检查后端是否启动在正确的端口 (5000)<br/>
-                        2. 确认后端CORS配置包含当前访问地址：{window.location.origin}<br/>
-                        3. 检查防火墙和网络设置
-                      </p>
-                    </div>
-                  )}
-                  {error.includes('网络连接失败') && (
-                    <div className="mt-2 p-2 bg-red-100 rounded border-l-4 border-red-400">
-                      <p className="text-xs">
-                        <strong>解决方案：</strong><br/>
-                        1. 确认后端服务已启动<br/>
-                        2. 检查网络连接是否正常<br/>
-                        3. 尝试直接访问：<a href={API_BASE_URL} target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">{API_BASE_URL}</a>
-                      </p>
-                    </div>
-                  )}
-                </div>
+      {/* 上传区域 */}
+      <Card className="mb-6">
+        <div
+          className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+            isDragging ? 'border-blue-500 bg-blue-50' : 'border-gray-300'
+          }`}
+          onDragEnter={handleDragEnter}
+          onDragLeave={handleDragLeave}
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
+        >
+          {previewUrl ? (
+            <div className="flex flex-col items-center space-y-4">
+              <Image
+                src={previewUrl}
+                alt="搜索图片"
+                style={{ maxHeight: 300, objectFit: 'contain' }}
+              />
+              <div className="flex space-x-2">
+                <Button type="primary" icon={<SearchOutlined />} onClick={handleSearch} loading={loading}>
+                  搜索相似产品
+                </Button>
+                <Button icon={<ClearOutlined />} onClick={handleClear}>
+                  清除
+                </Button>
               </div>
             </div>
-          </div>
-        )}
-
-        <button
-          type="submit"
-          disabled={loading || !searchImage}
-          className={`w-full p-2 text-white rounded ${
-            loading || !searchImage
-              ? 'bg-gray-400'
-              : 'bg-blue-500 hover:bg-blue-600'
-          }`}
-          onClick={() => {
-            console.log('🔘 搜索按钮点击事件:', {
-              loading,
-              hasSearchImage: !!searchImage,
-              searchImageName: searchImage?.name,
-              disabled: loading || !searchImage,
-              forceUpdateCounter: forceUpdate,
-              timestamp: new Date().toISOString()
-            });
-          }}
-        >
-          {loading ? '搜索中...' : '搜索'}
-        </button>
-      </form>
-
-      {results && results.length > 0 && (
-        <div>
-          <h3 className="text-xl font-semibold mb-4">搜索结果</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {results.map((result) => (
-              <div 
-                key={result.id}
-                className="border rounded-lg overflow-hidden shadow-sm hover:shadow-md transition-shadow duration-200 cursor-pointer"
-                onClick={() => window.open(`/product/${result.id}`, '_blank')}
+          ) : (
+            <div>
+              <UploadOutlined style={{ fontSize: 48, color: '#1890ff' }} />
+              <p className="text-lg mt-4">拖拽图片到此处，或点击选择文件</p>
+              <p className="text-gray-500 mt-2">支持 JPG、PNG、GIF 等格式</p>
+              <p className="text-gray-500">提示: 您也可以直接粘贴剪贴板中的图片 (Ctrl+V / Cmd+V)</p>
+              <Button
+                type="primary"
+                className="mt-4"
+                onClick={() => fileInputRef.current?.click()}
               >
-                <div className="w-full h-48 bg-gray-100 flex items-center justify-center">
-                  <img
-                    src={getImageUrl(result.oss_path)}
-                    alt={result.oss_path ? `缩略图 ${result.id}` : '缩略图'}
-                    className="max-w-full max-h-full object-contain"
-                  />
-                </div>
-                {/* 信息部分 */}
-                <div className="p-4">
-                  <p className="text-sm text-gray-700 mb-1">
-                    产品ID: {result.id}
-                  </p>
-                  <p className="text-sm text-gray-600 mb-2">
-                    相似度: {(result.similarity * 100).toFixed(2)}%
-                  </p>
-                  {result.original_path && (
-                    <p className="text-xs text-gray-500 break-all mb-2">
-                      原始路径: {result.original_path}
-                    </p>
-                  )}
-                  {result.oss_path && (
-                    <p className="text-xs text-gray-500 break-all mb-2">
-                      OSS路径: {result.oss_path}
-                    </p>
-                  )}
-                  <p 
-                    className="text-lg font-bold text-blue-600 cursor-pointer hover:bg-blue-50 px-2 py-1 rounded transition-colors"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      const priceValue = (typeof result.sale_price === 'number' && !isNaN(result.sale_price))
-                        ? result.sale_price
-                        : (typeof result.sale_price === 'number' && !isNaN(result.sale_price))
-                          ? result.sale_price
-                          : undefined;
+                选择文件
+              </Button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                onChange={handleFileChange}
+                style={{ display: 'none' }}
+              />
+            </div>
+          )}
+        </div>
+      </Card>
 
-                      const priceText = typeof priceValue === 'number' ? `¥${priceValue.toFixed(2)}` : '价格未知';
-                      navigator.clipboard.writeText(priceText)
-                        .then(() => message.success('价格已复制到剪贴板'))
-                        .catch(() => message.error('复制失败'));
-                    }}
-                    title="点击复制价格"
-                  > 
-                    {typeof result.sale_price === 'number' && !isNaN(result.sale_price)
-                      ? `¥${result.sale_price.toFixed(2)}`
-                      : (typeof result.price === 'number' && !isNaN(result.price)
-                        ? `¥${result.price.toFixed(2)}`
-                        : '价格未知')}
-                  </p>
-                  <div className="mt-3 flex items-center justify-between">
-                    {/* 小缩略图 */}
-                    {(result.image_path) && (
-                      <img
-                        src={getImageUrl(result.image_path)}
-                        alt={result.image_path ? `缩略图 ${result.id}` : '缩略图'}
-                        className="w-8 h-8 object-cover rounded mr-2 border border-gray-200"
-                      />
-                    )}
-
-                    <span className="text-sm text-blue-600 font-medium">查看详情 →</span>
+      {/* 搜索结果 */}
+      {loading ? (
+        <div className="text-center py-12">
+          <Spin size="large" tip="搜索中..." />
+        </div>
+      ) : results.length > 0 ? (
+        <div>
+          <h3 className="text-xl font-bold mb-4">搜索结果 ({results.length} 个)</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {results.map((result, index) => (
+              <Card
+                key={`${result.model_number}-${index}`}
+                hoverable
+                cover={
+                  <div className="relative">
+                    <Image
+                      src={getImageUrl(result.matched_image || result.primary_image || '')}
+                      alt={result.model_number}
+                      style={{ height: 250, objectFit: 'cover' }}
+                    />
+                    <div className="absolute top-2 right-2">
+                      <Tag color="blue">相似度: {((result.similarity || 0) * 100).toFixed(1)}%</Tag>
+                    </div>
                   </div>
-                </div>
-              </div>
+                }
+              >
+                <Card.Meta
+                  title={result.model_number}
+                  description={
+                    <div>
+                      <p className="text-gray-600 mb-2">{result.category}</p>
+                      <Descriptions column={1} size="small">
+                        <Descriptions.Item label="摄影师文件">
+                          {result.photographer_file}
+                        </Descriptions.Item>
+                        {result.price_1688 && (
+                          <Descriptions.Item label="1688价格">
+                            ¥{result.price_1688.toFixed(2)}
+                          </Descriptions.Item>
+                        )}
+                        {result.fob_price_tier1 && (
+                          <Descriptions.Item label="FOB报价">
+                            ${result.fob_price_tier1.toFixed(2)} - ${result.fob_price_tier3?.toFixed(2) || result.fob_price_tier1.toFixed(2)}
+                          </Descriptions.Item>
+                        )}
+                        {result.spec_cn && (
+                          <Descriptions.Item label="参数">
+                            {result.spec_cn.substring(0, 50)}...
+                          </Descriptions.Item>
+                        )}
+                      </Descriptions>
+                      {result.alibaba_product_url && (
+                        <a
+                          href={result.alibaba_product_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-500 hover:text-blue-700 text-sm mt-2 inline-block"
+                        >
+                          查看阿里产品详情 →
+                        </a>
+                      )}
+                    </div>
+                  }
+                />
+              </Card>
             ))}
           </div>
         </div>
-      )}
-
-      {product && (
-        <Card>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <h3 className="text-xl font-bold mb-4">商品图片</h3>
-              <div className="grid grid-cols-2 gap-2">
-                {product.good_img && (() => {
-                  const raw = Array.isArray(product.good_img)
-                    ? (product.good_img as (string | { url: string })[])
-                    : (product.good_img ? JSON.parse(product.good_img as string) : []);
-                  return (raw as (string | { url: string })[]).map((img: string | { url: string }, index: number) => {
-                    const path = typeof img === 'string' ? img : img.url;
-                    return (
-                      <Image
-                        key={index}
-                        src={`${API_BASE_URL}${path}`}
-                        alt={`商品图片 ${index + 1}`}
-                        style={{ width: '100%', height: 'auto' }}
-                      />
-                    );
-                  });
-                })()}
-              </div>
-              {product.size_img && (
-                <>
-                  <h3 className="text-xl font-bold my-4">尺码图片</h3>
-                  <div className="grid grid-cols-2 gap-2">
-                    {(() => {
-                      const sizeRaw = Array.isArray(product.size_img)
-                        ? (product.size_img as (string | { url: string })[])
-                        : (product.size_img ? JSON.parse(product.size_img as string) : []);
-                      return (sizeRaw as (string | { url: string })[]).map((img: string | { url: string }, index: number) => {
-                        const path = typeof img === 'string' ? img : img.url;
-                        return (
-                          <Image
-                            key={index}
-                            src={`${API_BASE_URL}                <Descriptions.Item label="成本价">¥{product.price}</Descriptions.Item>${path}`}
-                            alt={`尺码图片 ${index + 1}`}
-                            style={{ width: '100%', height: 'auto' }}
-                          />
-                        );
-                      });
-                    })()}
-                  </div>
-                </>
-              )}
-            </div>
-            
-            <div>
-              <Descriptions title="商品信息" bordered column={1}>
-                <Descriptions.Item label="商品ID">{product.id}</Descriptions.Item>
-                <Descriptions.Item label="商品名称">{product.name}</Descriptions.Item>
-                <Descriptions.Item label="销售价">{product.sale_price}</Descriptions.Item>
-                <Descriptions.Item label="货号">{product.product_code}</Descriptions.Item>
-                <Descriptions.Item label="图案">{product.pattern}</Descriptions.Item>
-                <Descriptions.Item label="裙长">{product.skirt_length}</Descriptions.Item>
-                <Descriptions.Item label="衣长">{product.clothing_length}</Descriptions.Item>
-                <Descriptions.Item label="风格">{product.style}</Descriptions.Item>
-                <Descriptions.Item label="裤长">{product.pants_length}</Descriptions.Item>
-                <Descriptions.Item label="袖长">{product.sleeve_length}</Descriptions.Item>
-                <Descriptions.Item label="流行元素">{product.fashion_elements}</Descriptions.Item>
-                <Descriptions.Item label="工艺">{product.craft}</Descriptions.Item>
-                <Descriptions.Item label="上市年份/季节">{product.launch_season}</Descriptions.Item>
-                <Descriptions.Item label="主面料成分">{product.main_material}</Descriptions.Item>
-                <Descriptions.Item label="颜色">{product.color}</Descriptions.Item>
-                <Descriptions.Item label="尺码">{product.size}</Descriptions.Item>
-                <Descriptions.Item label="工厂名称">{product.factory_name}</Descriptions.Item>
-                <Descriptions.Item label="描述">{product.description}</Descriptions.Item>
-              </Descriptions>
-            </div>
-          </div>
-        </Card>
+      ) : (
+        !loading && searchImage && <Empty description="未找到相似产品" />
       )}
     </div>
   );
 };
-
-export default ProductSearch;

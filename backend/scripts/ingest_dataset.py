@@ -2,6 +2,12 @@
 """
 批量导入本地数据集图片并构建向量索引。
 """
+
+raise SystemExit(
+    "This script is deprecated and disabled. "
+    "Use the products_v2 ingestion flow and PGVector-based search path instead."
+)
+
 import argparse
 import json
 import logging

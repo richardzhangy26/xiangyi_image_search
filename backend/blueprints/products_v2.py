@@ -11,6 +11,7 @@ import csv
 import io
 from flask_cors import cross_origin
 from models import db, Product, ProductImage
+from product_search import EmbeddingServiceError, VectorSearchError
 products_v2_bp = Blueprint('products_v2', __name__, url_prefix='/api/products')
 
 # ========================================
@@ -21,6 +22,42 @@ def allowed_file(filename):
     """检查文件扩展名是否允许"""
     ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def error_response(message, error_code, status_code):
+    """统一错误响应格式"""
+    return jsonify({'error': message, 'error_code': error_code}), status_code
+
+
+def validate_top_k(raw_top_k, default=10, min_value=1, max_value=50):
+    """严格校验 top_k 参数"""
+    if raw_top_k is None or raw_top_k == '':
+        return default
+
+    try:
+        top_k = int(raw_top_k)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('top_k 必须是整数') from exc
+
+    if not (min_value <= top_k <= max_value):
+        raise ValueError(f'top_k 必须在 {min_value} 到 {max_value} 之间')
+
+    return top_k
+
+
+def dedupe_results_by_model_number(results):
+    """按 model_number 去重，保留最高相似度。"""
+    deduped = []
+    seen_model_numbers = set()
+
+    for result in results:
+        model_number = result.get('model_number')
+        if not model_number or model_number in seen_model_numbers:
+            continue
+        deduped.append(result)
+        seen_model_numbers.add(model_number)
+
+    return deduped
 
 
 def save_product_image(file, model_number):
@@ -137,6 +174,8 @@ def get_product(model_number):
 @cross_origin()
 def create_product():
     """创建新产品（支持图片上传）"""
+    saved_filesystem_paths = []
+    should_cleanup_files = False
     try:
         # 获取产品数据
         product_data_str = request.form.get('product')
@@ -157,43 +196,39 @@ def create_product():
         if Product.query.get(model_number):
             return jsonify({'error': f'型号 {model_number} 已存在'}), 400
 
-        # 创建产品对象
+        # 创建产品对象（单事务：此处不提交）
         product = Product.from_dict(product_data)
         db.session.add(product)
-        db.session.commit()
 
         # 处理图片上传
         images = request.files.getlist('images')
         uploaded_images = []
-
         for idx, image_file in enumerate(images):
             if image_file and allowed_file(image_file.filename):
                 web_path, filesystem_path = save_product_image(image_file, model_number)
 
                 if web_path and filesystem_path:
+                    saved_filesystem_paths.append(filesystem_path)
                     # 生成向量
-                    try:
-                        product_search_service = current_app.config.get('PRODUCT_SEARCH_SERVICE')
-                        if product_search_service:
-                            feature = product_search_service.extract_feature(filesystem_path)
+                    product_search_service = current_app.config.get('PRODUCT_SEARCH_SERVICE')
+                    if product_search_service:
+                        request_id = uuid.uuid4().hex
+                        feature = product_search_service.extract_feature(filesystem_path, request_id=request_id)
 
-                            # 创建 ProductImage 记录
-                            product_image = ProductImage(
-                                model_number=model_number,
-                                image_path=web_path,
-                                vector=feature.tolist(),  # Pgvector expects a list, not bytes
-                                original_path=filesystem_path,
-                                image_order=idx,
-                                is_primary=(idx == 0)  # 第一张为主图
-                            )
-                            db.session.add(product_image)
-                            uploaded_images.append(web_path)
-
-                    except Exception as e:
-                        current_app.logger.error(f"生成图片向量失败: {str(e)}")
-                        # 继续处理，不中断
+                        # 创建 ProductImage 记录
+                        product_image = ProductImage(
+                            model_number=model_number,
+                            image_path=web_path,
+                            vector=feature.tolist(),
+                            original_path=filesystem_path,
+                            image_order=idx,
+                            is_primary=(idx == 0)  # 第一张为主图
+                        )
+                        db.session.add(product_image)
+                        uploaded_images.append(web_path)
 
         db.session.commit()
+        should_cleanup_files = False
 
         # 无需刷新向量索引 (Stateless)
         # if uploaded_images and current_app.config.get('PRODUCT_INDEX'):
@@ -205,10 +240,26 @@ def create_product():
             'uploaded_images': len(uploaded_images)
         }), 201
 
+    except EmbeddingServiceError as e:
+        db.session.rollback()
+        should_cleanup_files = True
+        current_app.logger.error(f"创建产品失败（向量服务）: {str(e)}")
+        return error_response(str(e), 'EMBEDDING_SERVICE_ERROR', 503)
     except Exception as e:
         db.session.rollback()
+        should_cleanup_files = True
         current_app.logger.error(f"创建产品失败: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return error_response(str(e), 'PRODUCT_CREATE_FAILED', 500)
+    finally:
+        if should_cleanup_files:
+            for filesystem_path in saved_filesystem_paths:
+                try:
+                    if os.path.exists(filesystem_path):
+                        os.remove(filesystem_path)
+                except Exception as cleanup_error:
+                    current_app.logger.warning(
+                        f"清理失败图片文件失败: {filesystem_path}, error={cleanup_error}"
+                    )
 
 
 @products_v2_bp.route('/<model_number>', methods=['PUT'])
@@ -563,20 +614,21 @@ def build_vector_index():
 @cross_origin()
 def search_products():
     """以图搜图功能"""
+    request_id = uuid.uuid4().hex
     try:
         # 检查搜索服务
         if 'PRODUCT_SEARCH_SERVICE' not in current_app.config:
-            return jsonify({'error': '向量搜索未配置'}), 500
+            return error_response('向量搜索未配置', 'VECTOR_SEARCH_NOT_CONFIGURED', 500)
 
         search_service = current_app.config['PRODUCT_SEARCH_SERVICE']
 
         # 处理上传的图片
         if 'image' not in request.files:
-            return jsonify({'error': '缺少图片文件'}), 400
+            return error_response('缺少图片文件', 'MISSING_IMAGE_FILE', 400)
 
         image_file = request.files['image']
         if not image_file or not allowed_file(image_file.filename):
-            return jsonify({'error': '图片格式不支持'}), 400
+            return error_response('图片格式不支持', 'UNSUPPORTED_IMAGE_FORMAT', 400)
 
         # 保存临时文件
         temp_filename = f"search_{uuid.uuid4()}_{secure_filename(image_file.filename)}"
@@ -585,11 +637,21 @@ def search_products():
 
         try:
             # 执行搜索
-            top_k = request.form.get('top_k', 10, type=int)
-            results = search_service.search_similar_images(temp_path, top_k=top_k)
+            try:
+                top_k = validate_top_k(request.form.get('top_k'))
+            except ValueError as e:
+                return error_response(str(e), 'INVALID_TOP_K', 400)
+
+            results = search_service.search_similar_images(temp_path, top_k=top_k, request_id=request_id)
+
+            # 搜索结果为空直接返回，避免无意义数据库查询
+            if not results:
+                return jsonify([])
+
+            deduped_results = dedupe_results_by_model_number(results)
 
             # 获取产品详情
-            model_numbers = [result.get('model_number') for result in results]
+            model_numbers = [result.get('model_number') for result in deduped_results]
             products = Product.query.filter(Product.model_number.in_(model_numbers)).all()
 
             # 构建产品字典
@@ -597,7 +659,7 @@ def search_products():
 
             # 组装结果
             search_results = []
-            for result in results:
+            for result in deduped_results:
                 model_number = result.get('model_number')
                 product = products_dict.get(model_number)
 
@@ -614,9 +676,15 @@ def search_products():
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
+    except EmbeddingServiceError as e:
+        current_app.logger.error(f"图片搜索失败（向量服务） request_id={request_id}: {str(e)}")
+        return error_response(str(e), 'EMBEDDING_SERVICE_ERROR', 503)
+    except VectorSearchError as e:
+        current_app.logger.error(f"图片搜索失败（向量检索） request_id={request_id}: {str(e)}")
+        return error_response(str(e), 'VECTOR_SEARCH_ERROR', 500)
     except Exception as e:
-        current_app.logger.error(f"图片搜索失败: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.error(f"图片搜索失败 request_id={request_id}: {str(e)}")
+        return error_response(str(e), 'IMAGE_SEARCH_FAILED', 500)
 
 
 # ========================================

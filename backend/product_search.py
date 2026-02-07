@@ -6,8 +6,19 @@ from PIL import Image
 import io
 import time
 import os
+import logging
 from models import ProductImage, Product, db
-from sqlalchemy import text
+
+
+logger = logging.getLogger(__name__)
+
+
+class EmbeddingServiceError(Exception):
+    """图片向量提取服务异常。"""
+
+
+class VectorSearchError(Exception):
+    """向量检索异常。"""
 
 # 设置DashScope API密钥
 dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
@@ -72,15 +83,21 @@ class ImageSearchService:
         base64_image = base64.b64encode(img_bytes).decode('utf-8')
         return f"data:image/jpeg;base64,{base64_image}"
     
-    def extract_feature(self, image_path: str) -> np.ndarray:
+    def extract_feature(self, image_path: str, request_id: str | None = None) -> np.ndarray:
         """使用DashScope API提取图片特征向量"""
+        start_time = time.perf_counter()
+
         # 将图片转换为base64格式
-        print(f"正在处理图片: {image_path}")
         image_data = self._image_to_base64(image_path)
         
         # 调用DashScope API
         inputs = [{'image': image_data}]
-        print("正在调用DashScope API...")
+        logger.info(
+            "embedding.extract.start request_id=%s model=%s image_path=%s",
+            request_id,
+            "multimodal-embedding-v1",
+            image_path,
+        )
         
         # 添加重试机制
         max_retries = 3
@@ -94,58 +111,88 @@ class ImageSearchService:
                 )
                 
                 if resp.status_code != HTTPStatus.OK:
-                    if "rate limit exceeded" in resp.message.lower():
+                    error_message = (getattr(resp, 'message', None) or '').lower()
+                    if "rate limit exceeded" in error_message:
                         if retry < max_retries - 1:  # 如果不是最后一次重试
-                            print(f"API速率限制错误，等待 {retry_delay} 秒后重试 ({retry+1}/{max_retries})...")
+                            logger.warning(
+                                "embedding.extract.retry request_id=%s retry=%s delay_seconds=%s",
+                                request_id,
+                                retry + 1,
+                                retry_delay,
+                            )
                             time.sleep(retry_delay)
                             retry_delay *= 2  # 指数退避策略
                             continue
-                    raise Exception(f"API调用失败: {resp.message}")
+                    raise EmbeddingServiceError(f"API调用失败: {getattr(resp, 'message', 'unknown error')}")
                 
                 # 获取特征向量
-                print("API调用成功，正在处理返回结果...")
                 # DashScope返回的已经是归一化的向量
                 feature = np.array(resp.output['embeddings'][0]['embedding'], dtype=np.float32)
+                latency_ms = int((time.perf_counter() - start_time) * 1000)
+                logger.info(
+                    "embedding.extract.success request_id=%s model=%s latency_ms=%s",
+                    request_id,
+                    "multimodal-embedding-v1",
+                    latency_ms,
+                )
                 return feature
-                
+
             except Exception as e:
                 if retry < max_retries - 1 and "rate limit exceeded" in str(e).lower():
-                    print(f"API速率限制错误，等待 {retry_delay} 秒后重试 ({retry+1}/{max_retries})...")
+                    logger.warning(
+                        "embedding.extract.retry request_id=%s retry=%s delay_seconds=%s",
+                        request_id,
+                        retry + 1,
+                        retry_delay,
+                    )
                     time.sleep(retry_delay)
                     retry_delay *= 2  # 指数退避策略
                 else:
-                    raise  # 如果是其他错误或已达到最大重试次数，则抛出异常
+                    latency_ms = int((time.perf_counter() - start_time) * 1000)
+                    logger.error(
+                        "embedding.extract.failed request_id=%s model=%s latency_ms=%s error=%s",
+                        request_id,
+                        "multimodal-embedding-v1",
+                        latency_ms,
+                        str(e),
+                    )
+                    if isinstance(e, EmbeddingServiceError):
+                        raise
+                    raise EmbeddingServiceError(f"图片向量提取失败: {e}") from e
 
-    def search_similar_images(self, image_path: str, top_k: int = 10) -> list:
+    def search_similar_images(self, image_path: str, top_k: int = 10, request_id: str | None = None) -> list:
         """
         直接使用数据库进行以图搜图 (PostgreSQL + pgvector)
         """
+        start_time = time.perf_counter()
         try:
             # 1. 提取特征向量
-            query_vector = self.extract_feature(image_path)
+            query_vector = self.extract_feature(image_path, request_id=request_id).tolist()
             
             # 2. 数据库向量检索
-            # 使用 pgvector 的 <-> 操作符 (L2距离)
-            # 需要将 numpy 数组转换为列表，SQLAlchemy 会自动处理转换
-            
-            print(f"Executing SQL vector search for top {top_k} results...")
-            
+            logger.info(
+                "vector.search.start request_id=%s top_k=%s metric=cosine image_path=%s",
+                request_id,
+                top_k,
+                image_path,
+            )
+
+            distance_expr = ProductImage.vector.cosine_distance(query_vector)
+
             results = db.session.query(
                 ProductImage,
-                ProductImage.vector.l2_distance(query_vector).label('distance')
+                distance_expr.label('distance')
             ).join(
                 Product, ProductImage.model_number == Product.model_number
             ).order_by(
-                ProductImage.vector.l2_distance(query_vector)
+                distance_expr
             ).limit(top_k).all()
 
             # 3. 格式化结果
             final_results = []
             for img, distance in results:
-                # 将距离转换为相似度 (0-1)
-                # distance 是 float 类型
-                similarity = 1 / (1 + distance)
-                
+                similarity = max(0.0, 1.0 - float(distance))
+
                 final_results.append({
                     'model_number': img.model_number,
                     'image_path': img.image_path,
@@ -153,11 +200,26 @@ class ImageSearchService:
                     'oss_path': img.oss_path,
                     'similarity': float(similarity)
                 })
-            
-            return final_results
 
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            logger.info(
+                "vector.search.success request_id=%s top_k=%s result_count=%s metric=cosine latency_ms=%s",
+                request_id,
+                top_k,
+                len(final_results),
+                latency_ms,
+            )
+
+            return final_results
+        except EmbeddingServiceError:
+            raise
         except Exception as e:
-            print(f"搜索失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            logger.error(
+                "vector.search.failed request_id=%s top_k=%s latency_ms=%s error=%s",
+                request_id,
+                top_k,
+                latency_ms,
+                str(e),
+            )
+            raise VectorSearchError(f"向量检索失败: {e}") from e

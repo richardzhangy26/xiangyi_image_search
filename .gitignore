@@ -67,3 +67,4 @@ Thumbs.db
 # Logs
 *.log
 *.jpg
+.mcp.json

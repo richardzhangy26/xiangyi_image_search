@@ -8,7 +8,14 @@ from pathlib import Path
 from models import db
 from blueprints.products_v2 import products_v2_bp  # 新版本
 from product_search import ImageSearchService
-# 数据库配置（默认使用 PostgreSQL + pgvector）
+# 数据库配置（优先使用 Supabase，否则回退到本地 PostgreSQL）
+# Supabase 提供两种连接方式:
+# - DIRECT_URL: 直连数据库（适用于迁移、长事务）
+# - DATABASE_URL: 连接池方式（推荐用于应用运行时，性能更好）
+SUPABASE_DIRECT_URL = os.getenv('DIRECT_URL')
+SUPABASE_DATABASE_URL = os.getenv('DATABASE_URL')
+
+# 本地 PostgreSQL 配置（作为回退选项）
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
     'port': int(os.getenv('DB_PORT', 5432)),
@@ -24,11 +31,22 @@ def create_app(config_name='development'):
         app.config['TESTING'] = True
         app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
     else:
-        # 使用统一的数据库配置（PostgreSQL + pgvector）
-        app.config['SQLALCHEMY_DATABASE_URI'] = (
-            f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
-            f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
-        )
+        # 优先使用 Supabase 连接池（DATABASE_URL）
+        # 如果不存在，则使用直连（DIRECT_URL）
+        # 最后回退到本地 PostgreSQL
+        if SUPABASE_DATABASE_URL:
+            app.config['SQLALCHEMY_DATABASE_URI'] = SUPABASE_DATABASE_URL
+            app.logger.info("使用 Supabase 连接池 (DATABASE_URL)")
+        elif SUPABASE_DIRECT_URL:
+            app.config['SQLALCHEMY_DATABASE_URI'] = SUPABASE_DIRECT_URL
+            app.logger.info("使用 Supabase 直连 (DIRECT_URL)")
+        else:
+            # 回退到本地 PostgreSQL
+            app.config['SQLALCHEMY_DATABASE_URI'] = (
+                f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
+                f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+            )
+            app.logger.info(f"使用本地 PostgreSQL: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
     
     # 配置CORS
     CORS(app, resources={

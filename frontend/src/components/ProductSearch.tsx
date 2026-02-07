@@ -4,6 +4,7 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { Card, Button, message, Spin, Empty, Descriptions, Image, Tag } from 'antd';
 import { UploadOutlined, SearchOutlined, ClearOutlined } from '@ant-design/icons';
+import { Upload, Search, X, Sparkles, TrendingUp } from 'lucide-react';
 import type { ProductSearchResult } from '../types/product';
 import { searchProductsByImage, getImageUrl } from '../services/productApi';
 
@@ -140,131 +141,195 @@ export const ProductSearch: React.FC = () => {
   };
 
   return (
-    <div className="p-6">
-      <h2 className="text-2xl font-bold mb-6">以图搜款</h2>
+    <div className="p-8">
+      {/* 标题区域 */}
+      <div className="mb-8">
+        <div className="flex items-center space-x-3 mb-2">
+          <div className="bg-gradient-to-br from-sky-500 to-sky-600 p-2 rounded-lg">
+            <Search className="w-6 h-6 text-white" />
+          </div>
+          <h2 className="text-3xl font-bold text-slate-900">以图搜款</h2>
+        </div>
+        <p className="text-slate-600 ml-14">上传产品图片，AI 智能识别并匹配相似款式</p>
+      </div>
 
       {/* 上传区域 */}
-      <Card className="mb-6">
+      <div className="mb-8">
         <div
-          className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
-            isDragging ? 'border-blue-500 bg-blue-50' : 'border-gray-300'
-          }`}
+          className={`
+            relative border-2 border-dashed rounded-xl p-12 text-center
+            transition-all duration-200
+            ${
+              isDragging
+                ? 'border-sky-500 bg-sky-50 scale-[1.02]'
+                : 'border-slate-300 bg-slate-50 hover:border-sky-400 hover:bg-slate-100'
+            }
+          `}
           onDragEnter={handleDragEnter}
           onDragLeave={handleDragLeave}
           onDragOver={handleDragOver}
           onDrop={handleDrop}
         >
           {previewUrl ? (
-            <div className="flex flex-col items-center space-y-4">
-              <Image
-                src={previewUrl}
-                alt="搜索图片"
-                style={{ maxHeight: 300, objectFit: 'contain' }}
-              />
-              <div className="flex space-x-2">
-                <Button type="primary" icon={<SearchOutlined />} onClick={handleSearch} loading={loading}>
-                  搜索相似产品
-                </Button>
-                <Button icon={<ClearOutlined />} onClick={handleClear}>
-                  清除
-                </Button>
+            <div className="flex flex-col items-center space-y-6">
+              <div className="relative group">
+                <img
+                  src={previewUrl}
+                  alt="搜索图片"
+                  className="max-h-80 rounded-lg shadow-lg object-contain"
+                />
+                <button
+                  onClick={handleClear}
+                  className="absolute top-2 right-2 bg-red-500 text-white p-2 rounded-full opacity-0 group-hover:opacity-100 transition-opacity duration-200 hover:bg-red-600"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="flex space-x-3">
+                <button
+                  onClick={handleSearch}
+                  disabled={loading}
+                  className="flex items-center space-x-2 px-6 py-3 bg-gradient-to-r from-sky-600 to-sky-700 text-white rounded-lg font-medium shadow-md hover:shadow-lg hover:from-sky-700 hover:to-sky-800 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {loading ? (
+                    <>
+                      <Spin size="small" className="text-white" />
+                      <span>搜索中...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-5 h-5" />
+                      <span>搜索相似产品</span>
+                    </>
+                  )}
+                </button>
+                <button
+                  onClick={handleClear}
+                  className="flex items-center space-x-2 px-6 py-3 bg-slate-200 text-slate-700 rounded-lg font-medium hover:bg-slate-300 transition-colors duration-200"
+                >
+                  <X className="w-5 h-5" />
+                  <span>清除</span>
+                </button>
               </div>
             </div>
           ) : (
             <div>
-              <UploadOutlined style={{ fontSize: 48, color: '#1890ff' }} />
-              <p className="text-lg mt-4">拖拽图片到此处，或点击选择文件</p>
-              <p className="text-gray-500 mt-2">支持 JPG、PNG、GIF 等格式</p>
-              <p className="text-gray-500">提示: 您也可以直接粘贴剪贴板中的图片 (Ctrl+V / Cmd+V)</p>
-              <Button
-                type="primary"
-                className="mt-4"
+              <div className="flex justify-center mb-4">
+                <div className="bg-gradient-to-br from-sky-100 to-sky-200 p-6 rounded-full">
+                  <Upload className="w-12 h-12 text-sky-600" />
+                </div>
+              </div>
+              <h3 className="text-xl font-semibold text-slate-900 mb-2">
+                拖拽图片到此处，或点击选择文件
+              </h3>
+              <p className="text-slate-600 mb-1">支持 JPG、PNG、GIF、WebP 等格式</p>
+              <p className="text-sm text-slate-500 mb-6">
+                💡 提示: 您也可以直接粘贴剪贴板中的图片 (Ctrl+V / Cmd+V)
+              </p>
+              <button
                 onClick={() => fileInputRef.current?.click()}
+                className="inline-flex items-center space-x-2 px-6 py-3 bg-sky-600 text-white rounded-lg font-medium shadow-md hover:bg-sky-700 hover:shadow-lg transition-all duration-200"
               >
-                选择文件
-              </Button>
+                <Upload className="w-5 h-5" />
+                <span>选择文件</span>
+              </button>
               <input
                 ref={fileInputRef}
                 type="file"
                 accept="image/*"
                 onChange={handleFileChange}
-                style={{ display: 'none' }}
+                className="hidden"
               />
             </div>
           )}
         </div>
-      </Card>
+      </div>
 
       {/* 搜索结果 */}
       {loading ? (
-        <div className="text-center py-12">
-          <Spin size="large" tip="搜索中..." />
+        <div className="text-center py-20">
+          <Spin size="large" />
+          <p className="mt-4 text-slate-600 text-lg">AI 正在分析图片并搜索相似产品...</p>
         </div>
       ) : results.length > 0 ? (
         <div>
-          <h3 className="text-xl font-bold mb-4">搜索结果 ({results.length} 个)</h3>
+          <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center space-x-3">
+              <TrendingUp className="w-6 h-6 text-sky-600" />
+              <h3 className="text-2xl font-bold text-slate-900">
+                搜索结果
+                <span className="ml-2 text-lg text-slate-500">({results.length} 个相似产品)</span>
+              </h3>
+            </div>
+          </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {results.map((result, index) => (
-              <Card
+              <div
                 key={`${result.model_number}-${index}`}
-                hoverable
-                cover={
-                  <div className="relative">
-                    <Image
-                      src={getImageUrl(result.matched_image || result.primary_image || '')}
-                      alt={result.model_number}
-                      style={{ height: 250, objectFit: 'cover' }}
-                    />
-                    <div className="absolute top-2 right-2">
-                      <Tag color="blue">相似度: {((result.similarity || 0) * 100).toFixed(1)}%</Tag>
+                className="group bg-white rounded-xl border border-slate-200 overflow-hidden hover:shadow-xl hover:border-sky-300 transition-all duration-200 cursor-pointer"
+              >
+                <div className="relative overflow-hidden">
+                  <img
+                    src={getImageUrl(result.matched_image || result.primary_image || '')}
+                    alt={result.model_number}
+                    className="w-full h-64 object-cover group-hover:scale-105 transition-transform duration-300"
+                  />
+                  <div className="absolute top-3 right-3">
+                    <div className="bg-gradient-to-r from-sky-600 to-sky-700 text-white px-3 py-1.5 rounded-full text-sm font-semibold shadow-lg">
+                      相似度: {((result.similarity || 0) * 100).toFixed(1)}%
                     </div>
                   </div>
-                }
-              >
-                <Card.Meta
-                  title={result.model_number}
-                  description={
-                    <div>
-                      <p className="text-gray-600 mb-2">{result.category}</p>
-                      <Descriptions column={1} size="small">
-                        <Descriptions.Item label="摄影师文件">
-                          {result.photographer_file}
-                        </Descriptions.Item>
-                        {result.price_1688 && (
-                          <Descriptions.Item label="1688价格">
-                            ¥{result.price_1688.toFixed(2)}
-                          </Descriptions.Item>
-                        )}
-                        {result.fob_price_tier1 && (
-                          <Descriptions.Item label="FOB报价">
-                            ${result.fob_price_tier1.toFixed(2)} - ${result.fob_price_tier3?.toFixed(2) || result.fob_price_tier1.toFixed(2)}
-                          </Descriptions.Item>
-                        )}
-                        {result.spec_cn && (
-                          <Descriptions.Item label="参数">
-                            {result.spec_cn.substring(0, 50)}...
-                          </Descriptions.Item>
-                        )}
-                      </Descriptions>
-                      {result.alibaba_product_url && (
-                        <a
-                          href={result.alibaba_product_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-blue-500 hover:text-blue-700 text-sm mt-2 inline-block"
-                        >
-                          查看阿里产品详情 →
-                        </a>
-                      )}
+                </div>
+                <div className="p-5">
+                  <h4 className="text-lg font-bold text-slate-900 mb-2">{result.model_number}</h4>
+                  <p className="text-sm text-slate-600 mb-4">{result.category}</p>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">摄影师文件:</span>
+                      <span className="text-slate-900 font-medium truncate ml-2">
+                        {result.photographer_file}
+                      </span>
                     </div>
-                  }
-                />
-              </Card>
+                    {result.price_1688 && (
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">1688价格:</span>
+                        <span className="text-sky-700 font-semibold">
+                          ¥{result.price_1688.toFixed(2)}
+                        </span>
+                      </div>
+                    )}
+                    {result.fob_price_tier1 && (
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">FOB报价:</span>
+                        <span className="text-sky-700 font-semibold">
+                          ${result.fob_price_tier1.toFixed(2)} - $
+                          {result.fob_price_tier3?.toFixed(2) || result.fob_price_tier1.toFixed(2)}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                  {result.alibaba_product_url && (
+                    <a
+                      href={result.alibaba_product_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="mt-4 inline-flex items-center text-sky-600 hover:text-sky-700 font-medium transition-colors duration-200"
+                    >
+                      查看阿里产品详情 →
+                    </a>
+                  )}
+                </div>
+              </div>
             ))}
           </div>
         </div>
       ) : (
-        !loading && searchImage && <Empty description="未找到相似产品" />
+        !loading &&
+        searchImage && (
+          <div className="text-center py-20">
+            <Empty description="未找到相似产品" />
+          </div>
+        )
       )}
     </div>
   );

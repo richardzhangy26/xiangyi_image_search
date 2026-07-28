@@ -3,6 +3,7 @@
 """
 import numpy as np
 import pytest
+from sqlalchemy import text
 
 from models import Product, ProductImage, db
 from services.vector_search import VectorSearchService
@@ -95,8 +96,18 @@ def test_similarity_clamped_to_unit_interval(app):
 
 
 def test_top_k_larger_than_default_ef_search_still_returns_all(app):
-    """旧实现的阻断级缺陷：hnsw.ef_search 默认 40，top_k=50 拿不满。"""
+    """旧实现的阻断级缺陷：hnsw.ef_search 默认 40，top_k=50 拿不满。
+
+    强制 enable_seqscan=off：60 行的测试表在 Postgres 规划器眼里体积太小——
+    顺序扫描+排序比遍历 HNSW 索引更便宜，规划器天然会选 Seq Scan，导致
+    hnsw.ef_search 根本不参与运算，测不出「SET LOCAL 未生效」这类回归
+    （T3 fix round 1 的 mutation test 证实：不加这行时，即使 SET LOCAL 被
+    整行删掉，本测试仍然全绿）。生产环境表更大时规划器会自然选择索引路径，
+    这里用规划器提示复现同样的执行路径，让测试真正覆盖 ef_search 的行为。
+    """
     _seed({f'M-{i:03d}': [_tilted_vector(i, 0.01)] for i in range(60)})
+    db.session.execute(text('SET enable_seqscan = off'))
+    db.session.commit()
 
     results = VectorSearchService().search_by_vector(_unit_vector(0), top_k=50)
 
@@ -114,3 +125,13 @@ def test_result_dict_shape(app):
     result = VectorSearchService().search_by_vector(_unit_vector(0), top_k=1)[0]
 
     assert set(result) == {'model_number', 'image_path', 'original_path', 'oss_path', 'similarity'}
+
+
+def test_invalid_top_k_raises_vector_search_error(app):
+    """T3 fix round 1 Minor：top_k 转 int 失败时必须包装成 VectorSearchError，
+    而不是让原始 ValueError 击穿"只捕获 VectorSearchError"的调用约定。
+    """
+    from services.vector_search import VectorSearchError
+
+    with pytest.raises(VectorSearchError):
+        VectorSearchService().search_by_vector(_unit_vector(0), top_k='not-a-number')

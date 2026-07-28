@@ -88,5 +88,16 @@ def app(_test_database, tmp_path):
         db.session.commit()
         db.drop_all()
         db.create_all()
+        # create_all() 不会建这个索引——models/product.py 没有用 SQLAlchemy Index
+        # 声明它，HNSW 索引只由 postgres/init/01_init.sql / backend/init_db.py 的
+        # 原生 SQL 创建。不补建的话，涉及 hnsw.ef_search 的检索测试会退化成
+        # Seq Scan 精确扫描，测不出近似最近邻检索的真实行为（见 T3 fix round 1）。
+        # 索引名与参数须与 postgres/init/01_init.sql、backend/init_db.py 保持一致。
+        db.session.execute(text(
+            'CREATE INDEX IF NOT EXISTS idx_product_images_vector_hnsw '
+            'ON product_images USING hnsw (vector vector_cosine_ops) '
+            'WITH (m = 16, ef_construction = 64)'
+        ))
+        db.session.commit()
         yield application
         db.session.remove()

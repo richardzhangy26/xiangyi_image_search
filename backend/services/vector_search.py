@@ -74,12 +74,20 @@ class VectorSearchService:
         return self.search_by_vector(query_vector, top_k=top_k, request_id=request_id)
 
     def search_by_vector(self, vector, top_k=10, request_id=None):
-        start = time.perf_counter()
-        top_k = int(top_k)
-        fetch_n = max(top_k, min(top_k * _oversample(), MAX_FETCH_N))
-        ef_search = max(fetch_n, MIN_EF_SEARCH)
+        """按向量做相似检索，返回按 model_number 折叠后的结果列表。
 
+        契约（T3 fix round 1 补充）：本方法结束前（无论成功还是异常）都会对
+        db.session 执行一次 rollback()——用于让 SET LOCAL 失效，把连接干净地
+        还给连接池。调用方若在调用本方法之前，在同一个 session 里留有尚未
+        commit 的写入（db.session.add 但未 commit），会被这次 rollback 静默
+        丢弃且不报错；因此**禁止在同一请求内、调用本方法之前遗留未提交的写入**。
+        """
+        start = time.perf_counter()
         try:
+            top_k = int(top_k)
+            fetch_n = max(top_k, min(top_k * _oversample(), MAX_FETCH_N))
+            ef_search = max(fetch_n, MIN_EF_SEARCH)
+
             # SET LOCAL 而非 SET：Gunicorn + SQLAlchemy 会复用连接，
             # SET 会污染这条连接上后续所有查询。int() 已保证无注入风险。
             db.session.execute(text(f'SET LOCAL hnsw.ef_search = {int(ef_search)}'))
@@ -107,14 +115,15 @@ class VectorSearchService:
             )
             return results
         except Exception as exc:
-            db.session.rollback()
             logger.error(
                 'vector.search.failed request_id=%s top_k=%s latency_ms=%s error=%s',
                 request_id, top_k, int((time.perf_counter() - start) * 1000), exc,
             )
             raise VectorSearchError(f'向量检索失败: {exc}') from exc
         finally:
-            # 结束事务，让 SET LOCAL 失效，连接干净地回到池里
+            # 结束事务，让 SET LOCAL 失效，连接干净地回到池里；
+            # 同时也是上方 docstring 里说明的隐式清空点（只需一次，except 分支
+            # 不再重复调用 rollback——finally 总会在异常传播前执行）。
             db.session.rollback()
 
 

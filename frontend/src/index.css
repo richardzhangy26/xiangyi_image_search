@@ -1,3 +1,69 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  --ink: #273240;
+  --teal: #0d7a72;
+  --teal-deep: #085f59;
+  --amber: #d97b29;
+  --paper: #f6f4ef;
+  --card: #fffdf9;
+}
+
+body {
+  background-color: var(--paper);
+  color: var(--ink);
+  /* 细腻噪点纹理，增加纸面质感 */
+  background-image: radial-gradient(rgba(13, 122, 114, 0.035) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+
+/* 页面卡片入场 */
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-rise {
+  animation: rise-in 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.animate-rise-delay-1 {
+  animation: rise-in 0.45s cubic-bezier(0.22, 1, 0.36, 1) 0.08s both;
+}
+
+.animate-rise-delay-2 {
+  animation: rise-in 0.45s cubic-bezier(0.22, 1, 0.36, 1) 0.16s both;
+}
+
+/* 工具栏按钮悬浮微交互 */
+.toolbar-btn {
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.toolbar-btn:hover {
+  transform: translateY(-1px);
+}
+
+/* CSV 拖拽上传区选中态 */
+.csv-dragger .ant-upload-drag {
+  border: 1.5px dashed rgba(13, 122, 114, 0.35) !important;
+  background: linear-gradient(180deg, #f4faf9 0%, #fffdf9 100%) !important;
+  border-radius: 14px !important;
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.csv-dragger .ant-upload-drag:hover {
+  border-color: var(--teal) !important;
+}
+
+.csv-dragger .ant-upload-drag-hover {
+  border-color: var(--amber) !important;
+}

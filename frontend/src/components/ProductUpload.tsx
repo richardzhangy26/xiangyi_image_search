@@ -15,6 +15,9 @@ import {
   Image,
   Progress,
   Tag,
+  Tooltip,
+  Space,
+  Empty,
 } from 'antd';
 import {
   PlusOutlined,
@@ -23,6 +26,10 @@ import {
   UploadOutlined,
   ReloadOutlined,
   DownloadOutlined,
+  ThunderboltOutlined,
+  InboxOutlined,
+  FileTextOutlined,
+  FileImageOutlined,
 } from '@ant-design/icons';
 import type { UploadFile } from 'antd/es/upload/interface';
 import type { Product, ProductFormData, VectorIndexEvent } from '../types/product';
@@ -37,6 +44,14 @@ import {
   buildVectorIndex,
   getImageUrl,
 } from '../services/productApi';
+
+/** CSV 必填字段说明（用于导入弹窗展示） */
+const CSV_REQUIRED_FIELDS = [
+  { key: 'model_number', label: '型号' },
+  { key: 'photographer_file', label: '摄影师文件' },
+  { key: 'alibaba_product_url', label: '阿里产品链接' },
+  { key: 'category', label: '分类' },
+];
 
 export const ProductUpload: React.FC = () => {
   const [products, setProducts] = useState<Product[]>([]);
@@ -260,20 +275,26 @@ export const ProductUpload: React.FC = () => {
       title: '型号',
       dataIndex: 'model_number',
       key: 'model_number',
-      width: 120,
+      width: 130,
       fixed: 'left' as const,
+      render: (text: string) => (
+        <span className="font-semibold text-slate-800 tracking-wide">{text}</span>
+      ),
     },
     {
       title: '分类',
       dataIndex: 'category',
       key: 'category',
-      width: 100,
+      width: 110,
+      render: (text: string) =>
+        text ? <Tag color="cyan" bordered={false}>{text}</Tag> : '--',
     },
     {
       title: '摄影师文件',
       dataIndex: 'photographer_file',
       key: 'photographer_file',
-      width: 120,
+      width: 130,
+      render: (text: string) => <span className="text-slate-500">{text}</span>,
     },
     {
       title: '主图',
@@ -281,10 +302,18 @@ export const ProductUpload: React.FC = () => {
       key: 'images',
       width: 100,
       render: (images: any) => {
-        if (!images || images.length === 0) return <span>无图片</span>;
+        const primaryImage =
+          images && images.length > 0
+            ? images.find((img: any) => img.is_primary) || images[0]
+            : null;
 
-        const primaryImage = images.find((img: any) => img.is_primary) || images[0];
-        if (!primaryImage) return <span>无图片</span>;
+        if (!primaryImage) {
+          return (
+            <div className="w-[60px] h-[60px] rounded-lg bg-slate-100 border border-dashed border-slate-300 flex items-center justify-center">
+              <FileImageOutlined className="text-slate-400" />
+            </div>
+          );
+        }
 
         return (
           <Image
@@ -292,7 +321,8 @@ export const ProductUpload: React.FC = () => {
             alt="主图"
             width={60}
             height={60}
-            style={{ objectFit: 'cover' }}
+            className="rounded-lg"
+            style={{ objectFit: 'cover', borderRadius: 8 }}
           />
         );
       },
@@ -301,20 +331,38 @@ export const ProductUpload: React.FC = () => {
       title: '1688价格',
       dataIndex: 'price_1688',
       key: 'price_1688',
-      width: 100,
-      render: (price?: number) => (price ? `¥${price.toFixed(2)}` : '--'),
+      width: 110,
+      render: (price?: number) =>
+        price ? (
+          <span className="font-medium text-amber-700">¥{price.toFixed(2)}</span>
+        ) : (
+          <span className="text-slate-400">--</span>
+        ),
     },
     {
       title: 'FOB报价',
       key: 'fob_prices',
       width: 180,
-      render: (_: any, record: Product) => (
-        <div style={{ fontSize: '12px' }}>
-          {record.fob_price_tier1 && <div>300-1999: ${record.fob_price_tier1.toFixed(2)}</div>}
-          {record.fob_price_tier2 && <div>2000-9999: ${record.fob_price_tier2.toFixed(2)}</div>}
-          {record.fob_price_tier3 && <div>≥10000: ${record.fob_price_tier3.toFixed(2)}</div>}
-        </div>
-      ),
+      render: (_: any, record: Product) => {
+        const tiers = [
+          { label: '300-1999', value: record.fob_price_tier1 },
+          { label: '2000-9999', value: record.fob_price_tier2 },
+          { label: '≥10000', value: record.fob_price_tier3 },
+        ].filter((t) => t.value);
+
+        if (tiers.length === 0) return <span className="text-slate-400">--</span>;
+
+        return (
+          <div className="space-y-0.5">
+            {tiers.map((t) => (
+              <div key={t.label} className="text-xs flex items-baseline gap-1.5">
+                <span className="text-slate-400 w-[64px]">{t.label}</span>
+                <span className="font-medium text-teal-700">${t.value!.toFixed(2)}</span>
+              </div>
+            ))}
+          </div>
+        );
+      },
     },
     {
       title: '操作',
@@ -322,15 +370,15 @@ export const ProductUpload: React.FC = () => {
       width: 150,
       fixed: 'right' as const,
       render: (_: any, record: Product) => (
-        <span className="space-x-2">
-          <Button type="text" icon={<EditOutlined />} onClick={() => showModal(record)}>
+        <span className="space-x-1">
+          <Button type="text" size="small" icon={<EditOutlined />} onClick={() => showModal(record)}>
             编辑
           </Button>
           <Popconfirm
             title="确定要删除这个产品吗？"
             onConfirm={() => handleDelete(record.model_number)}
           >
-            <Button type="text" danger icon={<DeleteOutlined />}>
+            <Button type="text" size="small" danger icon={<DeleteOutlined />}>
               删除
             </Button>
           </Popconfirm>
@@ -347,65 +395,132 @@ export const ProductUpload: React.FC = () => {
   };
 
   return (
-    <div className="p-6">
-      <div className="flex justify-between items-center mb-4">
-        <h2 className="text-2xl font-bold">产品管理</h2>
-        <div className="space-x-2">
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => showModal()}>
-            添加产品
-          </Button>
-          <Button icon={<UploadOutlined />} onClick={() => setCsvModalVisible(true)}>
-            CSV 批量导入
-          </Button>
-          <Button icon={<DownloadOutlined />} onClick={downloadCSVTemplate}>
-            下载 CSV 模板
-          </Button>
+    <div className="p-6 lg:p-8">
+      {/* 页头：标题 + 工具栏 */}
+      <div className="flex flex-wrap items-end justify-between gap-4 mb-6 animate-rise">
+        <div>
+          <div className="flex items-center gap-3">
+            <h2 className="text-2xl font-bold text-slate-800 tracking-tight m-0">产品管理</h2>
+            <Tag bordered={false} className="bg-teal-50 text-teal-700 font-medium">
+              {products.length} 个产品
+            </Tag>
+          </div>
+          <p className="text-sm text-slate-400 mt-1 mb-0">
+            维护产品资料与图片，支持 CSV 批量导入与向量索引构建
+          </p>
+        </div>
+
+        {/* 工具栏：主操作 / 数据操作 / 辅助操作 三组 */}
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             type="primary"
+            icon={<PlusOutlined />}
+            className="toolbar-btn shadow-sm"
+            onClick={() => showModal()}
+          >
+            添加产品
+          </Button>
+
+          <Space.Compact className="toolbar-btn">
+            <Button icon={<UploadOutlined />} onClick={() => setCsvModalVisible(true)}>
+              CSV 导入
+            </Button>
+            <Tooltip title="下载 CSV 模板">
+              <Button icon={<DownloadOutlined />} onClick={downloadCSVTemplate} />
+            </Tooltip>
+          </Space.Compact>
+
+          <Button
+            icon={<ThunderboltOutlined />}
+            className="toolbar-btn"
+            style={{ color: '#d97b29', borderColor: '#f0c894', background: '#fdf6ec' }}
             onClick={handleBuildVectorIndex}
             loading={indexingLoading}
           >
             构建向量索引
           </Button>
-          <Button icon={<ReloadOutlined />} onClick={fetchProducts} loading={loading}>
-            刷新
-          </Button>
-          <Popconfirm
-            title={`确定要删除选中的 ${selectedRowKeys.length} 个产品吗？`}
-            onConfirm={handleBatchDelete}
-            disabled={selectedRowKeys.length === 0}
-          >
+
+          <Tooltip title="刷新列表">
             <Button
-              danger
-              disabled={selectedRowKeys.length === 0}
-              loading={batchDeleteLoading}
-            >
-              批量删除 {selectedRowKeys.length > 0 && `(${selectedRowKeys.length})`}
-            </Button>
-          </Popconfirm>
+              className="toolbar-btn"
+              icon={<ReloadOutlined />}
+              onClick={fetchProducts}
+              loading={loading}
+            />
+          </Tooltip>
         </div>
       </div>
 
-      {showProgress && (
-        <div className="mb-4">
-          <Progress percent={Math.round(progressPercent)} />
-          <p className="mt-2 text-sm text-gray-600">{progressMessage}</p>
+      {/* 批量选择上下文操作条：仅选中时浮现 */}
+      {selectedRowKeys.length > 0 && (
+        <div className="animate-rise flex items-center justify-between mb-4 px-4 py-2.5 rounded-xl bg-teal-50/80 border border-teal-100">
+          <span className="text-sm text-teal-800">
+            已选中 <b>{selectedRowKeys.length}</b> 个产品
+          </span>
+          <Space>
+            <Button size="small" onClick={() => setSelectedRowKeys([])}>
+              取消选择
+            </Button>
+            <Popconfirm
+              title={`确定要删除选中的 ${selectedRowKeys.length} 个产品吗？`}
+              onConfirm={handleBatchDelete}
+            >
+              <Button
+                size="small"
+                danger
+                type="primary"
+                icon={<DeleteOutlined />}
+                loading={batchDeleteLoading}
+              >
+                批量删除
+              </Button>
+            </Popconfirm>
+          </Space>
         </div>
       )}
 
-      <Table
-        columns={columns}
-        rowKey="model_number"
-        dataSource={products}
-        rowSelection={rowSelection}
-        loading={loading}
-        scroll={{ x: 1200 }}
-        pagination={{
-          pageSize: 20,
-          showQuickJumper: true,
-          showTotal: (total) => `共 ${total} 条`,
-        }}
-      />
+      {/* 向量索引构建进度 */}
+      {showProgress && (
+        <div className="animate-rise mb-5 px-5 py-4 rounded-xl bg-white border border-slate-200 shadow-sm">
+          <div className="flex items-center gap-2 mb-2">
+            <ThunderboltOutlined className="text-amber-600" />
+            <span className="text-sm font-medium text-slate-700">向量索引构建</span>
+          </div>
+          <Progress
+            percent={Math.round(progressPercent)}
+            strokeColor={{ '0%': '#0d7a72', '100%': '#d97b29' }}
+          />
+          <p className="mt-1 mb-0 text-xs text-slate-400">{progressMessage}</p>
+        </div>
+      )}
+
+      <div className="animate-rise-delay-1">
+        <Table
+          columns={columns}
+          rowKey="model_number"
+          dataSource={products}
+          rowSelection={rowSelection}
+          loading={loading}
+          scroll={{ x: 1200 }}
+          locale={{
+            emptyText: (
+              <Empty
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                description={
+                  <span className="text-slate-400">
+                    暂无产品数据，点击「添加产品」或「CSV 导入」开始
+                  </span>
+                }
+              />
+            ),
+          }}
+          pagination={{
+            pageSize: 20,
+            showQuickJumper: true,
+            showTotal: (total) => `共 ${total} 条`,
+          }}
+        />
+      </div>
 
       {/* 添加/编辑产品弹窗 */}
       <Modal
@@ -418,7 +533,7 @@ export const ProductUpload: React.FC = () => {
         }}
         confirmLoading={loading}
         width={900}
-        bodyStyle={{ maxHeight: '70vh', overflow: 'auto' }}
+        styles={{ body: { maxHeight: '70vh', overflow: 'auto' } }}
       >
         <Form form={form} layout="vertical">
           <div className="grid grid-cols-2 gap-4">
@@ -556,7 +671,12 @@ export const ProductUpload: React.FC = () => {
 
       {/* CSV 导入弹窗 */}
       <Modal
-        title="CSV 批量导入产品"
+        title={
+          <span className="flex items-center gap-2">
+            <FileTextOutlined className="text-teal-600" />
+            CSV 批量导入产品
+          </span>
+        }
         open={csvModalVisible}
         onOk={handleCSVImport}
         onCancel={() => {
@@ -564,34 +684,58 @@ export const ProductUpload: React.FC = () => {
           setCsvFile(null);
         }}
         confirmLoading={csvUploading}
+        okText="开始导入"
+        cancelText="取消"
+        okButtonProps={{ disabled: !csvFile }}
+        width={560}
       >
-        <Form layout="vertical">
-          <Form.Item label="CSV 文件" required>
-            <input
-              type="file"
-              accept=".csv"
-              onChange={(e) => {
-                if (e.target.files) {
-                  setCsvFile(e.target.files[0]);
-                }
-              }}
-            />
-          </Form.Item>
-          <div style={{ marginTop: 12, color: '#666', fontSize: '12px' }}>
-            <p>CSV 文件必须包含以下必填字段：</p>
-            <ul style={{ marginLeft: 20 }}>
-              <li>model_number (型号)</li>
-              <li>photographer_file (摄影师文件)</li>
-              <li>alibaba_product_url (阿里产品链接)</li>
-              <li>category (分类)</li>
-            </ul>
-            <p style={{ marginTop: 8 }}>
-              <Button type="link" onClick={downloadCSVTemplate} style={{ padding: 0 }}>
-                点击下载 CSV 模板
-              </Button>
-            </p>
+        {/* 拖拽上传区 */}
+        <Upload.Dragger
+          className="csv-dragger"
+          accept=".csv"
+          maxCount={1}
+          beforeUpload={(file) => {
+            setCsvFile(file);
+            return false; // 阻止自动上传
+          }}
+          onRemove={() => setCsvFile(null)}
+          fileList={
+            csvFile
+              ? [{ uid: '-1', name: csvFile.name, size: csvFile.size, status: 'done' as const }]
+              : []
+          }
+        >
+          <p className="ant-upload-drag-icon" style={{ marginBottom: 8 }}>
+            <InboxOutlined style={{ color: '#0d7a72', fontSize: 42 }} />
+          </p>
+          <p className="text-slate-700 font-medium mb-1">点击或拖拽 CSV 文件到此处</p>
+          <p className="text-xs text-slate-400 m-0">支持 UTF-8 / GBK 编码，单次导入一个文件</p>
+        </Upload.Dragger>
+
+        {/* 必填字段说明 */}
+        <div className="mt-5 px-4 py-3.5 rounded-xl bg-slate-50 border border-slate-100">
+          <div className="text-xs font-medium text-slate-500 mb-2">CSV 必填字段</div>
+          <div className="flex flex-wrap gap-1.5">
+            {CSV_REQUIRED_FIELDS.map((f) => (
+              <Tag key={f.key} bordered={false} className="bg-white text-slate-600 border border-slate-200 m-0">
+                <code className="text-teal-700">{f.key}</code>
+                <span className="text-slate-400 ml-1">{f.label}</span>
+              </Tag>
+            ))}
           </div>
-        </Form>
+          <div className="mt-3 pt-3 border-t border-slate-200/70 flex items-center justify-between">
+            <span className="text-xs text-slate-400">不确定格式？先下载模板填写</span>
+            <Button
+              type="link"
+              size="small"
+              icon={<DownloadOutlined />}
+              onClick={downloadCSVTemplate}
+              style={{ padding: 0 }}
+            >
+              下载 CSV 模板
+            </Button>
+          </div>
+        </div>
       </Modal>
     </div>
   );

@@ -510,37 +510,51 @@ def import_csv():
             return jsonify({'error': '无法解码 CSV 文件，请使用 UTF-8 或 GBK 编码'}), 400
 
         # 解析 CSV
-        csv_reader = csv.DictReader(io.StringIO(csv_content))
+        rows = list(csv.DictReader(io.StringIO(csv_content)))
 
-        # 统计信息
-        stats = {
-            'total': 0,
-            'success': 0,
-            'failed': 0,
-            'skipped': 0,
-            'errors': []
+        stats = {'total': 0, 'success': 0, 'failed': 0, 'skipped': 0, 'errors': []}
+
+        REQUIRED_FIELDS = ['model_number', 'photographer_file', 'alibaba_product_url', 'category']
+        OPTIONAL_FIELDS = [
+            'spec_cn_reference', 'spec_cn', 'spec_en',
+            'product_size', 'package_size',
+            'price_1688', 'fob_price_tier1', 'fob_price_tier2', 'fob_price_tier3',
+            'intl_platform_price', 'competitor_price',
+            'ref_link_1', 'ref_link_2', 'ref_link_3',
+            'intl_platform_url', 'intl_platform_url_1', 'intl_platform_url_2'
+        ]
+        NUMERIC_SUFFIXES = ('price_1688', 'fob_price_tier1', 'fob_price_tier2',
+                            'fob_price_tier3', 'intl_platform_price', 'competitor_price')
+        COMMIT_EVERY = 200
+
+        # 一次查出全部已存在型号，替代逐行 query.get
+        candidate_model_numbers = {
+            (row.get('model_number') or '').strip()
+            for row in rows if (row.get('model_number') or '').strip()
         }
+        existing_model_numbers = {
+            value for (value,) in db.session.query(Product.model_number).filter(
+                Product.model_number.in_(candidate_model_numbers)
+            ).all()
+        } if candidate_model_numbers else set()
 
-        # 处理每一行
-        for row_number, row in enumerate(csv_reader, start=2):  # 从第2行开始（第1行是表头）
+        pending_in_batch = 0
+        for row_number, row in enumerate(rows, start=2):  # 第 1 行是表头
             stats['total'] += 1
 
             try:
-                # 验证必填字段
-                required_fields = ['model_number', 'photographer_file', 'alibaba_product_url', 'category']
-                for field in required_fields:
+                for field in REQUIRED_FIELDS:
                     if not row.get(field) or str(row.get(field)).strip() == '':
                         raise ValueError(f'缺少必填字段: {field}')
 
                 model_number = row['model_number'].strip()
 
-                # 检查是否已存在
-                if Product.query.get(model_number):
+                # 同时覆盖「库里已有」与「同一个 CSV 内重复」
+                if model_number in existing_model_numbers:
                     stats['skipped'] += 1
                     stats['errors'].append(f"第{row_number}行: 型号 {model_number} 已存在，跳过")
                     continue
 
-                # 构建产品数据
                 product_data = {
                     'model_number': model_number,
                     'photographer_file': row.get('photographer_file', '').strip(),
@@ -548,42 +562,48 @@ def import_csv():
                     'category': row.get('category', '').strip(),
                 }
 
-                # 可选字段
-                optional_fields = [
-                    'spec_cn_reference', 'spec_cn', 'spec_en',
-                    'product_size', 'package_size',
-                    'price_1688', 'fob_price_tier1', 'fob_price_tier2', 'fob_price_tier3',
-                    'intl_platform_price', 'competitor_price',
-                    'ref_link_1', 'ref_link_2', 'ref_link_3',
-                    'intl_platform_url', 'intl_platform_url_1', 'intl_platform_url_2'
-                ]
+                for field in OPTIONAL_FIELDS:
+                    value = (row.get(field) or '').strip()
+                    if not value:
+                        continue
+                    if field in NUMERIC_SUFFIXES:
+                        try:
+                            product_data[field] = float(value)
+                        except ValueError:
+                            current_app.logger.warning(f"第{row_number}行: {field} 值无效: {value}")
+                    else:
+                        product_data[field] = value
 
-                for field in optional_fields:
-                    value = row.get(field, '').strip()
-                    if value:
-                        # 处理数字字段
-                        if field.startswith('price_') or field.startswith('fob_') or field.endswith('_price'):
-                            try:
-                                product_data[field] = float(value)
-                            except ValueError:
-                                current_app.logger.warning(f"第{row_number}行: {field} 值无效: {value}")
-                                product_data[field] = None
-                        else:
-                            product_data[field] = value
-
-                # 创建产品
-                product = Product.from_dict(product_data)
-                db.session.add(product)
-                db.session.commit()
-
+                db.session.add(Product.from_dict(product_data))
+                existing_model_numbers.add(model_number)
                 stats['success'] += 1
+                pending_in_batch += 1
 
-            except Exception as e:
+                if pending_in_batch >= COMMIT_EVERY:
+                    db.session.commit()
+                    pending_in_batch = 0
+
+            except ValueError as e:
+                # 纯业务校验失败（缺必填字段等），发生在 db.session.add() 之前，
+                # session 尚未被这一行污染。绝不能在这里 rollback 整个 session——
+                # 那会把本批中「已 add 但未 commit」的好行一起冲掉，
+                # 使 stats['success'] 与实际入库行数对不上。
                 stats['failed'] += 1
                 error_msg = f"第{row_number}行: {str(e)}"
                 stats['errors'].append(error_msg)
                 current_app.logger.error(error_msg)
+
+            except Exception as e:
+                # 数据库层面异常（如批量 commit 时触发唯一约束冲突）：本批累积但
+                # 尚未提交的数据处于不确定状态，此时整体回滚才是正确行为。
                 db.session.rollback()
+                pending_in_batch = 0
+                stats['failed'] += 1
+                error_msg = f"第{row_number}行: {str(e)}"
+                stats['errors'].append(error_msg)
+                current_app.logger.error(error_msg)
+
+        db.session.commit()
 
         return jsonify({
             'message': 'CSV 导入完成',

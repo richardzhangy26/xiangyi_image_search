@@ -125,3 +125,86 @@ def test_embed_images_empty_list_makes_no_call():
     with patch('dashscope.MultiModalEmbedding.call') as call:
         assert EmbeddingClient(api_key='k').embed_images([]) == []
     call.assert_not_called()
+
+
+# ---------- fix round 1：响亮失败 vs 静默错位 / 数据损坏 ----------
+
+def test_call_raises_when_returned_count_is_fewer_than_requested():
+    """status_code=200 但返回数量少于请求数量（如缺 index=1）：
+    绝不能静默截断返回列表——那会让后续所有向量在结果数组里整体错位一格，
+    调用方按位置 zip(image_paths, vectors) 会把向量绑到错误的图片上。
+    必须是一次响亮的 EmbeddingServiceError。
+    """
+    def fake_call(**kwargs):
+        return FakeResponse(2)  # 请求 3 个，只返回 2 个
+
+    with patch('dashscope.MultiModalEmbedding.call', side_effect=fake_call):
+        with pytest.raises(EmbeddingServiceError):
+            EmbeddingClient(api_key='k')._call(
+                [{'image': 'a'}, {'image': 'b'}, {'image': 'c'}], None
+            )
+
+
+def test_embed_image_raises_service_error_when_response_is_empty():
+    """DashScope 返回空 embeddings 列表（status_code=200）：
+    必须抛 EmbeddingServiceError，而不是未包装的 IndexError 击穿调用方
+    （调用方按文档只捕获 EmbeddingServiceError）。
+    """
+    def fake_call(**kwargs):
+        return FakeResponse(0)
+
+    with patch('dashscope.MultiModalEmbedding.call', side_effect=fake_call):
+        with pytest.raises(EmbeddingServiceError):
+            EmbeddingClient(api_key='k').embed_image('/img/a.jpg')
+
+
+def test_embed_images_degrades_when_chunk_count_mismatches():
+    """批量调用 status_code=200 但数量对不上（缺 index=1）：视为该 chunk 失败，
+    降级为逐张调用（非限流原因，允许逐张重试定位坏图）。
+    最终返回列表长度必须仍与入参一致，不能因为一次错位就丢数据或整体错位。
+    """
+    paths = [f'/img/{i}.jpg' for i in range(3)]
+
+    def fake_call(**kwargs):
+        inputs = kwargs['input']
+        if len(inputs) > 1:
+            resp = FakeResponse(0)
+            # 只返回 index=0, 2，缺 index=1
+            resp.output = {
+                'embeddings': [
+                    {'index': 0, 'embedding': [0.1] * 1024},
+                    {'index': 2, 'embedding': [0.1] * 1024},
+                ]
+            }
+            return resp
+        return FakeResponse(1)
+
+    with patch('dashscope.MultiModalEmbedding.call', side_effect=fake_call):
+        vectors = EmbeddingClient(api_key='k').embed_images(paths)
+
+    assert len(vectors) == 3
+    assert all(isinstance(v, np.ndarray) for v in vectors)
+
+
+# ---------- fix round 1：429 耗尽不应降级逐张（避免加剧限流） ----------
+
+def test_batch_rate_limit_exhausted_does_not_degrade_to_singles():
+    """整批因 429 重试耗尽而失败：逐张重试同样会被限流，只会发起更多请求、
+    加剧限流。因此不应该降级为逐张调用，该 chunk 直接整体标记为 None，
+    且不产生任何额外的单张调用（长度契约仍然保持：与入参一致）。
+    """
+    paths = [f'/img/{i}.jpg' for i in range(3)]
+    calls = []
+
+    def fake_call(**kwargs):
+        calls.append(len(kwargs['input']))
+        return FakeResponse(0, status_code=429, message='Throttling.RateQuota')
+
+    with patch('dashscope.MultiModalEmbedding.call', side_effect=fake_call), \
+         patch('services.embedding.time.sleep'):
+        vectors = EmbeddingClient(api_key='k', max_retries=2).embed_images(paths)
+
+    assert vectors == [None, None, None]
+    # 只有整批调用重试了 max_retries=2 次（每次都是 3 张一起），
+    # 没有因为降级而对单张图片发起额外调用（否则会看到长度为 1 的调用）。
+    assert calls == [3, 3]

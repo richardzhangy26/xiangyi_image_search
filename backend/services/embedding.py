@@ -31,6 +31,15 @@ class EmbeddingServiceError(Exception):
     """图片向量提取服务异常。"""
 
 
+class EmbeddingRateLimitExhaustedError(EmbeddingServiceError):
+    """429 限流重试已耗尽。
+
+    与其他失败（如坏图导致的 400）不同：这种情况下逐张重试没有意义——
+    账号级限流不会因为把一批拆成多次单张调用就消失，反而会发起更多请求、
+    加剧限流。调用方（_embed_chunk）据此区分是否要降级。
+    """
+
+
 def _to_data_uri(image_path, max_size_mb=MAX_IMAGE_MB):
     """读图 → 必要时压缩到 max_size_mb 以内 → JPEG base64 Data URI。"""
     image = Image.open(image_path)
@@ -104,7 +113,15 @@ class EmbeddingClient:
         try:
             inputs = [{'image': _to_data_uri(path)} for path in chunk]
             return self._call(inputs, request_id)
-        except Exception as exc:  # noqa: BLE001 - 批失败一律降级重试
+        except EmbeddingRateLimitExhaustedError as exc:
+            # 429 重试已耗尽：逐张重试同样会被限流，只会发起更多请求、加剧限流。
+            # 不降级，整批直接判定失败（保持 embed_images 的长度契约：全部记为 None）。
+            logger.error(
+                'embedding.batch.rate_limited request_id=%s size=%s error=%s',
+                request_id, len(chunk), exc,
+            )
+            return [None] * len(chunk)
+        except Exception as exc:  # noqa: BLE001 - 非限流原因（如坏图 400），降级逐张定位
             logger.warning(
                 'embedding.batch.degraded request_id=%s size=%s error=%s',
                 request_id, len(chunk), exc,
@@ -124,6 +141,9 @@ class EmbeddingClient:
 
     def _call(self, inputs, request_id):
         """带 429 指数退避的 DashScope 调用，返回 np.ndarray 列表（按 index 排序）。"""
+        if self.max_retries <= 0:
+            raise EmbeddingServiceError('EmbeddingClient.max_retries 必须 >= 1')
+
         start = time.perf_counter()
         delay = self.initial_delay
 
@@ -139,7 +159,19 @@ class EmbeddingClient:
                 raise EmbeddingServiceError(f'图片向量提取失败: {exc}') from exc
 
             if resp.status_code == HTTPStatus.OK:
-                embeddings = sorted(resp.output['embeddings'], key=lambda e: e.get('index', 0))
+                embeddings = resp.output['embeddings']
+                if len(embeddings) != len(inputs):
+                    # 状态码 200 但数量对不上：绝不能静默返回错位/缺项的向量列表——
+                    # 调用方按位置 zip(image_paths, vectors) 会把向量错误地绑到别的图片上，
+                    # 这是静默的数据损坏（搜 A 出 B）。必须是一次响亮的失败。
+                    logger.error(
+                        'embedding.count_mismatch request_id=%s expected=%s actual=%s',
+                        request_id, len(inputs), len(embeddings),
+                    )
+                    raise EmbeddingServiceError(
+                        f'返回向量数量({len(embeddings)})与请求数量({len(inputs)})不符'
+                    )
+                embeddings = sorted(embeddings, key=lambda e: e.get('index', 0))
                 logger.info(
                     'embedding.success request_id=%s count=%s latency_ms=%s',
                     request_id, len(embeddings), int((time.perf_counter() - start) * 1000),
@@ -147,14 +179,24 @@ class EmbeddingClient:
                 return [np.array(e['embedding'], dtype=np.float32) for e in embeddings]
 
             message = getattr(resp, 'message', '') or ''
-            if resp.status_code == HTTPStatus.TOO_MANY_REQUESTS and attempt < self.max_retries:
-                logger.warning(
-                    'embedding.retry request_id=%s attempt=%s delay_seconds=%s message=%s',
-                    request_id, attempt, delay, message,
+            if resp.status_code == HTTPStatus.TOO_MANY_REQUESTS:
+                if attempt < self.max_retries:
+                    logger.warning(
+                        'embedding.retry request_id=%s attempt=%s delay_seconds=%s message=%s',
+                        request_id, attempt, delay, message,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+
+                logger.error(
+                    'embedding.rate_limit_exhausted request_id=%s attempts=%s message=%s latency_ms=%s',
+                    request_id, attempt, message,
+                    int((time.perf_counter() - start) * 1000),
                 )
-                time.sleep(delay)
-                delay *= 2
-                continue
+                raise EmbeddingRateLimitExhaustedError(
+                    f'429重试{self.max_retries}次后仍限流: {message}'
+                )
 
             logger.error(
                 'embedding.failed request_id=%s status=%s message=%s latency_ms=%s',
@@ -162,5 +204,3 @@ class EmbeddingClient:
                 int((time.perf_counter() - start) * 1000),
             )
             raise EmbeddingServiceError(f'API调用失败({resp.status_code}): {message}')
-
-        raise EmbeddingServiceError('图片向量提取失败: 重试次数已耗尽')

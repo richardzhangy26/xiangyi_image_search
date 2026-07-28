@@ -1,3 +1,4 @@
+import logging
 import os
 from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file
@@ -20,8 +21,17 @@ DB_CONFIG = {
     'password': os.getenv('DB_PASSWORD', ''),
 }
 def create_app(config_name='development'):
+    # 配置结构化日志：services/ 下模块级 logger 继承 root logger 的默认级别
+    # （WARNING），若不显式配置，logger.info(...)（如 vector.search.success）
+    # 永远不会被输出。basicConfig 本身是幂等的——若 root 已有 handler 则
+    # 不生效，这是当前唯一的日志配置点，不存在冲突。
+    logging.basicConfig(
+        level=os.getenv('LOG_LEVEL', 'INFO'),
+        format='%(asctime)s %(levelname)s %(name)s %(message)s',
+    )
+
     app = Flask(__name__)
-    
+
     # 根据配置类型设置配置
     if config_name == 'testing':
         app.config['TESTING'] = True

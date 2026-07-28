@@ -26,4 +26,5 @@
 ## Deprecated Paths
 
 - Legacy FAISS / mixed schema workflows are deprecated for online path
-- `backend/scripts/ingest_dataset.py` is disabled to avoid accidental usage
+- `backend/scripts/ingest_dataset.py`（FAISS 时代）已删除；批量导入改用
+  `python -m scripts.ingest_images --root <素材目录>`（见 `backend/scripts/ingest_images.py`）

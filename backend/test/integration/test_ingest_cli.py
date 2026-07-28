@@ -3,6 +3,7 @@ import io
 import os
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from models import Product, ProductImage, db
@@ -200,3 +201,128 @@ def test_batch_commit_integrity_error_does_not_abort_run_and_cleans_orphan_file(
     content_hash = hash_file(first_path)
     _, fs_path = storage_paths(app.config['UPLOAD_FOLDER'], 'CS-001', content_hash, '.png')
     assert not os.path.exists(fs_path)
+
+
+def test_cleanup_does_not_delete_file_still_referenced_by_a_committed_row(
+    app, tmp_path, monkeypatch,
+):
+    """[Fix round 1 · Critical] 跨批次场景：第一次写入成功提交；第二次因为
+    「判重不加锁」（比如并发下 find_existing_hashes 查询时还没看到第一次的
+    提交）又把同一内容（同一 content_hash → 同一路径，文件名由哈希决定）当成
+    新图送进 ingest_pending，commit 时撞真实的 content_hash UNIQUE 约束。
+
+    rollback 后的清理逻辑绝不能把第一次已提交的合法文件删掉——否则数据库行
+    还在、文件却没了，图片直接 404，而且不会出现在任何"孤儿文件"报告里，
+    比 brief 想避免的普通孤儿文件更隐蔽也更危险。
+    """
+    import scripts.ingest_images as ingest_images_module
+    from services.ingest import hash_file, storage_paths
+
+    _add_product('CS-001')
+    image_path = str(tmp_path / 'CS-001' / '1.png')
+    _write_png(image_path, 'red')
+
+    # 第一次：正常导入，成功落盘并提交
+    first = ingest_images_module.run(app, str(tmp_path), embedding_client=CountingEmbedding())
+    assert first.created == 1
+    assert ProductImage.query.count() == 1
+
+    content_hash = hash_file(image_path)
+    _, fs_path = storage_paths(app.config['UPLOAD_FOLDER'], 'CS-001', content_hash, '.png')
+    assert os.path.exists(fs_path)
+
+    # 第二次：模拟"判重不加锁"的并发场景——find_existing_hashes 查不到刚提交的
+    # 那一行（比如另一个写入者在自己做判重查询之后、commit 之前，第一个写入者
+    # 才提交成功），导致同一张图又被当成"新图"送进 ingest_pending。
+    monkeypatch.setattr(ingest_images_module, 'find_existing_hashes', lambda hashes: {})
+
+    second = ingest_images_module.run(app, str(tmp_path), embedding_client=CountingEmbedding())
+
+    # commit 时撞真实的 UNIQUE 约束，本批记为 failed
+    assert second.failed == 1
+    assert ProductImage.query.count() == 1  # 没有变成孤儿数据库行——还是只有第一次那一条
+
+    # 关键断言：第一次已提交的文件不能被第二次的 rollback-cleanup 误删
+    assert os.path.exists(fs_path)
+
+
+def test_hash_file_is_called_once_per_image_not_twice(app, tmp_path, monkeypatch):
+    """[Fix round 1 · Important 1] 每张已知型号的图片只应该被 hash_file 计算
+    一次：find_existing_hashes 批量查库用的哈希、build_plan 判重用的哈希，
+    必须是同一份，不能重复计算——几千张图的目录下，重复计算是实打实的
+    I/O + CPU 翻倍。
+    """
+    import scripts.ingest_images as ingest_images_module
+
+    _add_product('CS-001')
+    for i, color in enumerate(('red', 'blue', 'green')):
+        _write_png(str(tmp_path / 'CS-001' / f'{i}.png'), color)
+
+    real_hash_file = ingest_images_module.hash_file
+    calls = {'n': 0}
+
+    def counting_hash_file(path):
+        calls['n'] += 1
+        return real_hash_file(path)
+
+    monkeypatch.setattr(ingest_images_module, 'hash_file', counting_hash_file)
+
+    report = ingest_images_module.run(app, str(tmp_path), embedding_client=CountingEmbedding())
+
+    assert report.created == 3
+    assert calls['n'] == 3  # 3 张图，每张只算一次哈希（而不是 6 次）
+
+
+def test_rebuild_index_survives_unexpected_exception_during_execute(
+    app, tmp_path, monkeypatch,
+):
+    """[Fix round 1 · Important 2] --rebuild-index 用 try/finally 兜底：
+    DROP 之后哪怕 _execute() 内部抛出未被批次级 try/except 吞掉的异常
+    （比如扫描阶段本身出错），索引也必须被重建，不能永久丢失。
+    """
+    from sqlalchemy import text
+
+    import scripts.ingest_images as ingest_images_module
+
+    _add_product('CS-001')
+    _write_png(str(tmp_path / 'CS-001' / '1.png'), 'red')
+
+    def _boom(root):
+        raise RuntimeError('模拟扫描阶段的未预期异常')
+
+    monkeypatch.setattr(ingest_images_module, 'scan_directory', _boom)
+
+    with pytest.raises(RuntimeError, match='模拟扫描阶段的未预期异常'):
+        ingest_images_module.run(
+            app, str(tmp_path), rebuild_index=True, embedding_client=CountingEmbedding(),
+        )
+
+    exists = db.session.execute(text(
+        "SELECT 1 FROM pg_indexes WHERE indexname = 'idx_product_images_vector_hnsw'"
+    )).scalar()
+    assert exists == 1
+
+
+def test_directories_without_images_are_reported_as_empty(app, tmp_path):
+    """[Fix round 1 · Minor] 目录存在但递归后没有任何符合扩展名的图片（真空
+    目录，或只有 .txt 之类的非图片文件），既不该进 scanned，也不该被静默
+    忽略——哪怕目录名对不上任何已知型号，也要在报告里给出信号。
+
+    素材根目录用 tmp_path 的子目录 'source'，与 app fixture 的
+    UPLOAD_FOLDER（tmp_path/'uploads'）区分开——否则 UPLOAD_FOLDER 刚创建时
+    也是空目录，会被一起扫描进来，污染 empty_dirs 的断言（生产环境里 --root
+    素材目录和 UPLOAD_FOLDER 从来不是同一个目录树，这里只是测试隔离需要）。
+    """
+    from scripts.ingest_images import run
+
+    _add_product('CS-001')
+    root = tmp_path / 'source'
+    os.makedirs(str(root / 'CS-001'))  # 型号目录存在，但没有图片
+    (root / 'CS-001' / 'notes.txt').write_text('无图片')
+    os.makedirs(str(root / 'GHOST-000'))  # 目录名对不上任何型号，也没有图片
+
+    report = run(app, str(root), embedding_client=CountingEmbedding())
+
+    assert sorted(report.empty_dirs) == ['CS-001', 'GHOST-000']
+    assert report.orphan_dirs == []  # 没图片的目录不会同时出现在"孤儿目录"里，避免重复报告
+    assert report.created == 0

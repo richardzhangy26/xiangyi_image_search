@@ -22,7 +22,7 @@ sys.path.insert(0, str(BACKEND_DIR))
 from sqlalchemy import text  # noqa: E402
 
 from app import create_app  # noqa: E402
-from models import Product, db  # noqa: E402
+from models import Product, ProductImage, db  # noqa: E402
 from services.embedding import MAX_BATCH_SIZE, EmbeddingClient  # noqa: E402
 from services.ingest import (  # noqa: E402
     ALLOWED_EXTENSIONS,
@@ -53,6 +53,7 @@ class IngestReport:
     duplicates: int = 0
     failed: int = 0
     orphan_dirs: list = field(default_factory=list)
+    empty_dirs: list = field(default_factory=list)        # list[目录名]，存在但无符合扩展名的图片
     duplicate_details: list = field(default_factory=list)
     failed_details: list = field(default_factory=list)
     scanned: int = 0
@@ -79,10 +80,30 @@ def scan_directory(root):
     return scanned
 
 
-def build_plan(scanned, known_model_numbers, existing_hashes, limit=None):
+def _find_empty_directories(root, scanned):
+    """一级子目录存在，但递归后没有任何符合扩展名的图片（真空目录，或只有
+    filter 之外的文件，比如 .txt）。
+
+    这类目录在 scan_directory() 里会被直接忽略——连 key 都不会出现在返回值
+    里，所以也永远进不了 orphan_dirs（那是"有图片但型号未知"的另一种情况）。
+    结果是哪怕目录名根本对不上任何已知型号，用户也拿不到任何信号。这里单独
+    走一遍一级目录列表把它们找出来：与 scan_directory() 的返回值 contract
+    （已被测试锁定）分开算，不侵入那个函数。
+    """
+    root_path = Path(root)
+    return sorted(
+        entry.name for entry in root_path.iterdir()
+        if entry.is_dir() and entry.name not in scanned
+    )
+
+
+def build_plan(scanned, known_model_numbers, existing_hashes, path_hashes, limit=None):
     """把扫描结果切成「待入库 / 已重复 / 孤儿目录」三堆。
 
-    existing_hashes: {content_hash: 已存在的 image_path}
+    existing_hashes: {content_hash: 已存在的 image_path}（库里已有的）
+    path_hashes: {文件绝对路径: content_hash}，由调用方预先算好整批复用——
+    避免同一个文件被 hash_file 计算两遍（一遍用于批量查库判重、一遍用于本函数
+    的判重逻辑）。几千张图的目录下，重复计算是实打实的 I/O + CPU 翻倍。
     """
     plan = IngestPlan()
     seen = dict(existing_hashes)
@@ -98,7 +119,7 @@ def build_plan(scanned, known_model_numbers, existing_hashes, limit=None):
                 return plan
             processed += 1
 
-            content_hash = hash_file(source_path)
+            content_hash = path_hashes[source_path]
             if content_hash in seen:
                 plan.duplicates.append((source_path, seen[content_hash]))
                 continue
@@ -115,6 +136,17 @@ def build_plan(scanned, known_model_numbers, existing_hashes, limit=None):
     return plan
 
 
+def _is_referenced_by_committed_row(image_path):
+    """image_path 此刻是否已被某条**已提交**的 ProductImage 行引用。
+
+    调用方保证在 db.session.rollback() 之后才调用本函数，此时 session 是干净的，
+    查到的就是数据库当前的真实已提交状态（不含本批被回滚的那些行）。
+    """
+    if not image_path:
+        return False
+    return db.session.query(ProductImage.id).filter_by(image_path=image_path).first() is not None
+
+
 def _cleanup_orphan_files(results):
     """批次 commit 失败 rollback 后，清理该批在 ingest_pending 阶段已经落盘的文件。
 
@@ -122,9 +154,23 @@ def _cleanup_orphan_files(results):
     调用方 rollback 后 DB 行消失但磁盘文件不会自动清理，必须用 IngestResult.fs_path
     自行删除，否则留下孤儿文件。这里只处理 status == 'created' 的项——duplicate/failed
     项本来就没有落盘（或落盘的是别的已提交的文件）。
+
+    但删之前必须先确认这个路径此刻**没有**被别的已提交行引用——判重不加锁
+    （见 ImageIngestService docstring），文件名由 content_hash 决定，同一张图
+    在任何地方写入都是同一路径。如果另一个批次/另一次运行/另一个进程已经抢先
+    用同一路径成功 commit，这次 commit 才撞上 UNIQUE 约束失败；这时 fs_path 指向
+    的是"别人已经在用的合法文件"，删了会造成更隐蔽的问题——数据库行还在、
+    图片却 404，且不会出现在任何"孤儿文件"报告里。只有确认没有任何已提交行
+    引用这条路径时，它才是真正的孤儿，才能删。
     """
     for result in results or []:
         if result.status != 'created' or not result.fs_path:
+            continue
+        if _is_referenced_by_committed_row(result.image_path):
+            logger.info(
+                '跳过删除：路径已被其他已提交记录引用 image_path=%s fs_path=%s',
+                result.image_path, result.fs_path,
+            )
             continue
         try:
             if os.path.exists(result.fs_path):
@@ -157,36 +203,45 @@ def _create_hnsw_index():
 
 def run(app, root, dry_run=False, rebuild_index=False, batch_size=MAX_BATCH_SIZE,
         limit=None, embedding_client=None):
-    """执行导入，返回 IngestReport。app 需已进入 app_context 或本函数自行进入。"""
+    """执行导入，返回 IngestReport。app 需已进入 app_context 或本函数自行进入。
+
+    report 在 run() 的外层作用域创建，_execute() 只对它做字段级修改（不重新
+    赋值），所以哪怕 _execute() 中途抛出未被批次级 try/except 吞掉的异常，已经
+    跑完的批次统计也不会丢——虽然此时 run() 本身仍会把异常继续往上抛（见下方
+    try/except/finally），但至少异常前的进度会被记进日志，方便运维排查导到哪了。
+    """
     started = time.perf_counter()
+    report = IngestReport()
+    index_dropped = False
 
     def _execute():
         scanned = scan_directory(root)
-        total_scanned = sum(len(v) for v in scanned.values())
+        report.scanned = sum(len(v) for v in scanned.values())
+        report.empty_dirs = _find_empty_directories(root, scanned)
 
         known = {
             value for (value,) in db.session.query(Product.model_number).all()
         }
 
-        # 先批量算哈希，再一次性查库，避免逐张查询
-        all_hashes = []
-        for model_number, paths in scanned.items():
-            if model_number in known:
-                all_hashes.extend(hash_file(p) for p in paths)
-        existing = find_existing_hashes(all_hashes)
+        # 每个已知型号下的文件只算一次哈希：{路径: content_hash}。
+        # 这份结果既用于下面 find_existing_hashes 的批量查库判重，也直接传给
+        # build_plan 复用，避免同一个文件被 hash_file 计算两遍（几千张图的目录
+        # 下，重复计算是实打实的 I/O + CPU 翻倍）。
+        path_hashes = {
+            path: hash_file(path)
+            for model_number, paths in scanned.items() if model_number in known
+            for path in paths
+        }
+        existing = find_existing_hashes(list(path_hashes.values()))
 
-        plan = build_plan(scanned, known, existing, limit=limit)
-
-        report = IngestReport(
-            duplicates=len(plan.duplicates),
-            orphan_dirs=plan.orphan_dirs,
-            duplicate_details=plan.duplicates,
-            scanned=total_scanned,
-        )
+        plan = build_plan(scanned, known, existing, path_hashes, limit=limit)
+        report.orphan_dirs = plan.orphan_dirs
+        report.duplicates = len(plan.duplicates)
+        report.duplicate_details = plan.duplicates
 
         if dry_run:
             report.created = len(plan.pending)
-            return report
+            return
 
         service = ImageIngestService(embedding_client=embedding_client or EmbeddingClient())
         upload_folder = app.config['UPLOAD_FOLDER']
@@ -203,7 +258,8 @@ def run(app, root, dry_run=False, rebuild_index=False, batch_size=MAX_BATCH_SIZE
                 logger.error('批次写入失败 start=%s size=%s error=%s', start, len(chunk), exc)
                 # 判重不加锁，最终唯一性靠 DB UNIQUE 约束兜底：commit 撞上
                 # IntegrityError 时，本批在 ingest_pending 阶段已经落盘的文件
-                # 不会随 rollback 自动消失，必须显式清理，否则留下孤儿文件。
+                # 不会随 rollback 自动消失，必须显式清理，否则留下孤儿文件
+                # ——但要先确认没有被别的已提交行引用，见 _cleanup_orphan_files。
                 _cleanup_orphan_files(results)
                 report.failed += len(chunk)
                 report.failed_details.extend((item.source_path, str(exc)) for item in chunk)
@@ -222,19 +278,31 @@ def run(app, root, dry_run=False, rebuild_index=False, batch_size=MAX_BATCH_SIZE
             logger.info('进度 %s/%s', min(start + effective_batch, len(plan.pending)),
                         len(plan.pending))
 
-        return report
+    try:
+        if rebuild_index and not dry_run:
+            with app.app_context():
+                _drop_hnsw_index()
+            index_dropped = True
 
-    if rebuild_index and not dry_run:
+        # 测试传入的 app fixture 已处于 app_context 内；Flask 支持嵌套，无冲突
         with app.app_context():
-            _drop_hnsw_index()
-
-    # 测试传入的 app fixture 已处于 app_context 内；Flask 支持嵌套，无冲突
-    with app.app_context():
-        report = _execute()
-
-    if rebuild_index and not dry_run:
-        with app.app_context():
-            _create_hnsw_index()
+            _execute()
+    except Exception:
+        # 这里能接到的只会是没被批次级 try/except 吞掉的异常（比如 scan_directory/
+        # build_plan 阶段的 bug，或者数据库连接中断），不是常规的单批 commit 失败
+        # ——那种情况已经在上面的批次循环里处理成 report.failed，不会冒泡到这里。
+        # 记录已完成的进度后继续往上抛，不静默吞掉真实错误。
+        logger.exception(
+            '导入过程中出现未预期异常。已完成的进度：入库=%s 重复=%s 失败=%s 扫描=%s',
+            report.created, report.duplicates, report.failed, report.scanned,
+        )
+        raise
+    finally:
+        # 无论 _execute() 正常返回还是异常退出，DROP 掉的索引都必须重建，
+        # 否则索引永久丢失、后续所有检索都会退化成全表扫描。
+        if index_dropped:
+            with app.app_context():
+                _create_hnsw_index()
 
     report.elapsed_seconds = time.perf_counter() - started
     return report
@@ -252,6 +320,9 @@ def print_report(report, dry_run):
     print(f'  ✗ 孤儿目录    {len(report.orphan_dirs)} 个（无对应产品，已跳过）')
     if report.orphan_dirs:
         print(f'      {", ".join(report.orphan_dirs)}')
+    print(f'  ⊘ 无图片目录  {len(report.empty_dirs)} 个（目录存在但没有符合扩展名的图片，已跳过）')
+    if report.empty_dirs:
+        print(f'      {", ".join(report.empty_dirs)}')
     print(f'  ✗ 失败        {report.failed} 张')
     for source, error in report.failed_details[:20]:
         print(f'      {source}: {error}')

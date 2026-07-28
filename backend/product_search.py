@@ -26,6 +26,11 @@ if not dashscope.api_key:
     # 简单的 warning，应用启动时不要直接 crash，这也是无状态的好处
     print("Warning: DASHSCOPE_API_KEY environment variable not set.")
 
+# 多模态向量模型（Qwen3 底座，图文同空间，支持文搜图/融合向量）
+# dimension=1024 与数据库 vector(1024) 列保持一致
+EMBEDDING_MODEL = "tongyi-embedding-vision-plus-2026-03-06"
+EMBEDDING_DIMENSION = 1024
+
 class ImageSearchService:
     def __init__(self):
         """
@@ -95,7 +100,7 @@ class ImageSearchService:
         logger.info(
             "embedding.extract.start request_id=%s model=%s image_path=%s",
             request_id,
-            "multimodal-embedding-v1",
+            EMBEDDING_MODEL,
             image_path,
         )
         
@@ -106,8 +111,9 @@ class ImageSearchService:
         for retry in range(max_retries):
             try:
                 resp = dashscope.MultiModalEmbedding.call(
-                    model="multimodal-embedding-v1",
-                    input=inputs
+                    model=EMBEDDING_MODEL,
+                    input=inputs,
+                    dimension=EMBEDDING_DIMENSION
                 )
                 
                 if resp.status_code != HTTPStatus.OK:
@@ -132,7 +138,7 @@ class ImageSearchService:
                 logger.info(
                     "embedding.extract.success request_id=%s model=%s latency_ms=%s",
                     request_id,
-                    "multimodal-embedding-v1",
+                    EMBEDDING_MODEL,
                     latency_ms,
                 )
                 return feature
@@ -152,7 +158,7 @@ class ImageSearchService:
                     logger.error(
                         "embedding.extract.failed request_id=%s model=%s latency_ms=%s error=%s",
                         request_id,
-                        "multimodal-embedding-v1",
+                        EMBEDDING_MODEL,
                         latency_ms,
                         str(e),
                     )

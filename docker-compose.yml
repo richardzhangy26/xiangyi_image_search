@@ -1,25 +1,22 @@
 services:
-  # MySQL 数据库
+  # PostgreSQL 数据库（内置 pgvector 扩展，支持向量搜索）
   db:
-    build:
-      context: ./mysql
-      dockerfile: Dockerfile
-    image: fashion-crm-db:latest
+    image: pgvector/pgvector:pg16
     container_name: fashion-crm-db
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_CHARACTER_SET_SERVER: utf8mb4
-      MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-image_search}
       TZ: Asia/Shanghai
     ports:
-      - "127.0.0.1:3307:3306"
+      # 宿主机映射到 5433，避免与本机已安装的 PostgreSQL(5432) 冲突
+      - "127.0.0.1:5433:5432"
     volumes:
-      - mysql_data:/var/lib/mysql
-      - ./mysql/conf.d:/etc/mysql/conf.d
-    command: --default-authentication-plugin=mysql_native_password
+      - postgres_data:/var/lib/postgresql/data
+      # 首次启动时自动执行初始化 SQL（建扩展/建表/建索引）
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_PASSWORD}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-image_search}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -39,9 +36,9 @@ services:
       - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DB_HOST=db
-      - DB_PORT=3306
-      - DB_NAME=${DB_NAME}
-      - DB_USER=root
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-image_search}
+      - DB_USER=${DB_USER:-postgres}
       - DB_PASSWORD=${DB_PASSWORD}
       - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID}
       - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET}
@@ -93,7 +90,7 @@ services:
 
 # 持久化存储卷
 volumes:
-  mysql_data:
+  postgres_data:
     driver: local
 
 # 网络配置

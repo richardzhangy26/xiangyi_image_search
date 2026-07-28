@@ -25,6 +25,17 @@ def init_database():
         db.session.commit()
         print("HNSW 向量索引创建成功！")
 
+        # 4. 已有库的幂等收敛：create_all() 不会给已存在的表补列
+        db.session.execute(text(
+            'ALTER TABLE product_images ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)'
+        ))
+        db.session.execute(text(
+            'CREATE UNIQUE INDEX IF NOT EXISTS uq_product_images_content_hash '
+            'ON product_images (content_hash)'
+        ))
+        db.session.commit()
+        print("content_hash 列与唯一索引已就绪！")
+
 
 if __name__ == '__main__':
     init_database()

@@ -93,6 +93,7 @@ class ProductImage(db.Model):
     model_number = db.Column(db.String(100), db.ForeignKey('products.model_number', ondelete='CASCADE'), nullable=False, comment='关联产品型号')
     image_path = db.Column(db.String(255), nullable=False, unique=True, comment='Web访问路径')
     vector = db.Column(Vector(1024), nullable=False, comment='1024维图像向量')
+    content_hash = db.Column(db.String(64), nullable=True, comment='源文件 SHA-256（全库唯一，用于精确去重）')
     original_path = db.Column(db.Text, nullable=True, comment='文件系统原始路径')
     oss_path = db.Column(db.Text, nullable=True, comment='OSS云存储路径')
     image_order = db.Column(db.Integer, default=0, comment='图片排序')
@@ -101,6 +102,11 @@ class ProductImage(db.Model):
 
     # 建立与Product的关系
     product = db.relationship('Product', backref=db.backref('images', lazy=True, cascade='all, delete-orphan'))
+
+    # 唯一索引名与 postgres/init/01_init.sql、init_db.py 保持一致
+    __table_args__ = (
+        db.Index('uq_product_images_content_hash', 'content_hash', unique=True),
+    )
 
     def __repr__(self):
         return f'<ProductImage {self.id} for Product {self.model_number}>'
@@ -111,6 +117,7 @@ class ProductImage(db.Model):
             'id': self.id,
             'model_number': self.model_number,
             'image_path': self.image_path,
+            'content_hash': self.content_hash,
             'original_path': self.original_path,
             'oss_path': self.oss_path,
             'image_order': self.image_order,

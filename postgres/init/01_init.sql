@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS product_images (
     model_number  VARCHAR(100) NOT NULL REFERENCES products(model_number) ON DELETE CASCADE,
     image_path    VARCHAR(255) NOT NULL UNIQUE,
     vector        vector(1024) NOT NULL,
+    content_hash  VARCHAR(64),
     original_path TEXT,
     oss_path      TEXT,
     image_order   INTEGER DEFAULT 0,
@@ -65,6 +66,10 @@ COMMENT ON TABLE product_images IS '产品图片表，存储图片路径和 Dash
 -- 外键查询索引
 CREATE INDEX IF NOT EXISTS idx_product_images_model_number
     ON product_images (model_number);
+
+-- 内容哈希唯一索引（全库精确去重：同一张图只能入库一次）
+CREATE UNIQUE INDEX IF NOT EXISTS uq_product_images_content_hash
+    ON product_images (content_hash);
 
 -- HNSW 向量索引（cosine 距离，embedding 为归一化向量，检索统一使用 cosine_distance）
 CREATE INDEX IF NOT EXISTS idx_product_images_vector_hnsw

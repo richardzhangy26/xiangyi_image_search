@@ -8,6 +8,7 @@ from PIL import Image
 
 from models import Product, ProductImage, db
 from services.embedding import EmbeddingServiceError
+from services.ingest import hash_bytes, storage_paths
 
 
 def _png_bytes(color):
@@ -158,4 +159,102 @@ def test_reupload_after_delete_is_allowed(app):
     }, content_type='multipart/form-data')
 
     assert response.status_code == 200
+    assert ProductImage.query.count() == 1
+
+
+def test_create_product_concurrent_duplicate_returns_409(app, monkeypatch):
+    """并发上传同一张*新*图的竞态窗口：两边判重都过，后 commit 的一方撞 UNIQUE 约束。
+
+    用 monkeypatch 让 find_existing_hashes 对已存在的哈希也返回空 dict 来模拟这个窗口，
+    避免真的起两个线程/进程去赌时序（竞态成因见 services/ingest.py 的 ingest_one docstring）。
+    """
+    _install_embedding(app, FakeEmbedding())
+    client = app.test_client()
+    data = _png_bytes('red')
+
+    # 先建立一行已提交的记录，占住这张图的 content_hash
+    client.post('/api/products', data={
+        'product': _product_payload('CS-001'),
+        'images': [(io.BytesIO(data), '1.png')],
+    }, content_type='multipart/form-data')
+    assert ProductImage.query.count() == 1
+
+    # 判重"假阴性"：伪装这张图从未出现过，让 ingest_one 走到 created 分支
+    monkeypatch.setattr('services.ingest.find_existing_hashes', lambda hashes: {})
+
+    response = client.post('/api/products', data={
+        'product': _product_payload('CS-002'),
+        'images': [(io.BytesIO(data), '1.png')],
+    }, content_type='multipart/form-data')
+
+    assert response.status_code == 409
+    assert response.get_json()['error_code'] == 'DUPLICATE_IMAGE_CONFLICT'
+
+    db.session.expire_all()  # 强制下面的查询打到数据库，不读会话内的缓存对象
+    assert Product.query.get('CS-002') is None
+    assert ProductImage.query.count() == 1
+
+    # rollback 时必须用 fs_path 删掉已落盘的文件，不能留孤儿
+    _, fs_path = storage_paths(app.config['UPLOAD_FOLDER'], 'CS-002', hash_bytes(data), '.png')
+    assert not os.path.exists(fs_path)
+
+
+def test_update_product_concurrent_duplicate_returns_409_and_rolls_back(app, monkeypatch):
+    """update 路径同样的竞态窗口：字段更新与新图片同属一个事务，必须一起回滚，不能半成功。"""
+    _install_embedding(app, FakeEmbedding())
+    client = app.test_client()
+    data = _png_bytes('blue')
+
+    # 另一个产品先占住这张图的 content_hash
+    client.post('/api/products', data={
+        'product': _product_payload('HL-002'),
+        'images': [(io.BytesIO(data), '1.png')],
+    }, content_type='multipart/form-data')
+
+    # 待更新的产品，本身没有图片
+    client.post('/api/products', data={'product': _product_payload('CS-001')},
+                content_type='multipart/form-data')
+    image_count_before = ProductImage.query.count()
+
+    monkeypatch.setattr('services.ingest.find_existing_hashes', lambda hashes: {})
+
+    response = client.put('/api/products/CS-001', data={
+        'product': json.dumps({'photographer_file': 'changed'}),
+        'images': [(io.BytesIO(data), '1.png')],
+    }, content_type='multipart/form-data')
+
+    assert response.status_code == 409
+    assert response.get_json()['error_code'] == 'DUPLICATE_IMAGE_CONFLICT'
+
+    db.session.expire_all()  # 强制下面的查询打到数据库，不读会话内的缓存对象
+    # 字段更新和图片写入同属一个事务：字段必须保持修改前的值，不能只回滚一半
+    assert Product.query.get('CS-001').photographer_file == 'p'
+    assert ProductImage.query.count() == image_count_before
+
+    _, fs_path = storage_paths(app.config['UPLOAD_FOLDER'], 'CS-001', hash_bytes(data), '.png')
+    assert not os.path.exists(fs_path)
+
+
+def test_update_product_reports_duplicate_image(app):
+    """PUT 上传一张库里已存在的图：明确上报为跳过，而不是静默丢弃或误当新图入库。"""
+    _install_embedding(app, FakeEmbedding())
+    client = app.test_client()
+    data = _png_bytes('red')
+
+    client.post('/api/products', data={
+        'product': _product_payload('CS-001'),
+        'images': [(io.BytesIO(data), '1.png')],
+    }, content_type='multipart/form-data')
+
+    original_image_path = ProductImage.query.one().image_path
+
+    response = client.put('/api/products/CS-001', data={
+        'images': [(io.BytesIO(data), '2.png')],
+    }, content_type='multipart/form-data')
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body['uploaded_images'] == 0
+    assert len(body['skipped_duplicates']) == 1
+    assert body['skipped_duplicates'][0]['duplicate_of'] == original_image_path
     assert ProductImage.query.count() == 1

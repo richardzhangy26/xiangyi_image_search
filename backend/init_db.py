@@ -36,6 +36,5 @@ def init_database():
         db.session.commit()
         print("content_hash 列与唯一索引已就绪！")
 
-
 if __name__ == '__main__':
     init_database()

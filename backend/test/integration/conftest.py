@@ -28,10 +28,30 @@ def _dsn(database):
 # 关键：必须在 import app 之前生效
 os.environ['DATABASE_URL'] = _dsn(TEST_DB_NAME)
 
+# 仅当 PostgreSQL 服务器物理不可达时才跳过整个集成测试套件；
+# 认证失败、权限不足等配置错误必须让测试真实报错，不能被吞成"跳过"。
+#
+# 注意：本机 "localhost" 同时解析到 ::1 和 127.0.0.1，而 Docker 只监听 127.0.0.1，
+# 所以即便密码错了，libpq 的错误文本里也会先带一行 IPv6 的 "Connection refused"
+# （来自必然失败的 ::1 尝试），因此必须优先判定"认证/权限"特征命中，
+# 命中则视为真实错误，即使消息里同时出现连接层面的关键词也不能跳过。
+_AUTH_OR_PERMISSION_PATTERNS = (
+    'password authentication failed',
+    'authentication failed',
+    'permission denied',
+    'no password supplied',  # DB_PASSWORD 未设置/为空时 libpq 报的是这个，不是 "authentication failed"
+)
+_CONNECTION_ERROR_PATTERNS = (
+    'connection refused',
+    'could not connect',
+    'timeout',
+    'could not translate host name',
+)
+
 
 @pytest.fixture(scope='session')
 def _test_database():
-    """确保测试库存在；PostgreSQL 不可用时跳过整个集成测试套件。"""
+    """确保测试库存在；仅服务器不可达时跳过，其余错误一律真实失败。"""
     try:
         engine = sqlalchemy.create_engine(_dsn('postgres'), isolation_level='AUTOCOMMIT')
         with engine.connect() as conn:
@@ -42,8 +62,13 @@ def _test_database():
             if not exists:
                 conn.execute(text(f'CREATE DATABASE {TEST_DB_NAME}'))
         engine.dispose()
-    except Exception as exc:  # noqa: BLE001 - 任何连接失败都应跳过而非报错
-        pytest.skip(f'PostgreSQL 不可用（{exc}），跳过集成测试')
+    except sqlalchemy.exc.OperationalError as exc:
+        message = str(exc).lower()
+        is_auth_or_permission_error = any(p in message for p in _AUTH_OR_PERMISSION_PATTERNS)
+        is_connection_error = any(p in message for p in _CONNECTION_ERROR_PATTERNS)
+        if is_connection_error and not is_auth_or_permission_error:
+            pytest.skip(f'PostgreSQL 服务器不可达（{exc}），跳过集成测试')
+        raise
     return _dsn(TEST_DB_NAME)
 
 

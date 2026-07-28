@@ -45,21 +45,6 @@ def validate_top_k(raw_top_k, default=10, min_value=1, max_value=50):
     return top_k
 
 
-def dedupe_results_by_model_number(results):
-    """按 model_number 去重，保留最高相似度。"""
-    deduped = []
-    seen_model_numbers = set()
-
-    for result in results:
-        model_number = result.get('model_number')
-        if not model_number or model_number in seen_model_numbers:
-            continue
-        deduped.append(result)
-        seen_model_numbers.add(model_number)
-
-    return deduped
-
-
 def save_product_image(file, model_number):
     """
     保存产品图片到本地
@@ -648,10 +633,8 @@ def search_products():
             if not results:
                 return jsonify([])
 
-            deduped_results = dedupe_results_by_model_number(results)
-
-            # 获取产品详情
-            model_numbers = [result.get('model_number') for result in deduped_results]
+            # 去重已在 VectorSearchService 的 SQL（DISTINCT ON）内完成
+            model_numbers = [result.get('model_number') for result in results]
             products = Product.query.filter(Product.model_number.in_(model_numbers)).all()
 
             # 构建产品字典
@@ -659,7 +642,7 @@ def search_products():
 
             # 组装结果
             search_results = []
-            for result in deduped_results:
+            for result in results:
                 model_number = result.get('model_number')
                 product = products_dict.get(model_number)
 

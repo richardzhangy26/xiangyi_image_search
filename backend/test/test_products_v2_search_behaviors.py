@@ -115,13 +115,15 @@ def test_search_vector_failure_returns_500():
     assert body['error_code'] == 'VECTOR_SEARCH_ERROR'
 
 
-def test_search_dedupes_model_number():
+def test_search_returns_service_results_verbatim():
+    """去重已下沉到 SQL（VectorSearchService 内的 DISTINCT ON），
+    端点不再做应用层折叠。折叠正确性由 test/integration/test_vector_search.py 覆盖。
+    """
     app, client = _build_client_with_db()
     _seed_products(app)
     app.config['PRODUCT_SEARCH_SERVICE'] = FakeSearchService(
         results=[
             {'model_number': 'M-001', 'image_path': '/uploads/a.jpg', 'similarity': 0.95},
-            {'model_number': 'M-001', 'image_path': '/uploads/b.jpg', 'similarity': 0.85},
             {'model_number': 'M-002', 'image_path': '/uploads/c.jpg', 'similarity': 0.75},
         ]
     )
@@ -137,7 +139,29 @@ def test_search_dedupes_model_number():
     assert len(body) == 2
     assert body[0]['model_number'] == 'M-001'
     assert body[0]['matched_image'] == '/uploads/a.jpg'
+    assert body[0]['similarity'] == 0.95
     assert body[1]['model_number'] == 'M-002'
+
+
+def test_search_preserves_service_result_order():
+    """端点必须保持服务返回的顺序（已按距离升序），不得被字典查询打乱。"""
+    app, client = _build_client_with_db()
+    _seed_products(app)
+    app.config['PRODUCT_SEARCH_SERVICE'] = FakeSearchService(
+        results=[
+            {'model_number': 'M-002', 'image_path': '/uploads/c.jpg', 'similarity': 0.91},
+            {'model_number': 'M-001', 'image_path': '/uploads/a.jpg', 'similarity': 0.42},
+        ]
+    )
+
+    response = client.post(
+        '/api/products/search',
+        data={'image': (io.BytesIO(b'img'), 'a.jpg'), 'top_k': '10'},
+        content_type='multipart/form-data',
+    )
+
+    body = response.get_json()
+    assert [item['model_number'] for item in body] == ['M-002', 'M-001']
 
 
 def test_create_product_embedding_failure_rolls_back():

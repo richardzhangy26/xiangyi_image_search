@@ -32,6 +32,13 @@ class FakeCreateService:
             raise self.exc
         return [0.1] * 1024
 
+    def embed_image(self, image_path, request_id=None):
+        """create_product 现在经 ImageIngestService 落盘/生成向量，
+        embedding client 走的是 embed_image 接口（见 services/ingest.py）。"""
+        if self.exc:
+            raise self.exc
+        return [0.1] * 1024
+
 
 def _build_client_with_db():
     app = create_app('testing')
@@ -166,7 +173,9 @@ def test_search_preserves_service_result_order():
 
 def test_create_product_embedding_failure_rolls_back():
     app, client = _build_client_with_db()
-    app.config['PRODUCT_SEARCH_SERVICE'] = FakeCreateService(
+    # create_product 的图片处理走 ImageIngestService（T6），embedding client 通过
+    # IMAGE_INGEST_EMBEDDING 注入，不再是 PRODUCT_SEARCH_SERVICE（那是搜索端点用的）。
+    app.config['IMAGE_INGEST_EMBEDDING'] = FakeCreateService(
         exc=EmbeddingServiceError('cannot embed')
     )
 

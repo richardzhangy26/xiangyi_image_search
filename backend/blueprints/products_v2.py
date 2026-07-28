@@ -10,8 +10,10 @@ import json
 import csv
 import io
 from flask_cors import cross_origin
+from sqlalchemy.exc import IntegrityError
 from models import db, Product, ProductImage
 from product_search import EmbeddingServiceError, VectorSearchError
+from services.ingest import ALLOWED_EXTENSIONS, ImageIngestService
 products_v2_bp = Blueprint('products_v2', __name__, url_prefix='/api/products')
 
 # ========================================
@@ -20,8 +22,8 @@ products_v2_bp = Blueprint('products_v2', __name__, url_prefix='/api/products')
 
 def allowed_file(filename):
     """检查文件扩展名是否允许"""
-    ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return '.' in filename and \
+        os.path.splitext(filename)[1].lower() in ALLOWED_EXTENSIONS
 
 
 def error_response(message, error_code, status_code):
@@ -45,33 +47,19 @@ def validate_top_k(raw_top_k, default=10, min_value=1, max_value=50):
     return top_k
 
 
-def save_product_image(file, model_number):
-    """
-    保存产品图片到本地
-    返回: (web_path, filesystem_path)
-    """
-    if not file or not allowed_file(file.filename):
-        return None, None
+def get_ingest_service():
+    """构造 ImageIngestService，复用测试注入的 embedding client（如果有）。"""
+    return ImageIngestService(embedding_client=current_app.config.get('IMAGE_INGEST_EMBEDDING'))
 
-    filename = secure_filename(file.filename)
-    unique_filename = f"{uuid.uuid4()}_{filename}"
 
-    # 创建按型号组织的目录
-    product_dir = os.path.join(
-        current_app.config['UPLOAD_FOLDER'],
-        'product_images',
-        model_number
-    )
-    os.makedirs(product_dir, exist_ok=True)
-
-    # 保存文件
-    filesystem_path = os.path.join(product_dir, unique_filename)
-    file.save(filesystem_path)
-
-    # 生成Web访问路径
-    web_path = f"/uploads/product_images/{model_number}/{unique_filename}"
-
-    return web_path, filesystem_path
+def remove_files_quietly(paths):
+    """删除磁盘文件；单个失败只记日志，不影响其余。"""
+    for path in paths:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError as exc:
+            current_app.logger.warning(f"清理图片文件失败: {path}, error={exc}")
 
 
 # ========================================
@@ -186,31 +174,32 @@ def create_product():
         db.session.add(product)
 
         # 处理图片上传
+        ingest_service = get_ingest_service()
         images = request.files.getlist('images')
         uploaded_images = []
+        skipped_duplicates = []
+        request_id = uuid.uuid4().hex
+
         for idx, image_file in enumerate(images):
-            if image_file and allowed_file(image_file.filename):
-                web_path, filesystem_path = save_product_image(image_file, model_number)
+            if not image_file or not allowed_file(image_file.filename):
+                continue
 
-                if web_path and filesystem_path:
-                    saved_filesystem_paths.append(filesystem_path)
-                    # 生成向量
-                    product_search_service = current_app.config.get('PRODUCT_SEARCH_SERVICE')
-                    if product_search_service:
-                        request_id = uuid.uuid4().hex
-                        feature = product_search_service.extract_feature(filesystem_path, request_id=request_id)
-
-                        # 创建 ProductImage 记录
-                        product_image = ProductImage(
-                            model_number=model_number,
-                            image_path=web_path,
-                            vector=feature.tolist(),
-                            original_path=filesystem_path,
-                            image_order=idx,
-                            is_primary=(idx == 0)  # 第一张为主图
-                        )
-                        db.session.add(product_image)
-                        uploaded_images.append(web_path)
+            data = image_file.read()
+            # 向量生成失败会向上抛出，不再吞掉异常静默丢数据
+            result = ingest_service.ingest_one(
+                model_number, data, image_file.filename,
+                current_app.config['UPLOAD_FOLDER'],
+                image_order=idx, is_primary=(idx == 0),
+                request_id=request_id,
+            )
+            if result.status == 'created':
+                saved_filesystem_paths.append(result.fs_path)
+                uploaded_images.append(result.image_path)
+            elif result.status == 'duplicate':
+                skipped_duplicates.append({
+                    'filename': image_file.filename,
+                    'duplicate_of': result.duplicate_of,
+                })
 
         db.session.commit()
         should_cleanup_files = False
@@ -222,9 +211,22 @@ def create_product():
         return jsonify({
             'message': '产品创建成功',
             'model_number': model_number,
-            'uploaded_images': len(uploaded_images)
+            'uploaded_images': len(uploaded_images),
+            'skipped_duplicates': skipped_duplicates
         }), 201
 
+    except IntegrityError as e:
+        # 并发上传同一张新图：判重阶段两边都判定为"新"，后 commit 的一方在这里撞
+        # UNIQUE 约束（详见 services/ingest.py 的 ingest_one docstring）。
+        # 语义上这是一次瞬时冲突而非请求本身有错，409 + 提示重试比 500 更准确；
+        # 已落盘的文件必须清理，否则会产生新的孤儿文件。
+        db.session.rollback()
+        should_cleanup_files = True
+        current_app.logger.warning(f"创建产品失败（并发重复图片冲突）: {str(e)}")
+        return error_response(
+            '图片重复写入冲突（可能有并发请求上传了同一张图片），请重试',
+            'DUPLICATE_IMAGE_CONFLICT', 409,
+        )
     except EmbeddingServiceError as e:
         db.session.rollback()
         should_cleanup_files = True
@@ -237,20 +239,15 @@ def create_product():
         return error_response(str(e), 'PRODUCT_CREATE_FAILED', 500)
     finally:
         if should_cleanup_files:
-            for filesystem_path in saved_filesystem_paths:
-                try:
-                    if os.path.exists(filesystem_path):
-                        os.remove(filesystem_path)
-                except Exception as cleanup_error:
-                    current_app.logger.warning(
-                        f"清理失败图片文件失败: {filesystem_path}, error={cleanup_error}"
-                    )
+            remove_files_quietly(saved_filesystem_paths)
 
 
 @products_v2_bp.route('/<model_number>', methods=['PUT'])
 @cross_origin()
 def update_product(model_number):
     """更新产品信息"""
+    saved_filesystem_paths = []
+    should_cleanup_files = False
     try:
         product = Product.query.get(model_number)
         if not product:
@@ -267,48 +264,69 @@ def update_product(model_number):
                     setattr(product, key, value)
 
         # 处理新上传的图片
+        ingest_service = get_ingest_service()
         images = request.files.getlist('images')
+        uploaded_images = []
+        skipped_duplicates = []
+        request_id = uuid.uuid4().hex
+
         if images:
-            # 获取当前最大排序号
             current_max_order = db.session.query(
                 db.func.max(ProductImage.image_order)
             ).filter(ProductImage.model_number == model_number).scalar() or 0
 
             for idx, image_file in enumerate(images):
-                if image_file and allowed_file(image_file.filename):
-                    web_path, filesystem_path = save_product_image(image_file, model_number)
+                if not image_file or not allowed_file(image_file.filename):
+                    continue
 
-                    if web_path and filesystem_path:
-                        try:
-                            product_search_service = current_app.config.get('PRODUCT_SEARCH_SERVICE')
-                            if product_search_service:
-                                feature = product_search_service.extract_feature(filesystem_path)
-
-                                product_image = ProductImage(
-                                    model_number=model_number,
-                                    image_path=web_path,
-                                    vector=feature.tolist(),  # Pgvector expects a list, not bytes
-                                    original_path=filesystem_path,
-                                    image_order=current_max_order + idx + 1,
-                                    is_primary=False
-                                )
-                                db.session.add(product_image)
-
-                        except Exception as e:
-                            current_app.logger.error(f"生成图片向量失败: {str(e)}")
+                data = image_file.read()
+                # 向量生成失败会向上抛出，不再吞掉异常静默丢数据
+                result = ingest_service.ingest_one(
+                    model_number, data, image_file.filename,
+                    current_app.config['UPLOAD_FOLDER'],
+                    image_order=current_max_order + idx + 1,
+                    is_primary=False,
+                    request_id=request_id,
+                )
+                if result.status == 'created':
+                    saved_filesystem_paths.append(result.fs_path)
+                    uploaded_images.append(result.image_path)
+                elif result.status == 'duplicate':
+                    skipped_duplicates.append({
+                        'filename': image_file.filename,
+                        'duplicate_of': result.duplicate_of,
+                    })
 
         db.session.commit()
 
-        # 无需刷新向量索引 (Stateless)
-        # if images and current_app.config.get('PRODUCT_INDEX'):
-        #     current_app.config['PRODUCT_INDEX'].refresh_from_database()
+        return jsonify({
+            'message': '产品更新成功',
+            'uploaded_images': len(uploaded_images),
+            'skipped_duplicates': skipped_duplicates
+        })
 
-        return jsonify({'message': '产品更新成功'})
-
+    except IntegrityError as e:
+        # 并发上传同一张新图导致的 UNIQUE 冲突，语义与 create_product 一致：见该处注释。
+        db.session.rollback()
+        should_cleanup_files = True
+        current_app.logger.warning(f"更新产品失败（并发重复图片冲突）: {str(e)}")
+        return error_response(
+            '图片重复写入冲突（可能有并发请求上传了同一张图片），请重试',
+            'DUPLICATE_IMAGE_CONFLICT', 409,
+        )
+    except EmbeddingServiceError as e:
+        db.session.rollback()
+        should_cleanup_files = True
+        current_app.logger.error(f"更新产品失败（向量服务）: {str(e)}")
+        return error_response(str(e), 'EMBEDDING_SERVICE_ERROR', 503)
     except Exception as e:
         db.session.rollback()
+        should_cleanup_files = True
         current_app.logger.error(f"更新产品失败: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        return error_response(str(e), 'PRODUCT_UPDATE_FAILED', 500)
+    finally:
+        if should_cleanup_files:
+            remove_files_quietly(saved_filesystem_paths)
 
 
 @products_v2_bp.route('/<model_number>', methods=['DELETE'])
@@ -320,8 +338,16 @@ def delete_product(model_number):
         if not product:
             return jsonify({'error': '产品不存在'}), 404
 
+        # 先收集磁盘路径，删行之后才能删文件
+        file_paths = [
+            row.original_path for row in
+            ProductImage.query.filter_by(model_number=model_number).all()
+        ]
+
         db.session.delete(product)
         db.session.commit()
+
+        remove_files_quietly(file_paths)
 
         # 无需刷新向量索引 (Stateless)
         # if current_app.config.get('PRODUCT_INDEX'):
@@ -348,12 +374,22 @@ def batch_delete_products():
         if not isinstance(model_numbers, list):
             return jsonify({'error': 'model_numbers 必须是数组'}), 400
 
+        # 先收集磁盘路径；.delete() 绕过 ORM，cascade 只在数据库层生效
+        file_paths = [
+            row.original_path for row in
+            ProductImage.query.filter(
+                ProductImage.model_number.in_(model_numbers)
+            ).all()
+        ]
+
         # 批量删除
         deleted_count = Product.query.filter(
             Product.model_number.in_(model_numbers)
         ).delete(synchronize_session=False)
 
         db.session.commit()
+
+        remove_files_quietly(file_paths)
 
         # 无需刷新向量索引 (Stateless)
         # if deleted_count > 0 and current_app.config.get('PRODUCT_INDEX'):
@@ -387,12 +423,12 @@ def delete_product_image(model_number, image_id):
         if not product_image:
             return jsonify({'error': '图片不存在'}), 404
 
-        # 删除物理文件
-        if product_image.original_path and os.path.exists(product_image.original_path):
-            os.remove(product_image.original_path)
+        file_path = product_image.original_path
 
         db.session.delete(product_image)
         db.session.commit()
+
+        remove_files_quietly([file_path])
 
         # 无需刷新向量索引 (Stateless)
         # if current_app.config.get('PRODUCT_INDEX'):

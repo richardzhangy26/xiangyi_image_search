@@ -201,6 +201,55 @@ def test_ingest_pending_marks_failed_when_vector_is_none(app, tmp_path):
     assert ProductImage.query.count() == 0
 
 
+def test_ingest_pending_marks_batch_duplicate_failed_when_first_occurrence_fails(app, tmp_path):
+    """批内查重是乐观的：重复项先被标 duplicate、duplicate_of 指向首现项*预期*的路径。
+
+    如果首现项 embedding 失败，它从未落盘、DB 里也没有对应行 —— 这时依赖它的
+    批内重复项绝不能停留在 duplicate（那意味着一张图被静默丢弃且没有报错信号）。
+    必须回填为 failed。
+    """
+    _add_product('CS-001')
+    data = _png_bytes('red')
+    first = tmp_path / 'a.png'
+    second = tmp_path / 'b.png'
+    first.write_bytes(data)
+    second.write_bytes(data)
+
+    class FirstFailsEmbedding:
+        def embed_images(self, image_paths, request_id=None):
+            return [None] + [np.full(1024, 0.1, dtype=np.float32) for _ in image_paths[1:]]
+
+    service = ImageIngestService(embedding_client=FirstFailsEmbedding())
+    digest = hash_bytes(data)
+    pending = [
+        PendingImage('CS-001', str(first), digest, 0, True),
+        PendingImage('CS-001', str(second), digest, 1, False),
+    ]
+
+    results = service.ingest_pending(pending, app.config['UPLOAD_FOLDER'])
+    db.session.commit()
+
+    assert [r.status for r in results] == ['failed', 'failed']
+    assert results[1].duplicate_of is None
+    assert results[1].error
+    assert ProductImage.query.count() == 0
+
+
+def test_ingest_one_result_exposes_fs_path_for_created_row(app):
+    """调用方 rollback 时需要知道该删哪个文件——created 结果必须暴露文件系统绝对路径。"""
+    _add_product('CS-001')
+    service = ImageIngestService(embedding_client=FakeEmbedding())
+    data = _png_bytes('red')
+
+    result = service.ingest_one('CS-001', data, '1.png', app.config['UPLOAD_FOLDER'])
+    db.session.commit()
+
+    assert result.status == 'created'
+    assert result.fs_path is not None
+    assert os.path.isabs(result.fs_path)
+    assert os.path.exists(result.fs_path)
+
+
 def test_find_existing_hashes_chunks_large_input(app):
     """> 1000 个哈希要分块查询，不能一次塞进 IN 子句。"""
     from services.ingest import find_existing_hashes

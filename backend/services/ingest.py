@@ -42,6 +42,7 @@ class IngestResult:
     duplicate_of: str = None
     error: str = None
     source_path: str = None
+    fs_path: str = None              # created 时的文件系统绝对路径；调用方 rollback 需要它来清理孤儿文件
 
 
 def hash_bytes(data):
@@ -95,7 +96,19 @@ class ImageIngestService:
 
     def ingest_one(self, model_number, data, filename, upload_folder,
                    image_order=0, is_primary=False, request_id=None):
-        """单张入库（HTTP 上传路径）。重复返回 duplicate，不抛异常。"""
+        """单张入库（HTTP 上传路径）。重复返回 duplicate，不抛异常。
+
+        事务契约：本方法只 db.session.add，不 commit；成功路径会立即把文件写入磁盘。
+        调用方若之后 rollback，DB 行会消失但磁盘文件不会自动清理——请用返回结果里
+        status == 'created' 的 fs_path 字段自行删除该文件。
+
+        并发契约：判重（find_existing_hashes）与写入之间没有加锁。两个进程/线程各自
+        独立 session 并发上传同一张*新*图时，双方都会通过判重、都返回 'created'；
+        最终唯一性由数据库 content_hash 的 UNIQUE 约束保证——先 commit 的一方成功，
+        后 commit 的一方会在**调用方**的 db.session.commit() 处抛出 IntegrityError，
+        调用方必须准备好接住它。因为文件名由哈希决定，双方写入的是同一路径、同一
+        字节内容，覆盖是幂等的，不会发生内容错位。
+        """
         content_hash = hash_bytes(data)
 
         existing = find_existing_hashes([content_hash])
@@ -132,33 +145,40 @@ class ImageIngestService:
         ))
         return IngestResult(
             model_number=model_number, content_hash=content_hash,
-            status='created', image_path=web_path,
+            status='created', image_path=web_path, fs_path=fs_path,
         )
 
     def ingest_pending(self, pending, upload_folder, request_id=None):
         """批量入库（CLI 路径）。调用方需保证 pending 长度 <= EmbeddingClient 的批大小。
 
         库内去重由调用方预先过滤；这里只处理批内重复。
+
+        批内去重是乐观的：重复项在拿到 embedding 结果之前就先被标记为 duplicate，
+        duplicate_of 指向同批次首现项*预期*会落在的路径。如果首现项的 embedding
+        失败，它从未落盘、DB 里也没有对应行——这时所有依赖它的批内重复项会在
+        embedding 结果回来后被回填为 failed（而不是停留在 duplicate），避免一张图
+        被静默丢弃且没有报错信号。
+
+        事务/并发契约与 ingest_one 一致：只 add 不 commit，成功项会立即落盘，
+        rollback 需要调用方用 fs_path 自行清理；判重不加锁，最终一致性由 DB
+        UNIQUE 约束保证。
         """
         if not pending:
             return []
 
         results = [None] * len(pending)
-        seen_in_batch = {}
-        to_embed = []          # [(下标, PendingImage)]
+        # content_hash -> 批内首次出现该哈希的 pending 下标
+        first_index_by_hash = {}
+        # content_hash -> 依赖该首现项的批内重复项下标列表
+        duplicate_indices_by_hash = {}
+        to_embed = []          # [(下标, PendingImage)]，只含每个哈希的首现项
 
         for index, item in enumerate(pending):
-            if item.content_hash in seen_in_batch:
-                results[index] = IngestResult(
-                    model_number=item.model_number, content_hash=item.content_hash,
-                    status='duplicate', duplicate_of=seen_in_batch[item.content_hash],
-                    source_path=item.source_path,
-                )
+            if item.content_hash in first_index_by_hash:
+                duplicate_indices_by_hash.setdefault(item.content_hash, []).append(index)
                 continue
+            first_index_by_hash[item.content_hash] = index
             to_embed.append((index, item))
-            ext = normalized_ext(item.source_path)
-            web_path, _ = storage_paths(upload_folder, item.model_number, item.content_hash, ext)
-            seen_in_batch[item.content_hash] = web_path
 
         if not to_embed:
             return results
@@ -168,11 +188,20 @@ class ImageIngestService:
         )
 
         for (index, item), vector in zip(to_embed, vectors):
+            dup_indices = duplicate_indices_by_hash.get(item.content_hash, [])
+
             if vector is None:
                 results[index] = IngestResult(
                     model_number=item.model_number, content_hash=item.content_hash,
                     status='failed', error='向量生成失败', source_path=item.source_path,
                 )
+                for dup_index in dup_indices:
+                    dup_item = pending[dup_index]
+                    results[dup_index] = IngestResult(
+                        model_number=dup_item.model_number, content_hash=dup_item.content_hash,
+                        status='failed', error='同批次首现项向量生成失败，未入库',
+                        source_path=dup_item.source_path,
+                    )
                 continue
 
             ext = normalized_ext(item.source_path)
@@ -195,7 +224,14 @@ class ImageIngestService:
             results[index] = IngestResult(
                 model_number=item.model_number, content_hash=item.content_hash,
                 status='created', image_path=web_path, source_path=item.source_path,
+                fs_path=fs_path,
             )
+            for dup_index in dup_indices:
+                dup_item = pending[dup_index]
+                results[dup_index] = IngestResult(
+                    model_number=dup_item.model_number, content_hash=dup_item.content_hash,
+                    status='duplicate', duplicate_of=web_path, source_path=dup_item.source_path,
+                )
 
         return results
 

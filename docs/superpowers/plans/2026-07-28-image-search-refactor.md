@@ -771,10 +771,9 @@ def test_returns_distinct_products_not_distinct_images(app):
 
     results = VectorSearchService().search_by_vector(_unit_vector(0), top_k=3)
 
-    assert [r['model_number'] for r in results] == ['M-001', 'M-002', 'M-003'] or \
-           len({r['model_number'] for r in results}) == 3
     assert len(results) == 3
     assert len({r['model_number'] for r in results}) == 3
+    assert results[0]['model_number'] == 'M-001'   # 与查询向量同轴，距离最小
 
 
 def test_returns_best_matching_image_per_product(app):
@@ -1068,9 +1067,10 @@ git commit -m "refactor(search): 检索改为 SQL 内过采样+DISTINCT ON 折�
 """SHA-256 全库精确去重。"""
 import hashlib
 import io
-from unittest.mock import patch
+import os
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from models import Product, ProductImage, db
@@ -1215,15 +1215,11 @@ def test_ingest_one_removes_file_when_embedding_fails(app):
     service = ImageIngestService(embedding_client=FailingEmbedding())
     data = _png_bytes('red')
 
-    try:
+    with pytest.raises(EmbeddingServiceError):
         service.ingest_one('CS-001', data, '1.png', app.config['UPLOAD_FOLDER'])
-        raise AssertionError('应当抛出 EmbeddingServiceError')
-    except EmbeddingServiceError:
-        pass
 
     db.session.rollback()
     _, fs_path = storage_paths(app.config['UPLOAD_FOLDER'], 'CS-001', hash_bytes(data), '.png')
-    import os
     assert not os.path.exists(fs_path)
 
 
@@ -2332,7 +2328,6 @@ cd backend && python -m pytest test/integration/test_import_csv.py -v
                 db.session.rollback()
                 pending_in_batch = 0
                 stats['failed'] += 1
-                stats['success'] -= 0  # 计数在 add 之后才自增，此处无需回退
                 error_msg = f"第{row_number}行: {str(e)}"
                 stats['errors'].append(error_msg)
                 current_app.logger.error(error_msg)

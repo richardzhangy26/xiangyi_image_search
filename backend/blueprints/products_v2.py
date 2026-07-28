@@ -538,7 +538,41 @@ def import_csv():
             ).all()
         } if candidate_model_numbers else set()
 
-        pending_in_batch = 0
+        def flush_pending_batch(pending):
+            """提交当前累积批次（commit 失败时整体回滚，绝不让异常冒泡出函数）。
+
+            success 只能在这里增加——批内任意一行触发数据库层错误都会让整批
+            原子回滚，如果在 db.session.add() 时就计入 success，会出现
+            "stats 报告成功、但库里实际是空的" 的错配（fix round 1 修复的问题）。
+            commit 失败时把批内全部行计入 failed，并把它们的 model_number 从
+            existing_model_numbers 中撤销——否则同一 CSV 里稍后出现的同型号
+            会被误判为"已存在"而跳过，但它其实从未真正入库过。
+            这个函数内部吞掉所有异常，因此收尾提交也必须走这里，不能让数据库层
+            错误冒泡到最外层 except，把 200+stats 的响应变成 500+error
+            （同样是 fix round 1 修复的问题）。
+            """
+            if not pending:
+                return
+            try:
+                db.session.commit()
+                stats['success'] += len(pending)
+            except Exception as e:
+                db.session.rollback()
+                for _, mn in pending:
+                    existing_model_numbers.discard(mn)
+                stats['failed'] += len(pending)
+                first_row, last_row = pending[0][0], pending[-1][0]
+                if first_row == last_row:
+                    error_msg = f"第{first_row}行提交失败: {str(e)}"
+                else:
+                    error_msg = (
+                        f"第{first_row}~{last_row}行整批提交失败（批量提交，"
+                        f"具体出错行需自查）: {str(e)}"
+                    )
+                stats['errors'].append(error_msg)
+                current_app.logger.error(error_msg)
+
+        pending_rows = []  # [(row_number, model_number), ...]：本批已 add 但未 commit
         for row_number, row in enumerate(rows, start=2):  # 第 1 行是表头
             stats['total'] += 1
 
@@ -576,34 +610,28 @@ def import_csv():
 
                 db.session.add(Product.from_dict(product_data))
                 existing_model_numbers.add(model_number)
-                stats['success'] += 1
-                pending_in_batch += 1
-
-                if pending_in_batch >= COMMIT_EVERY:
-                    db.session.commit()
-                    pending_in_batch = 0
+                # 注意：这里不增加 stats['success']——必须等 flush_pending_batch
+                # 真正 commit 成功后才能算数，否则批量提交失败时 success 会跟
+                # 实际入库行数对不上（fix round 1 的 Critical 1）。
+                pending_rows.append((row_number, model_number))
 
             except ValueError as e:
                 # 纯业务校验失败（缺必填字段等），发生在 db.session.add() 之前，
-                # session 尚未被这一行污染。绝不能在这里 rollback 整个 session——
-                # 那会把本批中「已 add 但未 commit」的好行一起冲掉，
-                # 使 stats['success'] 与实际入库行数对不上。
+                # session 未被这一行污染，不影响 pending_rows，不需要 rollback。
                 stats['failed'] += 1
                 error_msg = f"第{row_number}行: {str(e)}"
                 stats['errors'].append(error_msg)
                 current_app.logger.error(error_msg)
+                continue
 
-            except Exception as e:
-                # 数据库层面异常（如批量 commit 时触发唯一约束冲突）：本批累积但
-                # 尚未提交的数据处于不确定状态，此时整体回滚才是正确行为。
-                db.session.rollback()
-                pending_in_batch = 0
-                stats['failed'] += 1
-                error_msg = f"第{row_number}行: {str(e)}"
-                stats['errors'].append(error_msg)
-                current_app.logger.error(error_msg)
+            if len(pending_rows) >= COMMIT_EVERY:
+                flush_pending_batch(pending_rows)
+                pending_rows = []
 
-        db.session.commit()
+        # 收尾：提交最后一批不足 COMMIT_EVERY 的数据。必须复用 flush_pending_batch——
+        # 数据库层错误在这里会被吞掉、转成 stats['failed']，而不会冒泡到最外层
+        # except 把响应变成 500 + {'error': ...}（fix round 1 的 Critical 2）。
+        flush_pending_batch(pending_rows)
 
         return jsonify({
             'message': 'CSV 导入完成',

@@ -10,12 +10,9 @@ import pytest
 from PIL import Image
 
 from scripts.migrate_kodo_to_oss import main
-from services.kodo_source import (
-    KodoConfig,
-    KodoS3Source,
-    PreflightError,
-    run_preflight,
-)
+from services.kodo_config import KodoConfig
+from services.kodo_source import DownloadSizeLimitExceeded, KodoS3Source
+from services.source_preflight import PreflightError, run_preflight
 
 
 def _png_bytes(color: str = "red") -> bytes:
@@ -176,6 +173,54 @@ def test_corrupt_image_fails_at_decode_stage():
 
     assert exc_info.value.stage == "decode_image"
     assert exc_info.value.object_key == "损坏 图片.png"
+
+
+def test_decompression_bomb_fails_at_decode_stage(monkeypatch):
+    client = FakeReadOnlyS3Client({"超像素 图片.png": _png_bytes()})
+    source = KodoS3Source(KodoConfig.from_env(_canonical_env()), client=client)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1)
+
+    with pytest.raises(PreflightError) as exc_info:
+        run_preflight(source)
+
+    assert exc_info.value.stage == "decode_image"
+    assert exc_info.value.object_key == "超像素 图片.png"
+
+
+class HeadGrewS3Client(FakeReadOnlyS3Client):
+    def list_objects_v2(self, **kwargs):
+        response = super().list_objects_v2(**kwargs)
+        for item in response.get("Contents", []):
+            item["Size"] = 5
+        return response
+
+    def head_object(self, **kwargs):
+        response = super().head_object(**kwargs)
+        response["ContentLength"] = 11
+        return response
+
+
+def test_head_growth_over_sample_limit_stops_before_get_object():
+    client = HeadGrewS3Client({"变化中的图片.png": _png_bytes()})
+    source = KodoS3Source(KodoConfig.from_env(_canonical_env()), client=client)
+
+    with pytest.raises(PreflightError) as exc_info:
+        run_preflight(source, max_sample_bytes=10)
+
+    assert exc_info.value.stage == "head_object"
+    assert "get_object" not in {name for name, _ in client.calls}
+
+
+def test_stream_download_stops_before_writing_over_limit():
+    client = FakeReadOnlyS3Client({"大图.png": _png_bytes()})
+    source = KodoS3Source(KodoConfig.from_env(_canonical_env()), client=client)
+    source.resolve_location()
+    target = io.BytesIO()
+
+    with pytest.raises(DownloadSizeLimitExceeded):
+        source.download_object("大图.png", target, max_bytes=10)
+
+    assert target.tell() <= 10
 
 
 class FailingSource:

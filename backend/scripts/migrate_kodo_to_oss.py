@@ -11,12 +11,11 @@ from typing import Callable, Mapping, Optional, Sequence, TextIO
 
 from dotenv import load_dotenv
 
-from services.kodo_source import (
-    KodoConfig,
-    KodoConfigError,
-    KodoS3Source,
+from services.kodo_config import KodoConfig, KodoConfigError
+from services.kodo_source import KodoS3Source
+from services.object_source import ReadOnlyObjectSource
+from services.source_preflight import (
     PreflightError,
-    ReadOnlyObjectSource,
     run_preflight,
     safe_exception_summary,
 )

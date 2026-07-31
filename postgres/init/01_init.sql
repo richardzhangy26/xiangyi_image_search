@@ -62,7 +62,44 @@ CREATE TABLE IF NOT EXISTS product_images (
 
 COMMENT ON TABLE product_images IS '产品图片表，存储图片路径和 DashScope 1024 维图像向量';
 
--- 4) 索引
+-- 4) image_assets 表（独立图片资产，不要求先关联商品）
+CREATE TABLE IF NOT EXISTS image_assets (
+    id                    UUID PRIMARY KEY,
+    model_number          VARCHAR(100) REFERENCES products(model_number) ON DELETE SET NULL,
+    source_provider       VARCHAR(32) NOT NULL,
+    source_bucket         VARCHAR(255) NOT NULL,
+    source_relative_path  TEXT NOT NULL,
+    source_revision       INTEGER NOT NULL DEFAULT 1,
+    oss_path              TEXT NOT NULL UNIQUE,
+    preview_oss_path      TEXT NOT NULL,
+    content_hash          VARCHAR(64) NOT NULL,
+    source_size           BIGINT NOT NULL,
+    source_mime_type      VARCHAR(100) NOT NULL,
+    source_width          INTEGER NOT NULL,
+    source_height         INTEGER NOT NULL,
+    vector                vector(1024) NOT NULL,
+    embedding_model       VARCHAR(128) NOT NULL,
+    embedding_dimension   SMALLINT NOT NULL,
+    normalization_version VARCHAR(32) NOT NULL,
+    status                VARCHAR(20) NOT NULL DEFAULT 'active',
+    archived_at           TIMESTAMP,
+    created_at            TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMP NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_image_assets_source_identity UNIQUE (
+        source_provider,
+        source_bucket,
+        source_relative_path,
+        source_revision
+    ),
+    CONSTRAINT ck_image_assets_status CHECK (status IN ('active', 'archived')),
+    CONSTRAINT ck_image_assets_source_revision CHECK (source_revision >= 1),
+    CONSTRAINT ck_image_assets_embedding_dimension CHECK (embedding_dimension = 1024)
+);
+
+COMMENT ON TABLE image_assets IS '独立图片资产：可无商品型号，源图与预览存放于私有 OSS';
+
+-- 5) 索引
 -- 外键查询索引
 CREATE INDEX IF NOT EXISTS idx_product_images_model_number
     ON product_images (model_number);
@@ -77,6 +114,22 @@ CREATE INDEX IF NOT EXISTS idx_product_images_vector_hnsw
     USING hnsw (vector vector_cosine_ops)
     WITH (m = 16, ef_construction = 64);
 
--- 5) 帮助优化器选用索引
+CREATE INDEX IF NOT EXISTS idx_image_assets_content_hash
+    ON image_assets (content_hash);
+
+CREATE INDEX IF NOT EXISTS idx_image_assets_model_number
+    ON image_assets (model_number);
+
+CREATE INDEX IF NOT EXISTS idx_image_assets_status
+    ON image_assets (status);
+
+CREATE INDEX IF NOT EXISTS idx_image_assets_vector_active_hnsw
+    ON image_assets
+    USING hnsw (vector vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+    WHERE status = 'active';
+
+-- 6) 帮助优化器选用索引
 ANALYZE products;
 ANALYZE product_images;
+ANALYZE image_assets;

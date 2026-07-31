@@ -32,18 +32,16 @@ services:
       dockerfile: Dockerfile
     image: fashion-crm-backend:latest
     container_name: fashion-crm-backend
+    # 应用凭证由被 Git/Docker build context 忽略的 backend/.env 注入；
+    # 下方容器数据库地址显式覆盖其中面向宿主机的 localhost:5433。
+    env_file:
+      - ./backend/.env
     environment:
-      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DB_HOST=db
       - DB_PORT=5432
       - DB_NAME=${DB_NAME:-image_search}
       - DB_USER=${DB_USER:-postgres}
       - DB_PASSWORD=${DB_PASSWORD}
-      - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID}
-      - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET}
-      - OSS_ENDPOINT=${OSS_ENDPOINT}
-      - OSS_BUCKET_NAME=${OSS_BUCKET_NAME}
       - FLASK_ENV=production
       - TZ=Asia/Shanghai
     ports:

@@ -42,6 +42,22 @@ class EmbeddingRateLimitExhaustedError(EmbeddingServiceError):
 
 def _to_data_uri(image_path, max_size_mb=MAX_IMAGE_MB):
     """读图 → 必要时压缩到 max_size_mb 以内 → JPEG base64 Data URI。"""
+    max_size_bytes = int(max_size_mb * 1024 * 1024)
+
+    # ImageNormalizer 产出的搜索预览图已经满足方向、尺寸、白底和字节上限。
+    # 对这类 JPEG 原样编码，避免持久化预览与实际 embedding 输入之间再发生
+    # 一次不可追踪的有损转码。
+    if os.path.getsize(image_path) <= max_size_bytes:
+        with open(image_path, 'rb') as source:
+            original_bytes = source.read()
+        with Image.open(io.BytesIO(original_bytes)) as original:
+            if original.format == 'JPEG':
+                original.verify()
+                return (
+                    'data:image/jpeg;base64,'
+                    + base64.b64encode(original_bytes).decode('utf-8')
+                )
+
     image = Image.open(image_path)
     if image.mode not in ('RGB', 'L'):
         image = image.convert('RGB')
@@ -50,7 +66,6 @@ def _to_data_uri(image_path, max_size_mb=MAX_IMAGE_MB):
     image.save(buffer, format='JPEG', quality=95)
     img_bytes = buffer.getvalue()
 
-    max_size_bytes = int(max_size_mb * 1024 * 1024)
     if len(img_bytes) > max_size_bytes:
         width, height = image.size
         scale = (max_size_bytes / len(img_bytes)) ** 0.5 * 0.9  # 0.9 安全系数

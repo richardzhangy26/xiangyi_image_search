@@ -22,8 +22,14 @@ def init_database():
             "ON product_images USING hnsw (vector vector_cosine_ops) "
             "WITH (m = 16, ef_construction = 64)"
         ))
+        db.session.execute(text(
+            "CREATE INDEX IF NOT EXISTS idx_image_assets_vector_active_hnsw "
+            "ON image_assets USING hnsw (vector vector_cosine_ops) "
+            "WITH (m = 16, ef_construction = 64) "
+            "WHERE status = 'active'"
+        ))
         db.session.commit()
-        print("HNSW 向量索引创建成功！")
+        print("新旧图片表的 HNSW 向量索引创建成功！")
 
         # 4. 已有库的幂等收敛：create_all() 不会给已存在的表补列
         db.session.execute(text(

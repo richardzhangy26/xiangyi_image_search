@@ -7,6 +7,7 @@ from flask import Flask, send_from_directory, request, jsonify, abort
 from flask_cors import CORS
 from pathlib import Path
 from models import db
+from blueprints.image_assets import image_assets_bp
 from blueprints.products_v2 import products_v2_bp  # 新版本
 from product_search import ImageSearchService
 # 数据库配置（本地 PostgreSQL + pgvector）
@@ -64,6 +65,9 @@ def create_app(config_name='development'):
     app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
     app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    app.config['OSS_SIGNED_URL_TTL_SECONDS'] = int(
+        os.getenv('OSS_SIGNED_URL_TTL_SECONDS', '600')
+    )
     app.config['DATASET_ROOT'] = os.getenv(
         'DATASET_ROOT',
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', '摄像师拍摄素材')
@@ -85,6 +89,7 @@ def create_app(config_name='development'):
     
     # 注册蓝图（使用新版本 products_v2）
     app.register_blueprint(products_v2_bp)
+    app.register_blueprint(image_assets_bp)
     
     # 添加静态文件路由
     @app.route('/uploads/<path:filename>')

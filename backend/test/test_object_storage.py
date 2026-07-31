@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from services.object_storage import OssObjectStorage
+from services.object_storage import ObjectSpec, OssObjectStorage
 
 
 class FakeBucket:
@@ -13,6 +13,7 @@ class FakeBucket:
             content_type='image/jpeg',
             headers={
                 'Content-Length': '123',
+                'ETag': '"098f6bcd4621d373cade4e832627b4f6"',
                 'X-OSS-Meta-SHA256': 'a' * 64,
             },
         )
@@ -41,6 +42,7 @@ def test_head_returns_size_content_type_and_normalized_metadata():
     assert result.size == 123
     assert result.content_type == 'image/jpeg'
     assert result.metadata == {'sha256': 'a' * 64}
+    assert result.etag == '"098f6bcd4621d373cade4e832627b4f6"'
 
 
 def test_uploads_forbid_overwrite_and_attach_metadata(tmp_path):
@@ -48,24 +50,35 @@ def test_uploads_forbid_overwrite_and_attach_metadata(tmp_path):
     storage = OssObjectStorage(bucket)
     source = tmp_path / 'source.png'
     source.write_bytes(b'original')
+    original_spec = ObjectSpec(
+        size=8,
+        content_type='image/png',
+        metadata={'sha256': 'b' * 64},
+        md5_hex='919c8b643b7133116b02fc0d9bb7df3f',
+    )
+    preview_spec = ObjectSpec(
+        size=7,
+        content_type='image/jpeg',
+        metadata={'normalization-version': 'preview-v1'},
+        md5_hex='5ebeb6065f64f2346dbb00ab789cf001',
+    )
 
     storage.put_file(
         'original/key.png',
         source,
-        content_type='image/png',
-        metadata={'sha256': 'b' * 64},
+        spec=original_spec,
     )
     storage.put_bytes(
         'preview/key.jpg',
         b'preview',
-        content_type='image/jpeg',
-        metadata={'normalization-version': 'preview-v1'},
+        spec=preview_spec,
     )
 
     for call in bucket.calls:
         headers = call[-1]
         assert headers['x-oss-forbid-overwrite'] == 'true'
         assert headers['Content-Type'].startswith('image/')
+        assert headers['Content-MD5']
     assert bucket.calls[0][-1]['x-oss-meta-sha256'] == 'b' * 64
     assert (
         bucket.calls[1][-1]['x-oss-meta-normalization-version']

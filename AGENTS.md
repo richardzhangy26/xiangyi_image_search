@@ -10,7 +10,7 @@ This file provides guidance to AI coding agents (Claude Code, Qoder, etc.) when 
 - Target users: Cross-border e-commerce sellers, wholesale buyers
 - Use case: Quickly find products matching customer inquiry images
 - Core feature: Upload an image → find visually similar products in database
-- Data ownership: Fully local deployment (local PostgreSQL + local image storage) for security and privacy
+- Data ownership: Local PostgreSQL plus a private Aliyun OSS image-asset prefix; credentials remain local
 
 ## Architecture
 
@@ -24,18 +24,24 @@ This file provides guidance to AI coding agents (Claude Code, Qoder, etc.) when 
   - Model + dimension defined as constants `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` in [backend/services/embedding.py](backend/services/embedding.py)（`backend/product_search.py` 兼容层再导出同名符号）
   - pgvector performs in-database cosine similarity search with HNSW index
   - **Stateless architecture**: No in-memory index, vectors stored natively in PostgreSQL
-- **Storage**: Local filesystem (`backend/uploads/product_images/{model_number}/`), bind-mounted into Docker
-  - Aliyun OSS scripts exist (`backend/scripts/batch_upload_oss.py`) but OSS is **not used** by default; migrate only if public/multi-site access is needed
+- **Storage**:
+  - Independent `image_assets` store original bytes and normalized previews in private Aliyun OSS under the isolated `image-search/` prefix
+  - Legacy `product_images` still use `backend/uploads/product_images/{model_number}/`; Issue #6 intentionally keeps that flow intact
 - **Dev environment**: miniconda `base` env (`~/miniconda3/bin/python`), Python 3.9+
 
 **Critical Files**:
 - [backend/app.py](backend/app.py) - Flask app init, DB config (`DATABASE_URL` or `DB_*` vars), CORS, blueprint registration, root logger config (`logging.basicConfig`)
 - [backend/services/embedding.py](backend/services/embedding.py) - `EmbeddingClient`: DashScope 调用，单张 + 批量（**硬上限 20 张/请求**）、429 重试、批失败降级为单张
+- [backend/models/image_asset.py](backend/models/image_asset.py) - 独立 `ImageAsset` 模型；型号可空、Product 删除时 `SET NULL`
+- [backend/services/image_normalizer.py](backend/services/image_normalizer.py) - EXIF、尺寸、透明背景、动图首帧和 2.5 MiB 硬上限
+- [backend/services/object_storage.py](backend/services/object_storage.py) - 私有 OSS HEAD/无覆盖上传/短时签名适配
+- [backend/services/asset_ingest.py](backend/services/asset_ingest.py) - 单张 Kodo 来源图片到 OSS、embedding 和 PostgreSQL 的纵向入库服务
 - [backend/services/vector_search.py](backend/services/vector_search.py) - `VectorSearchService`: pgvector 检索，SQL 内过采样 + `DISTINCT ON` 按型号折叠
 - [backend/services/ingest.py](backend/services/ingest.py) - `ImageIngestService`: SHA-256 全库去重 + 哈希命名落盘 + 入库，CLI 与 API 共用
 - [backend/product_search.py](backend/product_search.py) - 兼容层，仅再导出 `services/` 中的符号（`ImageSearchService = VectorSearchService`）
 - [backend/scripts/ingest_images.py](backend/scripts/ingest_images.py) - 目录批量导入 CLI
-- [backend/blueprints/products_v2.py](backend/blueprints/products_v2.py) - Product CRUD API (the only active blueprint, prefix `/api/products`)
+- [backend/blueprints/products_v2.py](backend/blueprints/products_v2.py) - Product CRUD API（prefix `/api/products`）
+- [backend/blueprints/image_assets.py](backend/blueprints/image_assets.py) - 私有图片资产预览 302（prefix `/api/image-assets`）
 - [backend/models/product.py](backend/models/product.py) - `Product` / `ProductImage` SQLAlchemy models (pgvector `Vector(1024)`)
 - [backend/init_db.py](backend/init_db.py) - One-shot init: `CREATE EXTENSION vector` + `create_all()` + HNSW index
 - [postgres/init/01_init.sql](postgres/init/01_init.sql) - Docker auto-init SQL (extension + tables + HNSW index); keep in sync with models
@@ -58,9 +64,10 @@ This file provides guidance to AI coding agents (Claude Code, Qoder, etc.) when 
 - Legacy `multimodal-embedding-v1` was replaced (more expensive, weaker text-image alignment).
 
 **Vector Search Workflow**:
-1. **Indexing**: Image upload → DashScope API (base64 Data URI, auto-compressed to ≤2.5MB JPEG) → 1024-dim vector → `product_images.vector`
-2. **Search**: Query image → embedding → `VectorSearchService.search_by_vector` 执行 SQL 内过采样 + `DISTINCT ON` 折叠（见下方 SQL Query Pattern）→ top-k
-3. Similarity score returned to clients: `min(1.0, max(0.0, 1.0 - cosine_distance))`
+1. **Legacy product indexing**: Image upload → DashScope API (base64 Data URI, auto-compressed to ≤2.5MB JPEG) → 1024-dim vector → `product_images.vector`
+2. **Image Asset ingest**: Kodo original → private OSS original + deterministic `preview-v1` JPEG → DashScope 1024-dim vector → `image_assets.vector`
+3. **Current search**: Query image → embedding → `VectorSearchService.search_by_vector` 执行 SQL 内过采样 + `DISTINCT ON` 折叠（见下方 SQL Query Pattern）→ top-k
+4. Similarity score returned to clients: `min(1.0, max(0.0, 1.0 - cosine_distance))`
 
 ### Frontend (React + TypeScript)
 - **Framework**: React 18 + TypeScript, Vite (dev server `localhost:5173`)
@@ -128,15 +135,19 @@ DB connection resolution in `app.py`: `DATABASE_URL` (full DSN, optional) → el
 **Required**:
 - `DASHSCOPE_API_KEY` - Aliyun DashScope API key (⚠️ embedding calls fail with "Access denied / overdue payment" if the Aliyun account balance is empty)
 - `DB_HOST=localhost`, `DB_PORT=5433`, `DB_NAME=image_search`, `DB_USER=postgres`, `DB_PASSWORD` - local dockerized PostgreSQL
+- `QINIU_ACCESS_KEY`, `QINIU_SECRET_KEY`, `QINIU_BUCKET_NAME`, `QINIU_REGION` - Kodo migration source/preflight
+- `OSS_ACCESS_KEY_ID`, `OSS_ACCESS_KEY_SECRET`, `OSS_ENDPOINT`, `OSS_BUCKET_NAME` - private OSS image-asset ingest and signed preview
 
 **Optional**:
 - `DATABASE_URL` - full PostgreSQL DSN, overrides `DB_*`
-- `OSS_*` - Aliyun OSS (unused by default)
+- `QINIU_S3_BUCKET_NAME` - explicit S3 bucket mapping when Get Service is ambiguous
+- `OSS_IMAGE_BASE_PREFIX`, `OSS_SIGNED_URL_TTL_SECONDS` - image-asset key namespace and preview URL TTL
+- `IMAGE_PREVIEW_MAX_EDGE`, `IMAGE_PREVIEW_MAX_MB`, `IMAGE_MAX_PIXELS`, `IMAGE_NORMALIZATION_VERSION` - deterministic preview limits/version
 - `DATASET_ROOT` - local dataset path
 - `SEARCH_OVERSAMPLE` - 检索过采样系数，默认 5（≈ 单型号平均图片数）。产品图片数普遍偏多时调大
 - `LOG_LEVEL` - root logger 级别，默认 `INFO`（见 `backend/app.py` 的 `logging.basicConfig`）
 
-Root `.env` (for docker-compose): `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DASHSCOPE_API_KEY`, `VITE_API_BASE_URL`.
+Docker Compose loads application credentials from ignored `backend/.env`; container `DB_HOST` / `DB_PORT` are explicitly overridden to `db:5432`. Root `.env` remains the Compose interpolation source for `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `VITE_API_BASE_URL`.
 
 ## Database Schema
 
@@ -246,8 +257,8 @@ python -m pytest test/ --cov=. --cov-report=html
 ## Important Architecture Notes
 
 - ⚠️ **Primary key**: products use `model_number` (VARCHAR), all FKs and API URLs reference it.
-- **File uploads**: max 16MB (Flask) / 20MB (nginx `client_max_body_size`); formats png/jpg/jpeg/gif/webp; stored under `backend/uploads/product_images/{model_number}/`.
-- **Blueprints**: only `products_v2.py` is registered. `products.py`, `customers.py`, `orders.py`, `product_search.py` (blueprint), `oss.py` are legacy/unregistered.
+- **Legacy product uploads**: max 16MB (Flask) / 20MB (nginx `client_max_body_size`); formats png/jpg/jpeg/gif/webp; stored under `backend/uploads/product_images/{model_number}/`.
+- **Blueprints**: `products_v2.py` and `image_assets.py` are registered. `products.py`, `customers.py`, `orders.py`, `product_search.py` (blueprint), `oss.py` are legacy/unregistered.
 - **批量导入**: 用 `python -m scripts.ingest_images`（见上方章节）。FAISS 时代的 `ingest_dataset.py` 已删除。
 - **图片去重**: `product_images.content_hash` 为源文件 SHA-256，**全库唯一**。同一张图在任何型号下只能入库一次；重复上传返回 `{skipped: true, duplicate_of: ...}`。近似去重（pHash）暂未实现。
 - **图片文件命名**: `uploads/product_images/{model_number}/{sha256前16位}{ext}`，不再用 UUID。同一张图永远落在同一路径，重复导入不产生新文件。

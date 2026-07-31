@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,30 +27,49 @@ class StoredObject:
     size: int
     content_type: Optional[str]
     metadata: Mapping[str, str]
+    etag: Optional[str]
 
 
-class ObjectStorage(Protocol):
-    def head_object(self, key: str) -> Optional[StoredObject]: ...
+@dataclass(frozen=True)
+class ObjectSpec:
+    """上传与 HEAD 复用校验所需的完整对象契约。"""
+
+    size: int
+    content_type: str
+    metadata: Mapping[str, str]
+    md5_hex: str
+
+    @property
+    def content_md5(self) -> str:
+        return base64.b64encode(bytes.fromhex(self.md5_hex)).decode('ascii')
+
+
+class ObjectWriter(Protocol):
+    def head_object(self, key: str) -> Optional[StoredObject]:
+        ...
 
     def put_file(
         self,
         key: str,
         source_path: Union[str, Path],
         *,
-        content_type: str,
-        metadata: Mapping[str, str],
-    ) -> None: ...
+        spec: ObjectSpec,
+    ) -> None:
+        ...
 
     def put_bytes(
         self,
         key: str,
         data: bytes,
         *,
-        content_type: str,
-        metadata: Mapping[str, str],
-    ) -> None: ...
+        spec: ObjectSpec,
+    ) -> None:
+        ...
 
-    def sign_download_url(self, key: str, expires_seconds: int) -> str: ...
+
+class PrivateObjectSigner(Protocol):
+    def sign_download_url(self, key: str, expires_seconds: int) -> str:
+        ...
 
 
 class OssObjectStorage:
@@ -101,7 +121,7 @@ class OssObjectStorage:
                 return None
             raise ObjectStorageError(
                 f'OSS HEAD 失败: {type(exc).__name__}'
-            ) from exc
+            ) from None
 
         headers = getattr(result, 'headers', {}) or {}
         metadata = {
@@ -115,11 +135,15 @@ class OssObjectStorage:
         content_type = getattr(result, 'content_type', None)
         if content_type is None:
             content_type = headers.get('Content-Type', headers.get('content-type'))
+        etag = getattr(result, 'etag', None)
+        if etag is None:
+            etag = headers.get('ETag', headers.get('etag'))
         return StoredObject(
             key=key,
             size=int(size),
             content_type=content_type,
             metadata=metadata,
+            etag=str(etag) if etag is not None else None,
         )
 
     def put_file(
@@ -127,34 +151,32 @@ class OssObjectStorage:
         key: str,
         source_path: Union[str, Path],
         *,
-        content_type: str,
-        metadata: Mapping[str, str],
+        spec: ObjectSpec,
     ) -> None:
         try:
             self._bucket.put_object_from_file(
                 key,
                 str(source_path),
-                headers=self._upload_headers(content_type, metadata),
+                headers=self._upload_headers(spec),
             )
         except Exception as exc:
-            raise self._safe_upload_error(exc) from exc
+            raise self._safe_upload_error(exc) from None
 
     def put_bytes(
         self,
         key: str,
         data: bytes,
         *,
-        content_type: str,
-        metadata: Mapping[str, str],
+        spec: ObjectSpec,
     ) -> None:
         try:
             self._bucket.put_object(
                 key,
                 data,
-                headers=self._upload_headers(content_type, metadata),
+                headers=self._upload_headers(spec),
             )
         except Exception as exc:
-            raise self._safe_upload_error(exc) from exc
+            raise self._safe_upload_error(exc) from None
 
     def sign_download_url(self, key: str, expires_seconds: int) -> str:
         if expires_seconds <= 0:
@@ -169,28 +191,27 @@ class OssObjectStorage:
         except Exception as exc:
             raise ObjectStorageError(
                 f'OSS 签名失败: {type(exc).__name__}'
-            ) from exc
+            ) from None
 
     @staticmethod
-    def _upload_headers(
-        content_type: str,
-        metadata: Mapping[str, str],
-    ) -> dict[str, str]:
+    def _upload_headers(spec: ObjectSpec) -> dict[str, str]:
         headers = {
-            'Content-Type': content_type,
+            'Content-Type': spec.content_type,
+            # OSS 会验证请求体 MD5，避免传输成功但对象内容已损坏。
+            'Content-MD5': spec.content_md5,
             # 即使 HEAD 与 PUT 之间出现竞态，也绝不覆盖已有对象。
             'x-oss-forbid-overwrite': 'true',
         }
         headers.update({
             f'x-oss-meta-{str(name).lower()}': str(value)
-            for name, value in metadata.items()
+            for name, value in spec.metadata.items()
         })
         return headers
 
     @staticmethod
     def _safe_upload_error(error: BaseException) -> ObjectStorageError:
         status = getattr(error, 'status', None)
-        if status in (409, 412):
+        if status in (409, 412, '409', '412'):
             return ObjectStorageConflictError(
                 f'OSS 对象已存在: {type(error).__name__}'
             )

@@ -17,7 +17,7 @@ from services.embedding import (
 )
 from services.image_normalizer import ImageNormalizer
 from services.object_source import ReadOnlyObjectSource
-from services.object_storage import ObjectStorage, StoredObject
+from services.object_storage import ObjectSpec, ObjectWriter, StoredObject
 
 SOURCE_PROVIDER = 'qiniu-kodo'
 DEFAULT_OSS_IMAGE_BASE_PREFIX = 'image-search'
@@ -47,7 +47,7 @@ class ImageAssetIngestService:
         self,
         *,
         source: ReadOnlyObjectSource,
-        storage: ObjectStorage,
+        storage: ObjectWriter,
         embedding_client=None,
         normalizer: Optional[ImageNormalizer] = None,
         oss_image_base_prefix: Optional[str] = None,
@@ -113,7 +113,6 @@ class ImageAssetIngestService:
                         raise AssetIngestConflictError(
                             '来源冲突：同一来源路径的内容已经变化'
                         )
-                    return self._result('existing', existing)
 
                 normalized = self._normalizer.normalize(source_path)
                 original_key = self._original_key(
@@ -131,12 +130,16 @@ class ImageAssetIngestService:
                     'sha256': content_hash,
                     'source-size': str(actual_size),
                 }
+                original_spec = ObjectSpec(
+                    size=actual_size,
+                    content_type=normalized.source_mime_type,
+                    metadata=original_metadata,
+                    md5_hex=self._md5_file(source_path),
+                )
                 self._ensure_file_object(
                     original_key,
                     source_path,
-                    expected_size=actual_size,
-                    content_type=normalized.source_mime_type,
-                    metadata=original_metadata,
+                    spec=original_spec,
                     conflict_name='原图',
                 )
 
@@ -144,13 +147,32 @@ class ImageAssetIngestService:
                     'sha256': content_hash,
                     'normalization-version': normalized.normalization_version,
                 }
+                preview_spec = ObjectSpec(
+                    size=len(normalized.data),
+                    content_type='image/jpeg',
+                    metadata=preview_metadata,
+                    md5_hex=self._md5_bytes(normalized.data),
+                )
                 self._ensure_bytes_object(
                     preview_key,
                     normalized.data,
-                    content_type='image/jpeg',
-                    metadata=preview_metadata,
+                    spec=preview_spec,
                     conflict_name='搜索预览图',
                 )
+
+                if existing is not None:
+                    if (
+                        existing.oss_path != original_key
+                        or existing.preview_oss_path != preview_key
+                        or existing.embedding_model != EMBEDDING_MODEL
+                        or existing.embedding_dimension != EMBEDDING_DIMENSION
+                        or existing.normalization_version
+                        != normalized.normalization_version
+                    ):
+                        raise AssetIngestConflictError(
+                            '来源记录与当前 OSS 对象布局或标准化版本冲突'
+                        )
+                    return self._result('existing', existing)
 
                 reusable = ImageAsset.query.filter_by(
                     content_hash=content_hash,
@@ -160,7 +182,7 @@ class ImageAssetIngestService:
                 ).first()
                 if reusable is None:
                     preview_path.write_bytes(normalized.data)
-                    vector = self._embedding.embed_image(
+                    vector = self._embedding.embed_normalized_image(
                         str(preview_path),
                         request_id=request_id,
                     )
@@ -207,60 +229,44 @@ class ImageAssetIngestService:
         key,
         source_path,
         *,
-        expected_size,
-        content_type,
-        metadata,
+        spec,
         conflict_name,
     ):
-        existing = self._storage.head_object(key)
-        if existing is not None:
-            self._assert_matching(
-                existing,
-                expected_size=expected_size,
-                content_type=content_type,
-                metadata=metadata,
-                conflict_name=conflict_name,
-            )
-            return
-        self._storage.put_file(
-            key,
-            source_path,
-            content_type=content_type,
-            metadata=metadata,
-        )
+        if self._object_needs_upload(key, spec, conflict_name):
+            self._storage.put_file(key, source_path, spec=spec)
+
     def _ensure_bytes_object(
         self,
         key,
         data,
         *,
-        content_type,
-        metadata,
+        spec,
         conflict_name,
     ):
+        if self._object_needs_upload(key, spec, conflict_name):
+            self._storage.put_bytes(key, data, spec=spec)
+
+    def _object_needs_upload(
+        self,
+        key: str,
+        spec: ObjectSpec,
+        conflict_name: str,
+    ) -> bool:
         existing = self._storage.head_object(key)
-        if existing is not None:
-            self._assert_matching(
-                existing,
-                expected_size=len(data),
-                content_type=content_type,
-                metadata=metadata,
-                conflict_name=conflict_name,
-            )
-            return
-        self._storage.put_bytes(
-            key,
-            data,
-            content_type=content_type,
-            metadata=metadata,
+        if existing is None:
+            return True
+        self._assert_matching(
+            existing,
+            spec=spec,
+            conflict_name=conflict_name,
         )
+        return False
 
     @staticmethod
     def _assert_matching(
         existing: StoredObject,
         *,
-        expected_size: int,
-        content_type: str,
-        metadata,
+        spec: ObjectSpec,
         conflict_name: str,
     ) -> None:
         actual_metadata = {
@@ -269,12 +275,14 @@ class ImageAssetIngestService:
         }
         metadata_matches = all(
             actual_metadata.get(str(name).lower()) == str(value)
-            for name, value in metadata.items()
+            for name, value in spec.metadata.items()
         )
+        actual_etag = (existing.etag or '').strip('"').lower()
         if (
-            existing.size != expected_size
-            or existing.content_type != content_type
+            existing.size != spec.size
+            or existing.content_type != spec.content_type
             or not metadata_matches
+            or actual_etag != spec.md5_hex
         ):
             raise AssetIngestConflictError(
                 f'OSS {conflict_name}对象冲突，已存在对象未被覆盖'
@@ -297,6 +305,18 @@ class ImageAssetIngestService:
             for chunk in iter(lambda: source.read(1024 * 1024), b''):
                 digest.update(chunk)
         return digest.hexdigest()
+
+    @staticmethod
+    def _md5_file(path: Path) -> str:
+        digest = hashlib.md5(usedforsecurity=False)
+        with path.open('rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _md5_bytes(data: bytes) -> str:
+        return hashlib.md5(data, usedforsecurity=False).hexdigest()
 
     @staticmethod
     def _result(status: str, asset: ImageAsset) -> AssetIngestResult:

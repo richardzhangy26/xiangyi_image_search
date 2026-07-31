@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from models import ImageAsset
+from models import ImageAsset, db
 from services.asset_ingest import (
     AssetIngestConflictError,
     ImageAssetIngestService,
@@ -83,18 +83,32 @@ class FakeOss:
             size=len(item.data),
             content_type=item.content_type,
             metadata=item.metadata,
+            etag=hashlib.md5(
+                item.data,
+                usedforsecurity=False,
+            ).hexdigest(),
         )
 
-    def put_file(self, key, source_path, *, content_type, metadata):
+    def put_file(self, key, source_path, *, spec):
         assert key not in self.objects
         with open(source_path, 'rb') as source:
             data = source.read()
-        self.objects[key] = _FakeObject(data, content_type, dict(metadata))
+        assert hashlib.md5(data, usedforsecurity=False).hexdigest() == spec.md5_hex
+        self.objects[key] = _FakeObject(
+            data,
+            spec.content_type,
+            dict(spec.metadata),
+        )
         self.put_calls.append(key)
 
-    def put_bytes(self, key, data, *, content_type, metadata):
+    def put_bytes(self, key, data, *, spec):
         assert key not in self.objects
-        self.objects[key] = _FakeObject(data, content_type, dict(metadata))
+        assert hashlib.md5(data, usedforsecurity=False).hexdigest() == spec.md5_hex
+        self.objects[key] = _FakeObject(
+            data,
+            spec.content_type,
+            dict(spec.metadata),
+        )
         self.put_calls.append(key)
 
     def sign_download_url(self, key, expires_seconds):
@@ -107,7 +121,7 @@ class FakeEmbedding:
         self.paths = []
         self.payloads = []
 
-    def embed_image(self, image_path, request_id=None):
+    def embed_normalized_image(self, image_path, request_id=None):
         self.paths.append(image_path)
         with open(image_path, 'rb') as preview:
             self.payloads.append(preview.read())
@@ -184,6 +198,61 @@ def test_existing_oss_metadata_conflict_never_overwrites(app):
     assert all(not os.path.exists(path) for path in source.temp_paths)
 
 
+def test_existing_oss_same_size_and_metadata_but_changed_content_conflicts(app):
+    relative_path = '同尺寸篡改/图片.png'
+    original = _png_bytes()
+    digest = hashlib.sha256(original).hexdigest()
+    source = FakeKodo({relative_path: original})
+    storage = FakeOss()
+    original_key = f'image-search/xiangxipackage/{relative_path}'
+    tampered = bytes([original[0] ^ 1]) + original[1:]
+    storage.objects[original_key] = _FakeObject(
+        data=tampered,
+        content_type='image/png',
+        metadata={
+            'source-provider': 'qiniu-kodo',
+            'source-bucket': 'xiangxipackage',
+            'sha256': digest,
+            'source-size': str(len(original)),
+        },
+    )
+
+    with pytest.raises(AssetIngestConflictError, match='原图对象冲突'):
+        _service(source, storage, FakeEmbedding()).ingest_one(relative_path)
+
+    assert storage.objects[original_key].data == tampered
+    assert storage.put_calls == []
+    assert ImageAsset.query.count() == 0
+
+
+def test_existing_preview_content_conflict_never_overwrites(app):
+    original = _png_bytes('purple')
+    first_path = '预览冲突/第一张.png'
+    second_path = '预览冲突/第二张.png'
+    source = FakeKodo({
+        first_path: original,
+        second_path: original,
+    })
+    storage = FakeOss()
+    embedding = FakeEmbedding()
+    service = _service(source, storage, embedding)
+    service.ingest_one(first_path)
+    row = ImageAsset.query.one()
+    preview_key = row.preview_oss_path
+    preview_object = storage.objects[preview_key]
+    tampered = bytes([preview_object.data[0] ^ 1]) + preview_object.data[1:]
+    preview_object.data = tampered
+    db.session.delete(row)
+    db.session.commit()
+
+    with pytest.raises(AssetIngestConflictError, match='搜索预览图对象冲突'):
+        service.ingest_one(second_path)
+
+    assert storage.objects[preview_key].data == tampered
+    assert storage.put_calls.count(preview_key) == 1
+    assert ImageAsset.query.count() == 0
+
+
 def test_embedding_exception_cleans_all_temporary_files(app):
     relative_path = '异常/图片.png'
     source = FakeKodo({relative_path: _png_bytes()})
@@ -219,6 +288,25 @@ def test_same_content_at_different_paths_creates_two_assets_and_reuses_vector(ap
     assert list(rows[0].vector) == list(rows[1].vector)
     assert len(embedding.paths) == 1
     assert storage.put_calls.count(rows[0].preview_oss_path) == 1
+
+
+def test_same_source_rerun_revalidates_oss_and_is_idempotent(app):
+    relative_path = '重跑/同一张.png'
+    source = FakeKodo({relative_path: _png_bytes('cyan')})
+    storage = FakeOss()
+    embedding = FakeEmbedding()
+    service = _service(source, storage, embedding)
+    created = service.ingest_one(relative_path)
+    storage.head_calls.clear()
+
+    existing = service.ingest_one(relative_path)
+
+    row = ImageAsset.query.one()
+    assert existing.status == 'existing'
+    assert existing.asset_id == created.asset_id
+    assert storage.head_calls == [row.oss_path, row.preview_oss_path]
+    assert len(embedding.paths) == 1
+    assert ImageAsset.query.count() == 1
 
 
 def test_same_source_path_with_changed_content_is_a_source_conflict(app):

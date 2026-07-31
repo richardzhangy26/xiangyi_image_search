@@ -42,22 +42,6 @@ class EmbeddingRateLimitExhaustedError(EmbeddingServiceError):
 
 def _to_data_uri(image_path, max_size_mb=MAX_IMAGE_MB):
     """读图 → 必要时压缩到 max_size_mb 以内 → JPEG base64 Data URI。"""
-    max_size_bytes = int(max_size_mb * 1024 * 1024)
-
-    # ImageNormalizer 产出的搜索预览图已经满足方向、尺寸、白底和字节上限。
-    # 对这类 JPEG 原样编码，避免持久化预览与实际 embedding 输入之间再发生
-    # 一次不可追踪的有损转码。
-    if os.path.getsize(image_path) <= max_size_bytes:
-        with open(image_path, 'rb') as source:
-            original_bytes = source.read()
-        with Image.open(io.BytesIO(original_bytes)) as original:
-            if original.format == 'JPEG':
-                original.verify()
-                return (
-                    'data:image/jpeg;base64,'
-                    + base64.b64encode(original_bytes).decode('utf-8')
-                )
-
     image = Image.open(image_path)
     if image.mode not in ('RGB', 'L'):
         image = image.convert('RGB')
@@ -66,6 +50,7 @@ def _to_data_uri(image_path, max_size_mb=MAX_IMAGE_MB):
     image.save(buffer, format='JPEG', quality=95)
     img_bytes = buffer.getvalue()
 
+    max_size_bytes = int(max_size_mb * 1024 * 1024)
     if len(img_bytes) > max_size_bytes:
         width, height = image.size
         scale = (max_size_bytes / len(img_bytes)) ** 0.5 * 0.9  # 0.9 安全系数
@@ -87,6 +72,32 @@ def _to_data_uri(image_path, max_size_mb=MAX_IMAGE_MB):
     return 'data:image/jpeg;base64,' + base64.b64encode(img_bytes).decode('utf-8')
 
 
+def _normalized_to_data_uri(image_path, max_size_mb=MAX_IMAGE_MB):
+    """将 ImageNormalizer 产出的合规 JPEG 原样转换为 Data URI。"""
+    max_size_bytes = int(max_size_mb * 1024 * 1024)
+    if os.path.getsize(image_path) > max_size_bytes:
+        raise EmbeddingServiceError('标准化搜索预览图超过 embedding 大小上限')
+
+    with open(image_path, 'rb') as source:
+        preview_bytes = source.read()
+    try:
+        with Image.open(io.BytesIO(preview_bytes)) as preview:
+            if preview.format != 'JPEG':
+                raise EmbeddingServiceError('标准化搜索预览图必须是 JPEG')
+            preview.verify()
+    except EmbeddingServiceError:
+        raise
+    except Exception as exc:
+        raise EmbeddingServiceError(
+            f'标准化搜索预览图无法解码: {type(exc).__name__}'
+        ) from exc
+
+    return (
+        'data:image/jpeg;base64,'
+        + base64.b64encode(preview_bytes).decode('utf-8')
+    )
+
+
 class EmbeddingClient:
     """无状态的 DashScope 封装，可安全地被多个请求共享。"""
 
@@ -102,6 +113,13 @@ class EmbeddingClient:
     def embed_image(self, image_path, request_id=None):
         """单张图片 → 1024 维向量。失败抛 EmbeddingServiceError。"""
         return self._call([{'image': _to_data_uri(image_path)}], request_id)[0]
+
+    def embed_normalized_image(self, image_path, request_id=None):
+        """标准化搜索预览 JPEG → 1024 维向量，不做二次有损转码。"""
+        return self._call(
+            [{'image': _normalized_to_data_uri(image_path)}],
+            request_id,
+        )[0]
 
     def embed_text(self, content, request_id=None):
         """文本 → 1024 维向量。与图片共享同一向量空间。"""

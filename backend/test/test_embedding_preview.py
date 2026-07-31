@@ -5,7 +5,7 @@ import io
 
 from PIL import Image
 
-from services.embedding import _to_data_uri
+from services.embedding import _normalized_to_data_uri
 
 
 def test_compliant_jpeg_bytes_are_sent_to_embedding_unchanged(tmp_path):
@@ -19,7 +19,7 @@ def test_compliant_jpeg_bytes_are_sent_to_embedding_unchanged(tmp_path):
     original = output.getvalue()
     source.write_bytes(original)
 
-    data_uri = _to_data_uri(source)
+    data_uri = _normalized_to_data_uri(source)
     encoded = data_uri.split(',', 1)[1]
 
     assert base64.b64decode(encoded) == original

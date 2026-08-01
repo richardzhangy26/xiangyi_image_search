@@ -37,6 +37,7 @@ import {
   getProducts,
   createProduct,
   updateProduct,
+  deleteProductImage,
   deleteProduct,
   batchDeleteProducts,
   importProductsFromCSV,
@@ -104,8 +105,30 @@ export const ProductUpload: React.FC = () => {
         const { images, ...productData } = values;
 
         if (editingProduct) {
-          // 更新产品
+          const retainedAssetIds = new Set(
+            (images as UploadFile[] | undefined)?.map((file) => file.uid) || []
+          );
+          const removedAssetIds =
+            editingProduct.images
+              ?.filter((image) => !retainedAssetIds.has(image.asset_id))
+              .map((image) => image.asset_id) || [];
+
+          // 先保存字段和新图片；只有保存成功后才归档被移除的既有资产。
           await updateProduct(editingProduct.model_number, productData, imageFiles);
+          const archiveResults = await Promise.allSettled(
+            removedAssetIds.map((assetId) =>
+              deleteProductImage(editingProduct.model_number, assetId)
+            )
+          );
+          const failedArchiveCount = archiveResults.filter(
+            (result) => result.status === 'rejected'
+          ).length;
+          if (failedArchiveCount > 0) {
+            await fetchProducts();
+            throw new Error(
+              `产品信息已更新，但有 ${failedArchiveCount} 张图片归档失败；请重试保存`
+            );
+          }
           message.success('产品更新成功');
         } else {
           // 创建产品
@@ -139,11 +162,11 @@ export const ProductUpload: React.FC = () => {
     if (product) {
       // 编辑模式，回填数据
       const imageList: UploadFile[] =
-        product.images?.map((img, idx) => ({
-          uid: `image_${idx}`,
-          name: img.image_path.split('/').pop() || '',
+        product.images?.map((img) => ({
+          uid: img.asset_id,
+          name: img.source_relative_path.split('/').pop() || '商品图片',
           status: 'done',
-          url: getImageUrl(img.image_path),
+          url: getImageUrl(img.preview_url),
         })) || [];
 
       form.setFieldsValue({
@@ -317,7 +340,7 @@ export const ProductUpload: React.FC = () => {
 
         return (
           <Image
-            src={getImageUrl(primaryImage.image_path)}
+            src={getImageUrl(primaryImage.preview_url)}
             alt="主图"
             width={60}
             height={60}

@@ -5,25 +5,17 @@
 
 import type {
   Product,
-  ProductImage,
   ProductListResponse,
-  ProductSearchResult,
+  ImageAssetSearchResult,
   ProductStatistics,
   CSVImportResponse,
   VectorIndexEvent,
   ProductFormData,
+  ProductImageWriteSummary,
 } from '../types/product';
+import { API_BASE_URL } from '../config';
 
-// API 基础 URL
-const getApiBaseUrl = () => {
-  const hostname = window.location.hostname;
-  if (hostname === 'localhost' || hostname === '127.0.0.1') {
-    return 'http://localhost:5000';
-  }
-  return `http://${hostname}:5000`;
-};
-
-export const API_BASE_URL = getApiBaseUrl();
+export { API_BASE_URL };
 
 /**
  * 获取完整图片 URL
@@ -100,7 +92,7 @@ export const getProductByModelNumber = async (modelNumber: string): Promise<Prod
 export const createProduct = async (
   productData: ProductFormData,
   images: File[]
-): Promise<{ message: string; model_number: string; uploaded_images: number }> => {
+): Promise<ProductImageWriteSummary & { message: string; model_number: string }> => {
   const formData = new FormData();
   formData.append('product', JSON.stringify(productData));
 
@@ -128,7 +120,7 @@ export const updateProduct = async (
   modelNumber: string,
   productData: Partial<ProductFormData>,
   newImages?: File[]
-): Promise<{ message: string }> => {
+): Promise<ProductImageWriteSummary & { message: string }> => {
   const formData = new FormData();
   formData.append('product', JSON.stringify(productData));
 
@@ -194,10 +186,10 @@ export const batchDeleteProducts = async (
  */
 export const deleteProductImage = async (
   modelNumber: string,
-  imageId: number
+  assetId: string
 ): Promise<{ message: string }> => {
   const response = await fetch(
-    `${API_BASE_URL}/api/products/${encodeURIComponent(modelNumber)}/images/${imageId}`,
+    `${API_BASE_URL}/api/products/${encodeURIComponent(modelNumber)}/images/${encodeURIComponent(assetId)}`,
     {
       method: 'DELETE',
     }
@@ -302,7 +294,7 @@ export const buildVectorIndex = (
 export const searchProductsByImage = async (
   image: File,
   topK: number = 10
-): Promise<ProductSearchResult[]> => {
+): Promise<ImageAssetSearchResult[]> => {
   const formData = new FormData();
   formData.append('image', image);
   formData.append('top_k', topK.toString());
@@ -315,8 +307,12 @@ export const searchProductsByImage = async (
   if (!response.ok) {
     let errorMessage = '图片搜索失败';
 
-    if (response.status === 400) {
-      errorMessage = '图片格式不支持或文件损坏';
+    if (response.status === 413) {
+      errorMessage = '图片过大，请缩小后重试';
+    } else if (response.status === 400) {
+      errorMessage = '图片格式不支持、文件损坏或无法安全解码';
+    } else if (response.status === 503) {
+      errorMessage = '图片识别服务暂不可用，请稍后重试';
     } else if (response.status === 500) {
       errorMessage = '服务器处理图片搜索时出错';
     } else {

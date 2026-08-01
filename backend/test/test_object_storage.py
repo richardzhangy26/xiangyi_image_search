@@ -8,6 +8,7 @@ from services.object_storage import ObjectSpec, OssObjectStorage
 class FakeBucket:
     def __init__(self):
         self.calls = []
+        self.bucket_name = 'private-image-assets'
         self.head_result = SimpleNamespace(
             content_length=123,
             content_type='image/jpeg',
@@ -21,6 +22,20 @@ class FakeBucket:
     def head_object(self, key):
         self.calls.append(('head', key))
         return self.head_result
+
+    def get_bucket_info(self):
+        self.calls.append(('bucket_info',))
+        return SimpleNamespace(
+            name=self.bucket_name,
+            location='oss-cn-shanghai',
+            acl=SimpleNamespace(grant='private'),
+        )
+
+    def list_objects_v2(self, **kwargs):
+        self.calls.append(('list', kwargs))
+        return SimpleNamespace(
+            object_list=[SimpleNamespace(key='image-search/original/key.jpg')]
+        )
 
     def put_object_from_file(self, key, filename, headers=None):
         self.calls.append(('put_file', key, filename, headers))
@@ -43,6 +58,23 @@ def test_head_returns_size_content_type_and_normalized_metadata():
     assert result.content_type == 'image/jpeg'
     assert result.metadata == {'sha256': 'a' * 64}
     assert result.etag == '"098f6bcd4621d373cade4e832627b4f6"'
+
+
+def test_inspect_target_reads_bucket_identity_acl_and_prefix_sample():
+    bucket = FakeBucket()
+
+    result = OssObjectStorage(bucket).inspect_target('image-search')
+
+    assert result.bucket_name == 'private-image-assets'
+    assert result.location == 'oss-cn-shanghai'
+    assert result.acl == 'private'
+    assert result.sample_key == 'image-search/original/key.jpg'
+    assert result.sample_metadata == {'sha256': 'a' * 64}
+    assert bucket.calls == [
+        ('bucket_info',),
+        ('list', {'prefix': 'image-search/', 'max_keys': 1}),
+        ('head', 'image-search/original/key.jpg'),
+    ]
 
 
 def test_uploads_forbid_overwrite_and_attach_metadata(tmp_path):

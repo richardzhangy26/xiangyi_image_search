@@ -2,16 +2,16 @@
  * 产品图片搜索组件 - 电子产品配件
  */
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { Card, Button, message, Spin, Empty, Descriptions, Image, Tag } from 'antd';
-import { UploadOutlined, SearchOutlined, ClearOutlined } from '@ant-design/icons';
-import { Upload, Search, X, Sparkles, TrendingUp } from 'lucide-react';
-import type { ProductSearchResult } from '../types/product';
+import { message, Spin, Empty } from 'antd';
+import { Copy, Upload, Search, X, Sparkles, TrendingUp } from 'lucide-react';
+import type { ImageAssetSearchResult } from '../types/product';
 import { searchProductsByImage, getImageUrl } from '../services/productApi';
+import { prepareSearchImage } from '../utils/prepareSearchImage';
 
 export const ProductSearch: React.FC = () => {
   const [searchImage, setSearchImage] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [results, setResults] = useState<ProductSearchResult[]>([]);
+  const [results, setResults] = useState<ImageAssetSearchResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -116,17 +116,30 @@ export const ProductSearch: React.FC = () => {
 
     setLoading(true);
     try {
-      const searchResults = await searchProductsByImage(searchImage, 10);
+      const preparedImage = await prepareSearchImage(searchImage);
+      if (preparedImage !== searchImage) {
+        message.info('图片较大，已在浏览器中缩小后上传');
+      }
+      const searchResults = await searchProductsByImage(preparedImage, 10);
       setResults(searchResults);
       if (searchResults.length === 0) {
-        message.info('未找到相似产品');
+        message.info('未找到相似图片');
       } else {
-        message.success(`找到 ${searchResults.length} 个相似产品`);
+        message.success(`找到 ${searchResults.length} 张相似图片`);
       }
     } catch (err) {
       message.error(err instanceof Error ? err.message : '搜索失败');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const copyRelativePath = async (relativePath: string) => {
+    try {
+      await navigator.clipboard.writeText(relativePath);
+      message.success('相对路径已复制');
+    } catch {
+      message.error('复制失败，请手动选择路径');
     }
   };
 
@@ -249,7 +262,7 @@ export const ProductSearch: React.FC = () => {
       {loading ? (
         <div className="text-center py-20">
           <Spin size="large" />
-          <p className="mt-4 text-slate-600 text-lg">AI 正在分析图片并搜索相似产品...</p>
+          <p className="mt-4 text-slate-600 text-lg">AI 正在分析图片并搜索相似图片...</p>
         </div>
       ) : results.length > 0 ? (
         <div>
@@ -258,20 +271,20 @@ export const ProductSearch: React.FC = () => {
               <TrendingUp className="w-6 h-6 text-sky-600" />
               <h3 className="text-2xl font-bold text-slate-900">
                 搜索结果
-                <span className="ml-2 text-lg text-slate-500">({results.length} 个相似产品)</span>
+                <span className="ml-2 text-lg text-slate-500">({results.length} 张相似图片)</span>
               </h3>
             </div>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {results.map((result, index) => (
+            {results.map((result) => (
               <div
-                key={`${result.model_number}-${index}`}
-                className="group bg-white rounded-xl border border-slate-200 overflow-hidden hover:shadow-xl hover:border-sky-300 transition-all duration-200 cursor-pointer"
+                key={result.asset_id}
+                className="group bg-white rounded-xl border border-slate-200 overflow-hidden hover:shadow-xl hover:border-sky-300 transition-all duration-200"
               >
                 <div className="relative overflow-hidden">
                   <img
-                    src={getImageUrl(result.matched_image || result.primary_image || '')}
-                    alt={result.model_number}
+                    src={getImageUrl(result.preview_url)}
+                    alt={result.model_number || result.relative_path}
                     className="w-full h-64 object-cover group-hover:scale-105 transition-transform duration-300"
                   />
                   <div className="absolute top-3 right-3">
@@ -281,43 +294,25 @@ export const ProductSearch: React.FC = () => {
                   </div>
                 </div>
                 <div className="p-5">
-                  <h4 className="text-lg font-bold text-slate-900 mb-2">{result.model_number}</h4>
-                  <p className="text-sm text-slate-600 mb-4">{result.category}</p>
-                  <div className="space-y-2 text-sm">
-                    <div className="flex justify-between">
-                      <span className="text-slate-500">摄影师文件:</span>
-                      <span className="text-slate-900 font-medium truncate ml-2">
-                        {result.photographer_file}
-                      </span>
+                  <h4 className="text-lg font-bold text-slate-900 mb-3">
+                    {result.model_number || '未补充型号'}
+                  </h4>
+                  <div className="rounded-lg bg-slate-50 border border-slate-100 p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <p className="text-sm text-slate-700 break-all whitespace-normal m-0">
+                        {result.relative_path}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => copyRelativePath(result.relative_path)}
+                        className="shrink-0 inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-600 hover:border-sky-300 hover:text-sky-700"
+                        aria-label={`复制相对路径 ${result.relative_path}`}
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                        复制相对路径
+                      </button>
                     </div>
-                    {result.price_1688 && (
-                      <div className="flex justify-between">
-                        <span className="text-slate-500">1688价格:</span>
-                        <span className="text-sky-700 font-semibold">
-                          ¥{result.price_1688.toFixed(2)}
-                        </span>
-                      </div>
-                    )}
-                    {result.fob_price_tier1 && (
-                      <div className="flex justify-between">
-                        <span className="text-slate-500">FOB报价:</span>
-                        <span className="text-sky-700 font-semibold">
-                          ${result.fob_price_tier1.toFixed(2)} - $
-                          {result.fob_price_tier3?.toFixed(2) || result.fob_price_tier1.toFixed(2)}
-                        </span>
-                      </div>
-                    )}
                   </div>
-                  {result.alibaba_product_url && (
-                    <a
-                      href={result.alibaba_product_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="mt-4 inline-flex items-center text-sky-600 hover:text-sky-700 font-medium transition-colors duration-200"
-                    >
-                      查看阿里产品详情 →
-                    </a>
-                  )}
                 </div>
               </div>
             ))}
@@ -327,7 +322,7 @@ export const ProductSearch: React.FC = () => {
         !loading &&
         searchImage && (
           <div className="text-center py-20">
-            <Empty description="未找到相似产品" />
+            <Empty description="未找到相似图片" />
           </div>
         )
       )}

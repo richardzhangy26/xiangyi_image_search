@@ -49,14 +49,30 @@ export interface Product {
  * 产品图片信息
  */
 export interface ProductImage {
-  id: number;                     // 图片ID
-  model_number: string;           // 关联产品型号
-  image_path: string;             // Web访问路径
-  original_path?: string;         // 文件系统原始路径
-  oss_path?: string;              // OSS云存储路径
+  id: string;                     // 图片资产 UUID（兼容字段）
+  asset_id: string;               // 图片资产 UUID
+  model_number: string | null;    // 关联产品型号
+  image_path: string;             // 站内私有预览路径（兼容字段）
+  preview_url: string;            // 站内私有预览路径
+  source_relative_path: string;   // 上传时的来源路径/文件名
+  content_hash: string;           // 原图 SHA-256
+  original_path: null;            // 正式图片不再使用本机路径
   image_order: number;            // 图片排序
   is_primary: boolean;            // 是否主图
   created_at?: string;            // 创建时间
+}
+
+export interface ProductImageWriteResult {
+  asset_id: string;
+  source_relative_path: string;
+  status: 'created' | 'existing';
+}
+
+export interface ProductImageWriteSummary {
+  uploaded_images: number;
+  reused_images: number;
+  skipped_duplicates: string[];
+  image_results: ProductImageWriteResult[];
 }
 
 /**
@@ -69,12 +85,13 @@ export interface ProductListResponse {
   per_page: number;
 }
 
-/**
- * 产品搜索结果
- */
-export interface ProductSearchResult extends Product {
-  similarity?: number;            // 相似度分数
-  matched_image?: string;         // 匹配的图片路径
+/** 图片资产级搜索结果；商品型号允许尚未补充。 */
+export interface ImageAssetSearchResult {
+  asset_id: string;
+  model_number: string | null;
+  relative_path: string;
+  preview_url: string;
+  similarity: number;
 }
 
 /**

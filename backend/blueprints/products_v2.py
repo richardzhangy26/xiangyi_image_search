@@ -4,17 +4,33 @@ Products V2 Blueprint - 电子产品配件管理 API
 """
 from flask import Blueprint, request, jsonify, current_app, Response, stream_with_context
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
 import os
+import hashlib
+import tempfile
 import uuid
 import json
 import csv
 import io
+from datetime import datetime
+from urllib.parse import quote
 from flask_cors import cross_origin
 from sqlalchemy.exc import IntegrityError
-from models import db, Product, ProductImage
+from models import db, ImageAsset, Product, ProductImage
 from product_search import EmbeddingServiceError, VectorSearchError
-from services.ingest import ALLOWED_EXTENSIONS, ImageIngestService
+from services.asset_ingest import (
+    AssetIngestConflictError,
+    AssetIngestError,
+    ImageAssetIngestService,
+)
+from services.image_normalizer import ImageNormalizationError
+from services.ingest import ALLOWED_EXTENSIONS
+from services.object_source import InMemoryObjectSource
+from services.object_storage import ObjectStorageError, OssObjectStorage
 products_v2_bp = Blueprint('products_v2', __name__, url_prefix='/api/products')
+
+PRODUCT_UPLOAD_SOURCE_PROVIDER = 'product-upload'
+PRODUCT_UPLOAD_SOURCE_BUCKET = 'product-uploads'
 
 # ========================================
 # 辅助函数
@@ -47,19 +63,198 @@ def validate_top_k(raw_top_k, default=10, min_value=1, max_value=50):
     return top_k
 
 
-def get_ingest_service():
-    """构造 ImageIngestService，复用测试注入的 embedding client（如果有）。"""
-    return ImageIngestService(embedding_client=current_app.config.get('IMAGE_INGEST_EMBEDDING'))
+def get_asset_ingest_service(source):
+    """构造统一图片资产入库服务，并只在外部系统边界提供测试替身。"""
+    storage = current_app.config.get('IMAGE_ASSET_STORAGE')
+    if storage is None:
+        storage = OssObjectStorage.from_env()
+    return ImageAssetIngestService(
+        source=source,
+        storage=storage,
+        embedding_client=current_app.config.get('IMAGE_INGEST_EMBEDDING'),
+        normalizer=current_app.config.get('IMAGE_ASSET_NORMALIZER'),
+        source_provider=PRODUCT_UPLOAD_SOURCE_PROVIDER,
+    )
 
 
-def remove_files_quietly(paths):
-    """删除磁盘文件；单个失败只记日志，不影响其余。"""
-    for path in paths:
-        try:
-            if path and os.path.exists(path):
-                os.remove(path)
-        except OSError as exc:
-            current_app.logger.warning(f"清理图片文件失败: {path}, error={exc}")
+def prepare_product_uploads(image_files, model_number):
+    """把 multipart 图片包装成可重放的只读来源。
+
+    Product 请求不是分布式事务：OSS 上传成功后，embedding 或数据库提交仍可能
+    失败。来源路径因此必须由商品、内容、文件名和同名出现序号稳定推导；重试同一
+    请求会 HEAD 并复用原对象，而不会因随机 UUID 再制造无法关联的 OSS 孤儿。
+    """
+    objects = {}
+    content_types = {}
+    relative_paths = []
+    occurrences = {}
+    encoded_model_number = quote(str(model_number), safe='')
+    for image_file in image_files:
+        if not image_file or not allowed_file(image_file.filename):
+            continue
+        filename = (
+            (image_file.filename or '')
+            .replace('\\', '/')
+            .rsplit('/', 1)[-1]
+            .replace('\x00', '')
+            .strip()
+        )
+        if not filename:
+            filename = 'upload.jpg'
+        data = image_file.read()
+        content_hash = hashlib.sha256(data).hexdigest()
+        occurrence_key = (filename, content_hash)
+        occurrence = occurrences.get(occurrence_key, 0) + 1
+        occurrences[occurrence_key] = occurrence
+        relative_path = (
+            f'models/{encoded_model_number}/{content_hash}/'
+            f'{occurrence:04d}/{filename}'
+        )
+        objects[relative_path] = data
+        content_types[relative_path] = image_file.mimetype or 'application/octet-stream'
+        relative_paths.append(relative_path)
+    return InMemoryObjectSource(
+        source_bucket=PRODUCT_UPLOAD_SOURCE_BUCKET,
+        objects=objects,
+        content_types=content_types,
+    ), relative_paths
+
+
+def attach_product_upload_result(result, model_number):
+    """把新建或幂等复用的上传资产关联到当前商品。
+
+    删除 Product 会把资产型号置空，图片归档也会保留来源身份。用户随后用同一
+    商品和同一文件重试或重新上传时，统一入库服务会返回 ``existing``；这里负责
+    恢复关联与 active 状态，同时继续复用原 OSS 对象和 embedding。
+    """
+    if result.status not in {'created', 'existing'} or not result.asset_id:
+        return None
+
+    asset = db.session.get(ImageAsset, result.asset_id)
+    if asset is None:
+        raise AssetIngestError(
+            '图片资产写入结果无法回读',
+            stage='database',
+        )
+    if asset.model_number not in {None, model_number}:
+        raise AssetIngestConflictError(
+            '图片资产已经关联到其他商品',
+            stage='database',
+            kind='source_conflict',
+        )
+
+    asset.model_number = model_number
+    asset.status = 'active'
+    asset.archived_at = None
+    return {
+        'asset_id': result.asset_id,
+        'source_relative_path': result.source_relative_path,
+        'status': result.status,
+    }
+
+
+def summarize_product_upload_results(image_results):
+    """保留旧计数字段，并显式区分新建与幂等复用。"""
+    created = [
+        item for item in image_results
+        if item['status'] == 'created'
+    ]
+    reused = [
+        item for item in image_results
+        if item['status'] == 'existing'
+    ]
+    return {
+        'uploaded_images': len(created),
+        'reused_images': len(reused),
+        'skipped_duplicates': [item['asset_id'] for item in reused],
+        'image_results': image_results,
+    }
+
+
+def image_asset_for_product(asset, image_order=0):
+    """适配现有商品管理界面的图片字段，不生成或持久化 OSS 签名 URL。"""
+    preview_url = f'/api/image-assets/{asset.id}/preview'
+    return {
+        'id': str(asset.id),
+        'asset_id': str(asset.id),
+        'model_number': asset.model_number,
+        'image_path': preview_url,
+        'preview_url': preview_url,
+        'source_relative_path': asset.source_relative_path,
+        'content_hash': asset.content_hash,
+        'original_path': None,
+        'image_order': image_order,
+        'is_primary': image_order == 0,
+        'created_at': asset.created_at.isoformat() if asset.created_at else None,
+    }
+
+
+def products_with_active_images(products):
+    """批量拼装商品与活动资产，避免产品列表出现逐行图片查询。"""
+    if not products:
+        return []
+
+    model_numbers = [product.model_number for product in products]
+    assets_by_model = {model_number: [] for model_number in model_numbers}
+    assets = ImageAsset.query.filter(
+        ImageAsset.model_number.in_(model_numbers),
+        ImageAsset.status == 'active',
+    ).order_by(
+        ImageAsset.model_number,
+        ImageAsset.created_at,
+        ImageAsset.id,
+    ).all()
+    for asset in assets:
+        assets_by_model[asset.model_number].append(asset)
+
+    result = []
+    for product in products:
+        product_dict = product.to_dict()
+        product_dict['images'] = [
+            image_asset_for_product(asset, image_order=index)
+            for index, asset in enumerate(
+                assets_by_model[product.model_number]
+            )
+        ]
+        result.append(product_dict)
+    return result
+
+
+def legacy_images_require_migration(model_numbers):
+    if not model_numbers:
+        return False
+    return ProductImage.query.filter(
+        ProductImage.model_number.in_(model_numbers)
+    ).first() is not None
+
+
+def legacy_images_error_response():
+    return error_response(
+        '检测到旧商品图片数据，请先制定兼容迁移方案后再删除商品',
+        'LEGACY_PRODUCT_IMAGES_REQUIRE_MIGRATION',
+        409,
+    )
+
+
+def asset_ingest_error_response(error):
+    """把统一入库服务的内部阶段转换为稳定的外部错误。"""
+    if error.stage == 'embedding':
+        return error_response(
+            '图片识别服务暂不可用，请稍后重试',
+            'EMBEDDING_SERVICE_ERROR',
+            503,
+        )
+    if error.stage in {'original', 'preview'}:
+        return error_response(
+            '图片存储服务暂不可用，请稍后重试',
+            'OBJECT_STORAGE_ERROR',
+            503,
+        )
+    return error_response(
+        '图片资产写入失败',
+        'IMAGE_ASSET_INGEST_FAILED',
+        500,
+    )
 
 
 # ========================================
@@ -107,8 +302,7 @@ def get_products():
             products = query.all()
             total = len(products)
 
-        # 转换为字典
-        product_list = [product.to_dict() for product in products]
+        product_list = products_with_active_images(products)
 
         return jsonify({
             'products': product_list,
@@ -127,16 +321,12 @@ def get_products():
 def get_product(model_number):
     """获取单个产品详情"""
     try:
-        product = Product.query.get(model_number)
+        product = db.session.get(Product, model_number)
 
         if not product:
             return jsonify({'error': '产品不存在'}), 404
 
-        # 获取产品图片列表
-        product_dict = product.to_dict()
-        product_dict['images'] = [img.to_dict() for img in product.images]
-
-        return jsonify(product_dict)
+        return jsonify(products_with_active_images([product])[0])
 
     except Exception as e:
         current_app.logger.error(f"获取产品详情失败: {str(e)}")
@@ -147,8 +337,6 @@ def get_product(model_number):
 @cross_origin()
 def create_product():
     """创建新产品（支持图片上传）"""
-    saved_filesystem_paths = []
-    should_cleanup_files = False
     try:
         # 获取产品数据
         product_data_str = request.form.get('product')
@@ -166,90 +354,110 @@ def create_product():
         model_number = product_data['model_number']
 
         # 检查型号是否已存在
-        if Product.query.get(model_number):
+        if db.session.get(Product, model_number):
             return jsonify({'error': f'型号 {model_number} 已存在'}), 400
 
         # 创建产品对象（单事务：此处不提交）
         product = Product.from_dict(product_data)
         db.session.add(product)
 
-        # 处理图片上传
-        ingest_service = get_ingest_service()
-        images = request.files.getlist('images')
-        uploaded_images = []
-        skipped_duplicates = []
+        source, relative_paths = prepare_product_uploads(
+            request.files.getlist('images'),
+            model_number,
+        )
+        image_results = []
         request_id = uuid.uuid4().hex
 
-        for idx, image_file in enumerate(images):
-            if not image_file or not allowed_file(image_file.filename):
-                continue
-
-            data = image_file.read()
-            # 向量生成失败会向上抛出，不再吞掉异常静默丢数据
-            result = ingest_service.ingest_one(
-                model_number, data, image_file.filename,
-                current_app.config['UPLOAD_FOLDER'],
-                image_order=idx, is_primary=(idx == 0),
-                request_id=request_id,
-            )
-            if result.status == 'created':
-                saved_filesystem_paths.append(result.fs_path)
-                uploaded_images.append(result.image_path)
-            elif result.status == 'duplicate':
-                skipped_duplicates.append({
-                    'filename': image_file.filename,
-                    'duplicate_of': result.duplicate_of,
-                })
+        if relative_paths:
+            ingest_service = get_asset_ingest_service(source)
+            for relative_path in relative_paths:
+                result = ingest_service.ingest_one(
+                    relative_path,
+                    model_number=model_number,
+                    request_id=request_id,
+                    commit=False,
+                )
+                image_result = attach_product_upload_result(
+                    result,
+                    model_number,
+                )
+                if image_result:
+                    image_results.append(image_result)
 
         db.session.commit()
-        should_cleanup_files = False
-
-        # 无需刷新向量索引 (Stateless)
-        # if uploaded_images and current_app.config.get('PRODUCT_INDEX'):
-        #     current_app.config['PRODUCT_INDEX'].refresh_from_database()
 
         return jsonify({
             'message': '产品创建成功',
             'model_number': model_number,
-            'uploaded_images': len(uploaded_images),
-            'skipped_duplicates': skipped_duplicates
+            **summarize_product_upload_results(image_results),
         }), 201
 
-    except IntegrityError as e:
-        # 并发上传同一张新图：判重阶段两边都判定为"新"，后 commit 的一方在这里撞
-        # UNIQUE 约束（详见 services/ingest.py 的 ingest_one docstring）。
-        # 语义上这是一次瞬时冲突而非请求本身有错，409 + 提示重试比 500 更准确；
-        # 已落盘的文件必须清理，否则会产生新的孤儿文件。
+    except (IntegrityError, AssetIngestConflictError) as e:
         db.session.rollback()
-        should_cleanup_files = True
-        current_app.logger.warning(f"创建产品失败（并发重复图片冲突）: {str(e)}")
+        current_app.logger.warning(
+            '创建产品失败（图片资产冲突）: %s',
+            type(e).__name__,
+        )
         return error_response(
-            '图片重复写入冲突（可能有并发请求上传了同一张图片），请重试',
-            'DUPLICATE_IMAGE_CONFLICT', 409,
+            '图片资产发生冲突，未覆盖现有内容',
+            'IMAGE_ASSET_CONFLICT',
+            409,
+        )
+    except ImageNormalizationError:
+        db.session.rollback()
+        return error_response(
+            '上传图片已损坏或无法安全解码',
+            'INVALID_IMAGE',
+            400,
         )
     except EmbeddingServiceError as e:
         db.session.rollback()
-        should_cleanup_files = True
-        current_app.logger.error(f"创建产品失败（向量服务）: {str(e)}")
-        return error_response(str(e), 'EMBEDDING_SERVICE_ERROR', 503)
+        current_app.logger.error(
+            '创建产品失败（向量服务） error_type=%s',
+            type(e).__name__,
+        )
+        return error_response(
+            '图片识别服务暂不可用，请稍后重试',
+            'EMBEDDING_SERVICE_ERROR',
+            503,
+        )
+    except ObjectStorageError as e:
+        db.session.rollback()
+        current_app.logger.error(
+            '创建产品失败（对象存储） error_type=%s',
+            type(e).__name__,
+        )
+        return error_response(
+            '图片存储服务暂不可用，请稍后重试',
+            'OBJECT_STORAGE_ERROR',
+            503,
+        )
+    except AssetIngestError as e:
+        db.session.rollback()
+        current_app.logger.error(
+            '创建产品失败（图片资产） stage=%s error_type=%s',
+            e.stage,
+            type(e).__name__,
+        )
+        return asset_ingest_error_response(e)
+    except RequestEntityTooLarge:
+        db.session.rollback()
+        return error_response('上传图片过大', 'IMAGE_TOO_LARGE', 413)
     except Exception as e:
         db.session.rollback()
-        should_cleanup_files = True
-        current_app.logger.error(f"创建产品失败: {str(e)}")
-        return error_response(str(e), 'PRODUCT_CREATE_FAILED', 500)
-    finally:
-        if should_cleanup_files:
-            remove_files_quietly(saved_filesystem_paths)
+        current_app.logger.error(
+            '创建产品失败 error_type=%s',
+            type(e).__name__,
+        )
+        return error_response('产品创建失败', 'PRODUCT_CREATE_FAILED', 500)
 
 
 @products_v2_bp.route('/<model_number>', methods=['PUT'])
 @cross_origin()
 def update_product(model_number):
     """更新产品信息"""
-    saved_filesystem_paths = []
-    should_cleanup_files = False
     try:
-        product = Product.query.get(model_number)
+        product = db.session.get(Product, model_number)
         if not product:
             return jsonify({'error': '产品不存在'}), 404
 
@@ -263,70 +471,94 @@ def update_product(model_number):
                 if key != 'model_number' and hasattr(product, key):
                     setattr(product, key, value)
 
-        # 处理新上传的图片
-        ingest_service = get_ingest_service()
-        images = request.files.getlist('images')
-        uploaded_images = []
-        skipped_duplicates = []
+        source, relative_paths = prepare_product_uploads(
+            request.files.getlist('images'),
+            model_number,
+        )
+        image_results = []
         request_id = uuid.uuid4().hex
 
-        if images:
-            current_max_order = db.session.query(
-                db.func.max(ProductImage.image_order)
-            ).filter(ProductImage.model_number == model_number).scalar() or 0
-
-            for idx, image_file in enumerate(images):
-                if not image_file or not allowed_file(image_file.filename):
-                    continue
-
-                data = image_file.read()
-                # 向量生成失败会向上抛出，不再吞掉异常静默丢数据
+        if relative_paths:
+            ingest_service = get_asset_ingest_service(source)
+            for relative_path in relative_paths:
                 result = ingest_service.ingest_one(
-                    model_number, data, image_file.filename,
-                    current_app.config['UPLOAD_FOLDER'],
-                    image_order=current_max_order + idx + 1,
-                    is_primary=False,
+                    relative_path,
+                    model_number=model_number,
                     request_id=request_id,
+                    commit=False,
                 )
-                if result.status == 'created':
-                    saved_filesystem_paths.append(result.fs_path)
-                    uploaded_images.append(result.image_path)
-                elif result.status == 'duplicate':
-                    skipped_duplicates.append({
-                        'filename': image_file.filename,
-                        'duplicate_of': result.duplicate_of,
-                    })
+                image_result = attach_product_upload_result(
+                    result,
+                    model_number,
+                )
+                if image_result:
+                    image_results.append(image_result)
 
         db.session.commit()
 
         return jsonify({
             'message': '产品更新成功',
-            'uploaded_images': len(uploaded_images),
-            'skipped_duplicates': skipped_duplicates
+            **summarize_product_upload_results(image_results),
         })
 
-    except IntegrityError as e:
-        # 并发上传同一张新图导致的 UNIQUE 冲突，语义与 create_product 一致：见该处注释。
+    except (IntegrityError, AssetIngestConflictError) as e:
         db.session.rollback()
-        should_cleanup_files = True
-        current_app.logger.warning(f"更新产品失败（并发重复图片冲突）: {str(e)}")
+        current_app.logger.warning(
+            '更新产品失败（图片资产冲突）: %s',
+            type(e).__name__,
+        )
         return error_response(
-            '图片重复写入冲突（可能有并发请求上传了同一张图片），请重试',
-            'DUPLICATE_IMAGE_CONFLICT', 409,
+            '图片资产发生冲突，未覆盖现有内容',
+            'IMAGE_ASSET_CONFLICT',
+            409,
+        )
+    except ImageNormalizationError:
+        db.session.rollback()
+        return error_response(
+            '上传图片已损坏或无法安全解码',
+            'INVALID_IMAGE',
+            400,
         )
     except EmbeddingServiceError as e:
         db.session.rollback()
-        should_cleanup_files = True
-        current_app.logger.error(f"更新产品失败（向量服务）: {str(e)}")
-        return error_response(str(e), 'EMBEDDING_SERVICE_ERROR', 503)
+        current_app.logger.error(
+            '更新产品失败（向量服务） error_type=%s',
+            type(e).__name__,
+        )
+        return error_response(
+            '图片识别服务暂不可用，请稍后重试',
+            'EMBEDDING_SERVICE_ERROR',
+            503,
+        )
+    except ObjectStorageError as e:
+        db.session.rollback()
+        current_app.logger.error(
+            '更新产品失败（对象存储） error_type=%s',
+            type(e).__name__,
+        )
+        return error_response(
+            '图片存储服务暂不可用，请稍后重试',
+            'OBJECT_STORAGE_ERROR',
+            503,
+        )
+    except AssetIngestError as e:
+        db.session.rollback()
+        current_app.logger.error(
+            '更新产品失败（图片资产） stage=%s error_type=%s',
+            e.stage,
+            type(e).__name__,
+        )
+        return asset_ingest_error_response(e)
+    except RequestEntityTooLarge:
+        db.session.rollback()
+        return error_response('上传图片过大', 'IMAGE_TOO_LARGE', 413)
     except Exception as e:
         db.session.rollback()
-        should_cleanup_files = True
-        current_app.logger.error(f"更新产品失败: {str(e)}")
-        return error_response(str(e), 'PRODUCT_UPDATE_FAILED', 500)
-    finally:
-        if should_cleanup_files:
-            remove_files_quietly(saved_filesystem_paths)
+        current_app.logger.error(
+            '更新产品失败 error_type=%s',
+            type(e).__name__,
+        )
+        return error_response('产品更新失败', 'PRODUCT_UPDATE_FAILED', 500)
 
 
 @products_v2_bp.route('/<model_number>', methods=['DELETE'])
@@ -334,31 +566,30 @@ def update_product(model_number):
 def delete_product(model_number):
     """删除产品"""
     try:
-        product = Product.query.get(model_number)
+        product = db.session.get(Product, model_number)
         if not product:
             return jsonify({'error': '产品不存在'}), 404
 
-        # 先收集磁盘路径，删行之后才能删文件
-        file_paths = [
-            row.original_path for row in
-            ProductImage.query.filter_by(model_number=model_number).all()
-        ]
+        if legacy_images_require_migration([model_number]):
+            return legacy_images_error_response()
 
         db.session.delete(product)
         db.session.commit()
-
-        remove_files_quietly(file_paths)
-
-        # 无需刷新向量索引 (Stateless)
-        # if current_app.config.get('PRODUCT_INDEX'):
-        #     current_app.config['PRODUCT_INDEX'].refresh_from_database()
 
         return jsonify({'message': '产品删除成功'})
 
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"删除产品失败: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.error(
+            '删除产品失败 model_number=%s error_type=%s',
+            model_number,
+            type(e).__name__,
+        )
+        return error_response(
+            '产品删除失败，请稍后重试',
+            'PRODUCT_DELETE_FAILED',
+            500,
+        )
 
 
 @products_v2_bp.route('/batch-delete', methods=['POST'])
@@ -374,13 +605,8 @@ def batch_delete_products():
         if not isinstance(model_numbers, list):
             return jsonify({'error': 'model_numbers 必须是数组'}), 400
 
-        # 先收集磁盘路径；.delete() 绕过 ORM，cascade 只在数据库层生效
-        file_paths = [
-            row.original_path for row in
-            ProductImage.query.filter(
-                ProductImage.model_number.in_(model_numbers)
-            ).all()
-        ]
+        if legacy_images_require_migration(model_numbers):
+            return legacy_images_error_response()
 
         # 批量删除
         deleted_count = Product.query.filter(
@@ -389,12 +615,6 @@ def batch_delete_products():
 
         db.session.commit()
 
-        remove_files_quietly(file_paths)
-
-        # 无需刷新向量索引 (Stateless)
-        # if deleted_count > 0 and current_app.config.get('PRODUCT_INDEX'):
-        #     current_app.config['PRODUCT_INDEX'].refresh_from_database()
-
         return jsonify({
             'message': f'成功删除 {deleted_count} 个产品',
             'deleted_count': deleted_count
@@ -402,44 +622,49 @@ def batch_delete_products():
 
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"批量删除产品失败: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.error(
+            '批量删除产品失败 error_type=%s',
+            type(e).__name__,
+        )
+        return error_response(
+            '批量删除产品失败，请稍后重试',
+            'PRODUCT_BATCH_DELETE_FAILED',
+            500,
+        )
 
 
 # ========================================
 # 图片管理 API
 # ========================================
 
-@products_v2_bp.route('/<model_number>/images/<int:image_id>', methods=['DELETE'])
+@products_v2_bp.route('/<model_number>/images/<uuid:asset_id>', methods=['DELETE'])
 @cross_origin()
-def delete_product_image(model_number, image_id):
-    """删除产品图片"""
+def delete_product_image(model_number, asset_id):
+    """归档产品图片资产，不删除数据库记录或共享 OSS 对象。"""
     try:
-        product_image = ProductImage.query.filter_by(
-            id=image_id,
+        asset = ImageAsset.query.filter_by(
+            id=asset_id,
             model_number=model_number
         ).first()
 
-        if not product_image:
+        if not asset:
             return jsonify({'error': '图片不存在'}), 404
 
-        file_path = product_image.original_path
-
-        db.session.delete(product_image)
+        if asset.status != 'archived':
+            asset.status = 'archived'
+            asset.archived_at = datetime.now()
         db.session.commit()
 
-        remove_files_quietly([file_path])
-
-        # 无需刷新向量索引 (Stateless)
-        # if current_app.config.get('PRODUCT_INDEX'):
-        #     current_app.config['PRODUCT_INDEX'].refresh_from_database()
-
-        return jsonify({'message': '图片删除成功'})
+        return jsonify({'message': '图片已归档'})
 
     except Exception as e:
         db.session.rollback()
-        current_app.logger.error(f"删除图片失败: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        current_app.logger.error(
+            '归档图片失败 asset_id=%s error_type=%s',
+            asset_id,
+            type(e).__name__,
+        )
+        return error_response('图片归档失败', 'IMAGE_ARCHIVE_FAILED', 500)
 
 
 @products_v2_bp.route('/<model_number>/images/<int:image_id>/set-primary', methods=['POST'])
@@ -691,6 +916,11 @@ def search_products():
 
         search_service = current_app.config['PRODUCT_SEARCH_SERVICE']
 
+        try:
+            top_k = validate_top_k(request.form.get('top_k'))
+        except ValueError as e:
+            return error_response(str(e), 'INVALID_TOP_K', 400)
+
         # 处理上传的图片
         if 'image' not in request.files:
             return error_response('缺少图片文件', 'MISSING_IMAGE_FILE', 400)
@@ -699,59 +929,58 @@ def search_products():
         if not image_file or not allowed_file(image_file.filename):
             return error_response('图片格式不支持', 'UNSUPPORTED_IMAGE_FORMAT', 400)
 
-        # 保存临时文件
-        temp_filename = f"search_{uuid.uuid4()}_{secure_filename(image_file.filename)}"
-        temp_path = os.path.join(current_app.config['UPLOAD_FOLDER'], temp_filename)
-        image_file.save(temp_path)
-
-        try:
-            # 执行搜索
-            try:
-                top_k = validate_top_k(request.form.get('top_k'))
-            except ValueError as e:
-                return error_response(str(e), 'INVALID_TOP_K', 400)
-
+        suffix = os.path.splitext(secure_filename(image_file.filename))[1]
+        with tempfile.TemporaryDirectory(prefix='image-query-upload-') as temp_dir:
+            temp_path = os.path.join(temp_dir, f'query{suffix}')
+            image_file.save(temp_path)
             results = search_service.search_similar_images(temp_path, top_k=top_k, request_id=request_id)
+            return jsonify(results)
 
-            # 搜索结果为空直接返回，避免无意义数据库查询
-            if not results:
-                return jsonify([])
-
-            # 去重已在 VectorSearchService 的 SQL（DISTINCT ON）内完成
-            model_numbers = [result.get('model_number') for result in results]
-            products = Product.query.filter(Product.model_number.in_(model_numbers)).all()
-
-            # 构建产品字典
-            products_dict = {p.model_number: p for p in products}
-
-            # 组装结果
-            search_results = []
-            for result in results:
-                model_number = result.get('model_number')
-                product = products_dict.get(model_number)
-
-                if product:
-                    product_data = product.to_dict()
-                    product_data['similarity'] = result.get('similarity')
-                    product_data['matched_image'] = result.get('image_path')
-                    search_results.append(product_data)
-
-            return jsonify(search_results)
-
-        finally:
-            # 清理临时文件
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-
+    except RequestEntityTooLarge:
+        return error_response(
+            '查询图片过大，请缩小后重试',
+            'IMAGE_TOO_LARGE',
+            413,
+        )
+    except ImageNormalizationError:
+        return error_response(
+            '查询图片已损坏或无法安全解码',
+            'INVALID_IMAGE',
+            400,
+        )
     except EmbeddingServiceError as e:
-        current_app.logger.error(f"图片搜索失败（向量服务） request_id={request_id}: {str(e)}")
-        return error_response(str(e), 'EMBEDDING_SERVICE_ERROR', 503)
+        current_app.logger.error(
+            '图片搜索失败（向量服务） request_id=%s error_type=%s',
+            request_id,
+            type(e).__name__,
+        )
+        return error_response(
+            '图片识别服务暂不可用，请稍后重试',
+            'EMBEDDING_SERVICE_ERROR',
+            503,
+        )
     except VectorSearchError as e:
-        current_app.logger.error(f"图片搜索失败（向量检索） request_id={request_id}: {str(e)}")
-        return error_response(str(e), 'VECTOR_SEARCH_ERROR', 500)
+        current_app.logger.error(
+            '图片搜索失败（向量检索） request_id=%s error_type=%s',
+            request_id,
+            type(e).__name__,
+        )
+        return error_response(
+            '图片检索服务暂不可用，请稍后重试',
+            'VECTOR_SEARCH_ERROR',
+            500,
+        )
     except Exception as e:
-        current_app.logger.error(f"图片搜索失败 request_id={request_id}: {str(e)}")
-        return error_response(str(e), 'IMAGE_SEARCH_FAILED', 500)
+        current_app.logger.error(
+            '图片搜索失败 request_id=%s error_type=%s',
+            request_id,
+            type(e).__name__,
+        )
+        return error_response(
+            '图片搜索失败，请稍后重试',
+            'IMAGE_SEARCH_FAILED',
+            500,
+        )
 
 
 # ========================================
@@ -764,7 +993,10 @@ def get_statistics():
     """获取产品统计信息"""
     try:
         total_products = Product.query.count()
-        total_images = ProductImage.query.count()
+        total_images = ImageAsset.query.filter(
+            ImageAsset.status == 'active',
+            ImageAsset.model_number.isnot(None),
+        ).count()
 
         # 按分类统计
         category_stats = db.session.query(

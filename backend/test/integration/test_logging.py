@@ -41,8 +41,9 @@ import io
 import logging
 
 import numpy as np
+from PIL import Image
 
-from models import Product, ProductImage, db
+from models import ImageAsset, db
 from services.vector_search import VectorSearchService
 
 
@@ -52,7 +53,9 @@ class _FakeEmbeddingClient:
     def __init__(self, vector):
         self._vector = vector
 
-    def embed_image(self, image_path, request_id=None):
+    def embed_normalized_image(self, image_path, request_id=None):
+        with Image.open(image_path) as image:
+            assert image.format == 'JPEG'
         return self._vector
 
 
@@ -72,19 +75,27 @@ def test_create_app_configures_logging_so_vector_search_success_is_emitted(app):
     vector[0] = 1.0
 
     with app.app_context():
-        db.session.add(Product(
-            model_number='LOG-001',
-            photographer_file='p',
-            alibaba_product_url='https://example.com/x',
-            category='相机肩带',
-        ))
-        db.session.add(ProductImage(
-            model_number='LOG-001',
-            image_path='/uploads/product_images/LOG-001/0.jpg',
-            vector=vector.tolist(),
+        db.session.add(ImageAsset(
+            source_provider='qiniu-kodo',
+            source_bucket='xiangxipackage',
+            source_relative_path='日志/匹配图片.png',
+            source_revision=1,
+            oss_path='image-search/xiangxipackage/日志/匹配图片.png',
+            preview_oss_path=(
+                'image-search/previews/preview-v1/aa/'
+                + 'a' * 64
+                + '.jpg'
+            ),
             content_hash='a' * 64,
-            image_order=0,
-            is_primary=True,
+            source_size=123,
+            source_mime_type='image/png',
+            source_width=8,
+            source_height=8,
+            vector=vector.tolist(),
+            embedding_model='tongyi-embedding-vision-plus-2026-03-06',
+            embedding_dimension=1024,
+            normalization_version='preview-v1',
+            status='active',
         ))
         db.session.commit()
 
@@ -106,14 +117,18 @@ def test_create_app_configures_logging_so_vector_search_success_is_emitted(app):
 
         root.addHandler(list_handler)
 
+        query_image = io.BytesIO()
+        Image.new('RGB', (8, 8), 'red').save(query_image, format='PNG')
+        query_image.seek(0)
         client = app.test_client()
         response = client.post(
             '/api/products/search',
-            data={'image': (io.BytesIO(b'fake-image-bytes'), 'q.jpg')},
+            data={'image': (query_image, 'q.png')},
             content_type='multipart/form-data',
         )
 
         assert response.status_code == 200
+        assert response.get_json()[0]['relative_path'] == '日志/匹配图片.png'
         assert any('vector.search.success' in message for message in list_handler.messages), (
             f'未捕获到 vector.search.success，实际捕获到的日志: {list_handler.messages}'
         )

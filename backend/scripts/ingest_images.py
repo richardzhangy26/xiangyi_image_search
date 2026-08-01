@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""目录批量导入图片与向量。
+"""旧本地目录图片入口（仅保留只读盘点）。
 
-约定：`--root` 的一级子目录名即 model_number，型号目录内部递归收图。
-先跑 CSV 建产品，再跑本脚本导图；目录名对不上已有型号的一律跳过并报告。
+该脚本过去会把图片写入本机 ``uploads`` 和旧 ``product_images``。Issue #9
+之后，正式图片必须经 ``ImageAssetIngestService`` 写入私有 OSS 与
+``image_assets``，因此所有非 ``--dry-run`` 模式都会在扫描、embedding 或
+数据库写入之前安全拒绝。
 
-用法：
+只读盘点：
     python -m scripts.ingest_images --root data/摄像师拍摄素材 --dry-run
-    python -m scripts.ingest_images --root data/摄像师拍摄素材 --rebuild-index
+
+Kodo 正式迁移：
+    python -m scripts.migrate_kodo_to_oss --dry-run
 """
+
 import argparse
 import logging
 import os
@@ -19,14 +24,11 @@ from pathlib import Path
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
-from sqlalchemy import text  # noqa: E402
-
 from app import create_app  # noqa: E402
-from models import Product, ProductImage, db  # noqa: E402
-from services.embedding import MAX_BATCH_SIZE, EmbeddingClient  # noqa: E402
+from models import Product, db  # noqa: E402
+from services.embedding import MAX_BATCH_SIZE  # noqa: E402
 from services.ingest import (  # noqa: E402
     ALLOWED_EXTENSIONS,
-    ImageIngestService,
     PendingImage,
     find_existing_hashes,
     hash_file,
@@ -34,17 +36,26 @@ from services.ingest import (  # noqa: E402
 
 logger = logging.getLogger('ingest_images')
 
-# 每张图约 402 tokens，0.0005 元/千 token
+# 每张图约 402 tokens，0.0005 元/千 token；dry-run 仅用于估算。
 YUAN_PER_IMAGE = 402 * 0.0005 / 1000
 
-_HNSW_INDEX = 'idx_product_images_vector_hnsw'
+LEGACY_INGEST_DISABLED_MESSAGE = (
+    'scripts.ingest_images 的 ProductImage/本地 uploads 写入已停用；'
+    '正式图片必须通过 ImageAssetIngestService 写入私有 OSS 和 image_assets。'
+    'Kodo 数据请改用 scripts.migrate_kodo_to_oss；本地目录目前仅支持 --dry-run '
+    '只读盘点。'
+)
+
+
+class LegacyProductImageIngestDisabledError(RuntimeError):
+    """旧 ProductImage 写入口被显式调用。"""
 
 
 @dataclass
 class IngestPlan:
-    pending: list = field(default_factory=list)          # list[PendingImage]
-    duplicates: list = field(default_factory=list)       # list[(源路径, 已存在的 image_path)]
-    orphan_dirs: list = field(default_factory=list)      # list[model_number]
+    pending: list = field(default_factory=list)
+    duplicates: list = field(default_factory=list)
+    orphan_dirs: list = field(default_factory=list)
 
 
 @dataclass
@@ -53,7 +64,7 @@ class IngestReport:
     duplicates: int = 0
     failed: int = 0
     orphan_dirs: list = field(default_factory=list)
-    empty_dirs: list = field(default_factory=list)        # list[目录名]，存在但无符合扩展名的图片
+    empty_dirs: list = field(default_factory=list)
     duplicate_details: list = field(default_factory=list)
     failed_details: list = field(default_factory=list)
     scanned: int = 0
@@ -61,19 +72,17 @@ class IngestReport:
 
 
 def scan_directory(root):
-    """{model_number: [排序后的图片绝对路径]}。
-
-    一级子目录名 = model_number；型号目录内部递归收图。
-    root 下直接存放的散图不属于任何型号，会被忽略（由调用方计入孤儿）。
-    """
+    """返回 ``{model_number: [排序后的图片绝对路径]}``。"""
     scanned = {}
     root_path = Path(root)
     for entry in sorted(root_path.iterdir()):
         if not entry.is_dir():
             continue
         images = sorted(
-            str(p.resolve()) for p in entry.rglob('*')
-            if p.is_file() and p.suffix.lower() in ALLOWED_EXTENSIONS
+            str(path.resolve())
+            for path in entry.rglob('*')
+            if path.is_file()
+            and path.suffix.lower() in ALLOWED_EXTENSIONS
         )
         if images:
             scanned[entry.name] = images
@@ -81,30 +90,22 @@ def scan_directory(root):
 
 
 def _find_empty_directories(root, scanned):
-    """一级子目录存在，但递归后没有任何符合扩展名的图片（真空目录，或只有
-    filter 之外的文件，比如 .txt）。
-
-    这类目录在 scan_directory() 里会被直接忽略——连 key 都不会出现在返回值
-    里，所以也永远进不了 orphan_dirs（那是"有图片但型号未知"的另一种情况）。
-    结果是哪怕目录名根本对不上任何已知型号，用户也拿不到任何信号。这里单独
-    走一遍一级目录列表把它们找出来：与 scan_directory() 的返回值 contract
-    （已被测试锁定）分开算，不侵入那个函数。
-    """
     root_path = Path(root)
     return sorted(
-        entry.name for entry in root_path.iterdir()
+        entry.name
+        for entry in root_path.iterdir()
         if entry.is_dir() and entry.name not in scanned
     )
 
 
-def build_plan(scanned, known_model_numbers, existing_hashes, path_hashes, limit=None):
-    """把扫描结果切成「待入库 / 已重复 / 孤儿目录」三堆。
-
-    existing_hashes: {content_hash: 已存在的 image_path}（库里已有的）
-    path_hashes: {文件绝对路径: content_hash}，由调用方预先算好整批复用——
-    避免同一个文件被 hash_file 计算两遍（一遍用于批量查库判重、一遍用于本函数
-    的判重逻辑）。几千张图的目录下，重复计算是实打实的 I/O + CPU 翻倍。
-    """
+def build_plan(
+    scanned,
+    known_model_numbers,
+    existing_hashes,
+    path_hashes,
+    limit=None,
+):
+    """构造只读盘点计划；不会生成向量、落盘或写数据库。"""
     plan = IngestPlan()
     seen = dict(existing_hashes)
     processed = 0
@@ -121,7 +122,9 @@ def build_plan(scanned, known_model_numbers, existing_hashes, path_hashes, limit
 
             content_hash = path_hashes[source_path]
             if content_hash in seen:
-                plan.duplicates.append((source_path, seen[content_hash]))
+                plan.duplicates.append(
+                    (source_path, seen[content_hash])
+                )
                 continue
 
             plan.pending.append(PendingImage(
@@ -136,173 +139,62 @@ def build_plan(scanned, known_model_numbers, existing_hashes, path_hashes, limit
     return plan
 
 
-def _is_referenced_by_committed_row(image_path):
-    """image_path 此刻是否已被某条**已提交**的 ProductImage 行引用。
+def run(
+    app,
+    root,
+    dry_run=False,
+    rebuild_index=False,
+    batch_size=MAX_BATCH_SIZE,
+    limit=None,
+    embedding_client=None,
+):
+    """执行只读盘点；任何旧表写模式均在触碰来源和外部服务前失败。"""
+    if not dry_run:
+        raise LegacyProductImageIngestDisabledError(
+            LEGACY_INGEST_DISABLED_MESSAGE
+        )
 
-    调用方保证在 db.session.rollback() 之后才调用本函数，此时 session 是干净的，
-    查到的就是数据库当前的真实已提交状态（不含本批被回滚的那些行）。
-    """
-    if not image_path:
-        return False
-    return db.session.query(ProductImage.id).filter_by(image_path=image_path).first() is not None
+    # 保留旧调用签名，避免调用方误以为这些参数仍能开启写模式。
+    del rebuild_index, batch_size, embedding_client
 
-
-def _cleanup_orphan_files(results):
-    """批次 commit 失败 rollback 后，清理该批在 ingest_pending 阶段已经落盘的文件。
-
-    承重契约 (b)：ImageIngestService 只 add 不 commit，成功项会立即落盘；
-    调用方 rollback 后 DB 行消失但磁盘文件不会自动清理，必须用 IngestResult.fs_path
-    自行删除，否则留下孤儿文件。这里只处理 status == 'created' 的项——duplicate/failed
-    项本来就没有落盘（或落盘的是别的已提交的文件）。
-
-    但删之前必须先确认这个路径此刻**没有**被别的已提交行引用——判重不加锁
-    （见 ImageIngestService docstring），文件名由 content_hash 决定，同一张图
-    在任何地方写入都是同一路径。如果另一个批次/另一次运行/另一个进程已经抢先
-    用同一路径成功 commit，这次 commit 才撞上 UNIQUE 约束失败；这时 fs_path 指向
-    的是"别人已经在用的合法文件"，删了会造成更隐蔽的问题——数据库行还在、
-    图片却 404，且不会出现在任何"孤儿文件"报告里。只有确认没有任何已提交行
-    引用这条路径时，它才是真正的孤儿，才能删。
-    """
-    for result in results or []:
-        if result.status != 'created' or not result.fs_path:
-            continue
-        if _is_referenced_by_committed_row(result.image_path):
-            logger.info(
-                '跳过删除：路径已被其他已提交记录引用 image_path=%s fs_path=%s',
-                result.image_path, result.fs_path,
-            )
-            continue
-        try:
-            if os.path.exists(result.fs_path):
-                os.remove(result.fs_path)
-        except OSError as exc:
-            logger.warning('清理孤儿文件失败 path=%s error=%s', result.fs_path, exc)
-
-
-def _drop_hnsw_index():
-    db.session.execute(text(f'DROP INDEX IF EXISTS {_HNSW_INDEX}'))
-    db.session.commit()
-    logger.info('已删除 HNSW 索引，导入结束后重建')
-
-
-def _create_hnsw_index():
-    # 建索引期间临时放宽内存与并行度（pgvector 官方建议）
-    db.session.execute(text("SET maintenance_work_mem = '2GB'"))
-    db.session.execute(text('SET max_parallel_maintenance_workers = 7'))
-    db.session.execute(text(
-        f'CREATE INDEX IF NOT EXISTS {_HNSW_INDEX} '
-        'ON product_images USING hnsw (vector vector_cosine_ops) '
-        'WITH (m = 16, ef_construction = 64)'
-    ))
-    db.session.execute(text('RESET maintenance_work_mem'))
-    db.session.execute(text('RESET max_parallel_maintenance_workers'))
-    db.session.execute(text('ANALYZE product_images'))
-    db.session.commit()
-    logger.info('HNSW 索引已重建')
-
-
-def run(app, root, dry_run=False, rebuild_index=False, batch_size=MAX_BATCH_SIZE,
-        limit=None, embedding_client=None):
-    """执行导入，返回 IngestReport。app 需已进入 app_context 或本函数自行进入。
-
-    report 在 run() 的外层作用域创建，_execute() 只对它做字段级修改（不重新
-    赋值），所以哪怕 _execute() 中途抛出未被批次级 try/except 吞掉的异常，已经
-    跑完的批次统计也不会丢——虽然此时 run() 本身仍会把异常继续往上抛（见下方
-    try/except/finally），但至少异常前的进度会被记进日志，方便运维排查导到哪了。
-    """
     started = time.perf_counter()
     report = IngestReport()
-    index_dropped = False
-
-    def _execute():
-        scanned = scan_directory(root)
-        report.scanned = sum(len(v) for v in scanned.values())
-        report.empty_dirs = _find_empty_directories(root, scanned)
-
-        known = {
-            value for (value,) in db.session.query(Product.model_number).all()
-        }
-
-        # 每个已知型号下的文件只算一次哈希：{路径: content_hash}。
-        # 这份结果既用于下面 find_existing_hashes 的批量查库判重，也直接传给
-        # build_plan 复用，避免同一个文件被 hash_file 计算两遍（几千张图的目录
-        # 下，重复计算是实打实的 I/O + CPU 翻倍）。
-        path_hashes = {
-            path: hash_file(path)
-            for model_number, paths in scanned.items() if model_number in known
-            for path in paths
-        }
-        existing = find_existing_hashes(list(path_hashes.values()))
-
-        plan = build_plan(scanned, known, existing, path_hashes, limit=limit)
-        report.orphan_dirs = plan.orphan_dirs
-        report.duplicates = len(plan.duplicates)
-        report.duplicate_details = plan.duplicates
-
-        if dry_run:
-            report.created = len(plan.pending)
-            return
-
-        service = ImageIngestService(embedding_client=embedding_client or EmbeddingClient())
-        upload_folder = app.config['UPLOAD_FOLDER']
-        effective_batch = max(1, min(int(batch_size), MAX_BATCH_SIZE))
-
-        for start in range(0, len(plan.pending), effective_batch):
-            chunk = plan.pending[start:start + effective_batch]
-            results = None
-            try:
-                results = service.ingest_pending(chunk, upload_folder)
-                db.session.commit()
-            except Exception as exc:  # noqa: BLE001 - 单批失败不应终止整次导入
-                db.session.rollback()
-                logger.error('批次写入失败 start=%s size=%s error=%s', start, len(chunk), exc)
-                # 判重不加锁，最终唯一性靠 DB UNIQUE 约束兜底：commit 撞上
-                # IntegrityError 时，本批在 ingest_pending 阶段已经落盘的文件
-                # 不会随 rollback 自动消失，必须显式清理，否则留下孤儿文件
-                # ——但要先确认没有被别的已提交行引用，见 _cleanup_orphan_files。
-                _cleanup_orphan_files(results)
-                report.failed += len(chunk)
-                report.failed_details.extend((item.source_path, str(exc)) for item in chunk)
-                continue
-
-            for result in results:
-                if result.status == 'created':
-                    report.created += 1
-                elif result.status == 'duplicate':
-                    report.duplicates += 1
-                    report.duplicate_details.append((result.source_path, result.duplicate_of))
-                else:
-                    report.failed += 1
-                    report.failed_details.append((result.source_path, result.error))
-
-            logger.info('进度 %s/%s', min(start + effective_batch, len(plan.pending)),
-                        len(plan.pending))
-
     try:
-        if rebuild_index and not dry_run:
-            with app.app_context():
-                _drop_hnsw_index()
-            index_dropped = True
-
-        # 测试传入的 app fixture 已处于 app_context 内；Flask 支持嵌套，无冲突
         with app.app_context():
-            _execute()
+            scanned = scan_directory(root)
+            report.scanned = sum(
+                len(paths) for paths in scanned.values()
+            )
+            report.empty_dirs = _find_empty_directories(root, scanned)
+            known = {
+                value
+                for (value,) in db.session.query(
+                    Product.model_number
+                ).all()
+            }
+            path_hashes = {
+                path: hash_file(path)
+                for model_number, paths in scanned.items()
+                if model_number in known
+                for path in paths
+            }
+            existing = find_existing_hashes(
+                list(path_hashes.values())
+            )
+            plan = build_plan(
+                scanned,
+                known,
+                existing,
+                path_hashes,
+                limit=limit,
+            )
+            report.orphan_dirs = plan.orphan_dirs
+            report.duplicates = len(plan.duplicates)
+            report.duplicate_details = plan.duplicates
+            report.created = len(plan.pending)
     except Exception:
-        # 这里能接到的只会是没被批次级 try/except 吞掉的异常（比如 scan_directory/
-        # build_plan 阶段的 bug，或者数据库连接中断），不是常规的单批 commit 失败
-        # ——那种情况已经在上面的批次循环里处理成 report.failed，不会冒泡到这里。
-        # 记录已完成的进度后继续往上抛，不静默吞掉真实错误。
-        logger.exception(
-            '导入过程中出现未预期异常。已完成的进度：入库=%s 重复=%s 失败=%s 扫描=%s',
-            report.created, report.duplicates, report.failed, report.scanned,
-        )
+        logger.exception('旧图片目录只读盘点失败')
         raise
-    finally:
-        # 无论 _execute() 正常返回还是异常退出，DROP 掉的索引都必须重建，
-        # 否则索引永久丢失、后续所有检索都会退化成全表扫描。
-        if index_dropped:
-            with app.app_context():
-                _create_hnsw_index()
 
     report.elapsed_seconds = time.perf_counter() - started
     return report
@@ -311,40 +203,74 @@ def run(app, root, dry_run=False, rebuild_index=False, batch_size=MAX_BATCH_SIZE
 def print_report(report, dry_run):
     prefix = '[DRY-RUN] ' if dry_run else ''
     print(f'\n{prefix}扫描: {report.scanned} 张')
-    print(f'  ✓ {"将入库" if dry_run else "入库"}      {report.created} 张')
-    print(f'  ⊘ 重复跳过    {report.duplicates} 张（节省 ¥{report.duplicates * YUAN_PER_IMAGE:.3f}）')
+    print(f'  ✓ 将入库      {report.created} 张')
+    print(
+        '  ⊘ 重复跳过    '
+        f'{report.duplicates} 张'
+        f'（预计节省 ¥{report.duplicates * YUAN_PER_IMAGE:.3f}）'
+    )
     for source, existing in report.duplicate_details[:20]:
         print(f'      {source}  与 {existing} 内容相同')
-    if len(report.duplicate_details) > 20:
-        print(f'      …… 其余 {len(report.duplicate_details) - 20} 条见日志')
-    print(f'  ✗ 孤儿目录    {len(report.orphan_dirs)} 个（无对应产品，已跳过）')
+    print(
+        f'  ✗ 孤儿目录    {len(report.orphan_dirs)} 个'
+        '（无对应产品，已跳过）'
+    )
     if report.orphan_dirs:
         print(f'      {", ".join(report.orphan_dirs)}')
-    print(f'  ⊘ 无图片目录  {len(report.empty_dirs)} 个（目录存在但没有符合扩展名的图片，已跳过）')
+    print(
+        f'  ⊘ 无图片目录  {len(report.empty_dirs)} 个'
+        '（目录存在但没有符合扩展名的图片）'
+    )
     if report.empty_dirs:
         print(f'      {", ".join(report.empty_dirs)}')
-    print(f'  ✗ 失败        {report.failed} 张')
-    for source, error in report.failed_details[:20]:
-        print(f'      {source}: {error}')
-    print(f'\n耗时 {report.elapsed_seconds:.1f}s / API 费用约 ¥{report.created * YUAN_PER_IMAGE:.2f}\n')
+    print(f'\n耗时 {report.elapsed_seconds:.1f}s；未写数据库、OSS 或本地 uploads。\n')
 
 
 def create_parser():
-    parser = argparse.ArgumentParser(description='批量导入本地目录中的产品图片与向量。')
-    parser.add_argument('--root', help='素材根目录，默认取 Flask 配置 DATASET_ROOT')
-    parser.add_argument('--dry-run', action='store_true',
-                        help='只扫描算哈希查重并报告，不调 API、不写库、不落盘')
-    parser.add_argument('--rebuild-index', action='store_true',
-                        help='导入前删除 HNSW 索引，导入后重建（首次全量导入用）')
-    parser.add_argument('--batch-size', type=int, default=MAX_BATCH_SIZE,
-                        help=f'每次 DashScope 请求的图片数，clamp 到 [1, {MAX_BATCH_SIZE}]')
-    parser.add_argument('--limit', type=int, help='只处理前 N 张，用于调试')
+    parser = argparse.ArgumentParser(
+        description='旧本地图片目录只读盘点（ProductImage 写入已停用）。',
+        epilog=(
+            'Kodo 正式迁移请使用 python -m '
+            'scripts.migrate_kodo_to_oss；本地文件夹写入 ImageAsset '
+            '需等待独立入口。'
+        ),
+    )
+    parser.add_argument(
+        '--root',
+        help='素材根目录，默认取 Flask 配置 DATASET_ROOT',
+    )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='只扫描算哈希并报告；这是当前唯一允许的模式',
+    )
+    parser.add_argument(
+        '--rebuild-index',
+        action='store_true',
+        help='旧参数，仅用于给出停用错误，不再重建 product_images 索引',
+    )
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=MAX_BATCH_SIZE,
+        help='旧参数；只读模式不会调用 embedding',
+    )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        help='只盘点前 N 张',
+    )
     return parser
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(levelname)s] %(message)s',
+    )
     args = create_parser().parse_args()
+    if not args.dry_run:
+        raise SystemExit(LEGACY_INGEST_DISABLED_MESSAGE)
 
     app = create_app()
     root = args.root or app.config.get('DATASET_ROOT', '')
@@ -354,13 +280,14 @@ def main():
 
     logger.info('素材目录: %s', root)
     report = run(
-        app, root,
-        dry_run=args.dry_run,
+        app,
+        root,
+        dry_run=True,
         rebuild_index=args.rebuild_index,
         batch_size=args.batch_size,
         limit=args.limit,
     )
-    print_report(report, args.dry_run)
+    print_report(report, dry_run=True)
 
 
 if __name__ == '__main__':

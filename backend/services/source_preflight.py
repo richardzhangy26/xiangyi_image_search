@@ -128,7 +128,7 @@ def run_preflight(
             safe_exception_summary(exc),
         ) from exc
 
-    image_objects = [item for item in objects if _is_image_key(item.key)]
+    image_objects = [item for item in objects if is_image_key(item.key)]
     candidates = [item for item in image_objects if 0 < item.size <= max_sample_bytes]
     if not candidates:
         raise PreflightError(
@@ -220,7 +220,8 @@ def run_preflight(
     )
 
 
-def _is_image_key(key: str) -> bool:
+def is_image_key(key: str) -> bool:
+    """按 Object Key 扩展名判断是否是迁移候选图片。"""
     filename = key.rsplit("/", 1)[-1]
     if "." not in filename:
         return False

@@ -31,7 +31,13 @@ class FakeResponse:
 @pytest.fixture(autouse=True)
 def _stub_data_uri():
     """跳过真实图片读取，测试只关心调用编排。"""
-    with patch('services.embedding._to_data_uri', side_effect=lambda p, **kw: f'data:image/jpeg;base64,{p}'):
+    with patch(
+        'services.embedding._to_data_uri',
+        side_effect=lambda p, **kw: f'data:image/jpeg;base64,legacy:{p}',
+    ), patch(
+        'services.embedding._normalized_to_data_uri',
+        side_effect=lambda p, **kw: f'data:image/jpeg;base64,normalized:{p}',
+    ):
         yield
 
 
@@ -125,6 +131,54 @@ def test_embed_images_empty_list_makes_no_call():
     with patch('dashscope.MultiModalEmbedding.call') as call:
         assert EmbeddingClient(api_key='k').embed_images([]) == []
     call.assert_not_called()
+
+
+def test_embed_normalized_images_splits_at_twenty_without_legacy_reencoding():
+    paths = [f'/preview/{index}.jpg' for index in range(21)]
+    calls = []
+
+    def fake_call(**kwargs):
+        calls.append(kwargs['input'])
+        return FakeResponse(len(kwargs['input']))
+
+    with patch('dashscope.MultiModalEmbedding.call', side_effect=fake_call):
+        vectors = EmbeddingClient(api_key='k').embed_normalized_images(paths)
+
+    assert [len(batch) for batch in calls] == [20, 1]
+    assert len(vectors) == 21
+    assert all(
+        item['image'].startswith('data:image/jpeg;base64,normalized:')
+        for batch in calls
+        for item in batch
+    )
+
+
+def test_normalized_batch_failure_degrades_with_normalized_single_calls():
+    paths = ['/preview/good.jpg', '/preview/bad.jpg', '/preview/also-good.jpg']
+    calls = []
+
+    def fake_call(**kwargs):
+        inputs = kwargs['input']
+        calls.append([item['image'] for item in inputs])
+        if len(inputs) > 1:
+            return FakeResponse(0, status_code=400, message='invalid image')
+        if inputs[0]['image'].endswith('bad.jpg'):
+            return FakeResponse(0, status_code=400, message='invalid image')
+        return FakeResponse(1)
+
+    with patch('dashscope.MultiModalEmbedding.call', side_effect=fake_call):
+        vectors = EmbeddingClient(api_key='k').embed_normalized_images(paths)
+
+    assert len(vectors) == 3
+    assert isinstance(vectors[0], np.ndarray)
+    assert vectors[1] is None
+    assert isinstance(vectors[2], np.ndarray)
+    assert [len(batch) for batch in calls] == [3, 1, 1, 1]
+    assert all(
+        value.startswith('data:image/jpeg;base64,normalized:')
+        for batch in calls
+        for value in batch
+    )
 
 
 # ---------- fix round 1：响亮失败 vs 静默错位 / 数据损坏 ----------

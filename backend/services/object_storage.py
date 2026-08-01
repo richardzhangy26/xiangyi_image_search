@@ -44,6 +44,17 @@ class ObjectSpec:
         return base64.b64encode(bytes.fromhex(self.md5_hex)).decode('ascii')
 
 
+@dataclass(frozen=True)
+class ObjectStorageTargetInspection:
+    """写入前只读获取的 OSS 目标身份、ACL 与前缀样本。"""
+
+    bucket_name: str
+    location: str
+    acl: str
+    sample_key: Optional[str]
+    sample_metadata: Mapping[str, str]
+
+
 class ObjectWriter(Protocol):
     def head_object(self, key: str) -> Optional[StoredObject]:
         ...
@@ -144,6 +155,42 @@ class OssObjectStorage:
             content_type=content_type,
             metadata=metadata,
             etag=str(etag) if etag is not None else None,
+        )
+
+    def inspect_target(
+        self,
+        base_prefix: str,
+    ) -> ObjectStorageTargetInspection:
+        """只读核对 Bucket 信息，并抽查隔离前缀中的一个既有对象。"""
+        normalized_prefix = base_prefix.strip('/')
+        try:
+            info = self._bucket.get_bucket_info()
+            listed = self._bucket.list_objects_v2(
+                prefix=f'{normalized_prefix}/',
+                max_keys=1,
+            )
+        except Exception as exc:
+            raise ObjectStorageError(
+                f'OSS 目标预检失败: {type(exc).__name__}'
+            ) from None
+
+        acl_value = getattr(getattr(info, 'acl', None), 'grant', None)
+        object_list = getattr(listed, 'object_list', None) or []
+        sample_key = (
+            str(getattr(object_list[0], 'key', ''))
+            if object_list
+            else None
+        )
+        sample = self.head_object(sample_key) if sample_key else None
+        return ObjectStorageTargetInspection(
+            bucket_name=str(
+                getattr(info, 'name', None)
+                or getattr(self._bucket, 'bucket_name', '')
+            ),
+            location=str(getattr(info, 'location', '') or ''),
+            acl=str(acl_value or ''),
+            sample_key=sample_key,
+            sample_metadata=dict(sample.metadata) if sample else {},
         )
 
     def put_file(

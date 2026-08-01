@@ -11,9 +11,10 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from models import ImageAsset, db
+from models import ImageAsset, Product, db
 from services.asset_ingest import (
     AssetIngestConflictError,
+    AssetIngestError,
     ImageAssetIngestService,
 )
 from services.embedding import (
@@ -21,8 +22,9 @@ from services.embedding import (
     EMBEDDING_MODEL,
     EmbeddingServiceError,
 )
+from services.image_normalizer import ImageNormalizer
 from services.object_source import SourceLocation, SourceObjectHead
-from services.object_storage import StoredObject
+from services.object_storage import ObjectStorageError, StoredObject
 
 
 def _png_bytes(color='red', size=(40, 24)):
@@ -32,14 +34,15 @@ def _png_bytes(color='red', size=(40, 24)):
 
 
 class FakeKodo:
-    def __init__(self, objects):
+    def __init__(self, objects, source_bucket='xiangxipackage'):
         self.objects = dict(objects)
+        self.source_bucket = source_bucket
         self.temp_paths = []
 
     def resolve_location(self):
         return SourceLocation(
-            source_bucket='xiangxipackage',
-            s3_bucket='xiangxipackage',
+            source_bucket=self.source_bucket,
+            s3_bucket=self.source_bucket,
             s3_region='cn-east-1',
             endpoint_url='https://s3.cn-east-1.qiniucs.com',
         )
@@ -120,6 +123,7 @@ class FakeEmbedding:
         self.fail = fail
         self.paths = []
         self.payloads = []
+        self.batch_calls = []
 
     def embed_normalized_image(self, image_path, request_id=None):
         self.paths.append(image_path)
@@ -129,12 +133,28 @@ class FakeEmbedding:
             raise EmbeddingServiceError('fake embedding failed')
         return np.full(EMBEDDING_DIMENSION, 0.1, dtype=np.float32)
 
+    def embed_normalized_images(self, image_paths, request_id=None):
+        self.batch_calls.append(len(image_paths))
+        return [
+            self.embed_normalized_image(path, request_id=request_id)
+            for path in image_paths
+        ]
 
-def _service(source, storage, embedding):
+
+def _service(
+    source,
+    storage,
+    embedding,
+    *,
+    normalizer=None,
+    source_provider='qiniu-kodo',
+):
     return ImageAssetIngestService(
         source=source,
         storage=storage,
         embedding_client=embedding,
+        normalizer=normalizer,
+        source_provider=source_provider,
     )
 
 
@@ -323,3 +343,294 @@ def test_same_source_path_with_changed_content_is_a_source_conflict(app):
 
     assert ImageAsset.query.count() == 1
     assert len(embedding.paths) == 1
+
+
+class CountingNormalizer:
+    def __init__(self):
+        self.delegate = ImageNormalizer()
+        self.normalization_version = self.delegate.normalization_version
+        self.calls = []
+
+    def normalize(self, source_path):
+        self.calls.append(str(source_path))
+        return self.delegate.normalize(source_path)
+
+
+def test_same_source_rerun_does_not_regenerate_preview(app):
+    relative_path = '重跑/不重复标准化.png'
+    source = FakeKodo({relative_path: _png_bytes('orange')})
+    storage = FakeOss()
+    embedding = FakeEmbedding()
+    normalizer = CountingNormalizer()
+    service = _service(
+        source,
+        storage,
+        embedding,
+        normalizer=normalizer,
+    )
+
+    service.ingest_one(relative_path)
+    service.ingest_one(relative_path)
+
+    assert len(normalizer.calls) == 1
+    assert len(embedding.paths) == 1
+
+
+def test_ingest_many_batches_unique_previews_at_requested_size(app):
+    objects = {
+        f'批量/{index:02d}.png': _png_bytes(
+            (index, (index * 7) % 255, (index * 13) % 255)
+        )
+        for index in range(21)
+    }
+    source = FakeKodo(objects)
+    storage = FakeOss()
+    embedding = FakeEmbedding()
+
+    results = _service(source, storage, embedding).ingest_many(
+        list(objects),
+        batch_size=20,
+    )
+
+    assert [result.status for result in results] == ['created'] * 21
+    assert embedding.batch_calls == [20, 1]
+    assert ImageAsset.query.count() == 21
+    assert all(result.stages['database'] == 'new' for result in results)
+
+
+def test_ingest_many_reuses_same_content_inside_one_batch(app):
+    original = _png_bytes('blue')
+    source = FakeKodo({
+        '重复/第一张.png': original,
+        '重复/第二张.png': original,
+    })
+    storage = FakeOss()
+    embedding = FakeEmbedding()
+
+    results = _service(source, storage, embedding).ingest_many([
+        '重复/第一张.png',
+        '重复/第二张.png',
+    ])
+
+    rows = ImageAsset.query.order_by(ImageAsset.source_relative_path).all()
+    assert [result.status for result in results] == ['created', 'created']
+    assert len(rows) == 2
+    assert rows[0].preview_oss_path == rows[1].preview_oss_path
+    assert list(rows[0].vector) == list(rows[1].vector)
+    assert embedding.batch_calls == [1]
+    assert len(embedding.paths) == 1
+    assert results[1].stages['preview'] == 'reused'
+    assert results[1].stages['embedding'] == 'reused'
+
+
+def test_ingest_many_treats_repeated_source_path_as_idempotent(app):
+    source = FakeKodo({'重复/同一路径.png': _png_bytes('blue')})
+    embedding = FakeEmbedding()
+
+    results = _service(source, FakeOss(), embedding).ingest_many([
+        '重复/同一路径.png',
+        '重复/同一路径.png',
+    ])
+
+    assert [result.status for result in results] == ['created', 'existing']
+    assert results[0].asset_id == results[1].asset_id
+    assert ImageAsset.query.count() == 1
+    assert embedding.batch_calls == [1]
+
+
+def test_ingest_many_isolates_bad_image_and_continues(app):
+    source = FakeKodo({
+        '批量/好图一.png': _png_bytes('red'),
+        '批量/损坏.png': b'not-an-image',
+        '批量/好图二.png': _png_bytes('green'),
+    })
+
+    results = _service(source, FakeOss(), FakeEmbedding()).ingest_many([
+        '批量/好图一.png',
+        '批量/损坏.png',
+        '批量/好图二.png',
+    ])
+
+    assert [result.status for result in results] == [
+        'created',
+        'failed',
+        'created',
+    ]
+    assert results[1].error_stage == 'preview'
+    assert results[1].stages == {'download': 'new'}
+    assert ImageAsset.query.count() == 2
+
+
+def test_ingest_many_preserves_download_when_original_upload_fails(app):
+    class FirstOriginalFailsStorage(FakeOss):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+        def put_file(self, key, source_path, *, spec):
+            if not self.failed:
+                self.failed = True
+                raise ObjectStorageError('fake original failure')
+            return super().put_file(key, source_path, spec=spec)
+
+    source = FakeKodo({
+        '批量/原图失败.png': _png_bytes('red'),
+        '批量/后续成功.png': _png_bytes('green'),
+    })
+
+    results = _service(
+        source,
+        FirstOriginalFailsStorage(),
+        FakeEmbedding(),
+    ).ingest_many(list(source.objects))
+
+    assert [result.status for result in results] == ['failed', 'created']
+    assert results[0].error_stage == 'original'
+    assert results[0].stages == {'download': 'new'}
+    assert ImageAsset.query.one().source_relative_path == '批量/后续成功.png'
+
+
+def test_ingest_many_preserves_original_when_preview_upload_fails(app):
+    class FirstPreviewFailsStorage(FakeOss):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+        def put_bytes(self, key, data, *, spec):
+            if not self.failed:
+                self.failed = True
+                raise ObjectStorageError('fake preview failure')
+            return super().put_bytes(key, data, spec=spec)
+
+    source = FakeKodo({
+        '批量/预览失败.png': _png_bytes('red'),
+        '批量/后续成功.png': _png_bytes('green'),
+    })
+
+    results = _service(
+        source,
+        FirstPreviewFailsStorage(),
+        FakeEmbedding(),
+    ).ingest_many(list(source.objects))
+
+    assert [result.status for result in results] == ['failed', 'created']
+    assert results[0].error_stage == 'preview'
+    assert results[0].stages == {
+        'download': 'new',
+        'original': 'new',
+    }
+    assert ImageAsset.query.one().source_relative_path == '批量/后续成功.png'
+
+
+def test_ingest_many_isolates_invalid_vector_and_persists_other_items(app):
+    class InvalidFirstVectorEmbedding(FakeEmbedding):
+        def embed_normalized_images(self, image_paths, request_id=None):
+            self.batch_calls.append(len(image_paths))
+            return [
+                np.array([0.1], dtype=np.float32),
+                np.full(EMBEDDING_DIMENSION, 0.2, dtype=np.float32),
+            ]
+
+    source = FakeKodo({
+        '批量/错维向量.png': _png_bytes('red'),
+        '批量/正常向量.png': _png_bytes('green'),
+    })
+
+    results = _service(
+        source,
+        FakeOss(),
+        InvalidFirstVectorEmbedding(),
+    ).ingest_many(list(source.objects))
+
+    assert [result.status for result in results] == ['failed', 'created']
+    assert results[0].error_stage == 'embedding'
+    assert results[0].stages == {
+        'download': 'new',
+        'original': 'new',
+        'preview': 'new',
+    }
+    assert ImageAsset.query.one().source_relative_path == '批量/正常向量.png'
+
+
+def test_ingest_many_preserves_completed_stages_when_database_write_fails(
+    app,
+    monkeypatch,
+):
+    source = FakeKodo({
+        '批量/数据库失败.png': _png_bytes('red'),
+        '批量/后续成功.png': _png_bytes('green'),
+    })
+    service = _service(source, FakeOss(), FakeEmbedding())
+    real_persist = service._persist
+    calls = 0
+
+    def fail_first_persist(prepared, vector_values, *, commit):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise AssetIngestError('fake database failure', stage='database')
+        return real_persist(prepared, vector_values, commit=commit)
+
+    monkeypatch.setattr(service, '_persist', fail_first_persist)
+
+    results = service.ingest_many(list(source.objects))
+
+    assert [result.status for result in results] == ['failed', 'created']
+    assert results[0].error_stage == 'database'
+    assert results[0].stages == {
+        'download': 'new',
+        'original': 'new',
+        'preview': 'new',
+        'embedding': 'new',
+    }
+    assert ImageAsset.query.one().source_relative_path == '批量/后续成功.png'
+
+
+def test_non_kodo_source_and_caller_owned_transaction(app):
+    db.session.add(Product(
+        model_number='UPLOAD-001',
+        photographer_file='p',
+        alibaba_product_url='https://example.com/x',
+        category='相机肩带',
+    ))
+    source = FakeKodo(
+        {'UPLOAD-001/原图.png': _png_bytes('purple')},
+        source_bucket='product-crud',
+    )
+    service = _service(
+        source,
+        FakeOss(),
+        FakeEmbedding(),
+        source_provider='product-upload',
+    )
+
+    result = service.ingest_one(
+        'UPLOAD-001/原图.png',
+        model_number='UPLOAD-001',
+        commit=False,
+    )
+
+    assert result.status == 'created'
+    assert ImageAsset.query.one().source_provider == 'product-upload'
+    db.session.rollback()
+    assert ImageAsset.query.count() == 0
+    assert Product.query.count() == 0
+
+
+def test_ingest_many_refuses_to_commit_callers_pending_writes(app):
+    db.session.add(Product(
+        model_number='PENDING-001',
+        photographer_file='p',
+        alibaba_product_url='https://example.com/x',
+        category='相机肩带',
+    ))
+    source = FakeKodo({'批量/图片.png': _png_bytes('red')})
+
+    with pytest.raises(AssetIngestError, match='已有数据库写事务'):
+        _service(source, FakeOss(), FakeEmbedding()).ingest_many(
+            ['批量/图片.png']
+        )
+
+    assert Product.query.count() == 1
+    assert ImageAsset.query.count() == 0
+    db.session.rollback()

@@ -131,20 +131,56 @@ class EmbeddingClient:
         一批中只要有一张坏图，整个请求就会 400。因此批级失败时降级为逐张调用，
         只把真正有问题的图片标记为 None，避免一张坏图毁掉 20 张。
         """
+        return self._embed_paths(
+            image_paths,
+            request_id=request_id,
+            data_uri_encoder=_to_data_uri,
+            single_embedder=self.embed_image,
+        )
+
+    def embed_normalized_images(self, image_paths, request_id=None):
+        """批量标准化 JPEG → 向量；保留预览字节，不做二次有损转码。"""
+        return self._embed_paths(
+            image_paths,
+            request_id=request_id,
+            data_uri_encoder=_normalized_to_data_uri,
+            single_embedder=self.embed_normalized_image,
+        )
+
+    def _embed_paths(
+        self,
+        image_paths,
+        *,
+        request_id,
+        data_uri_encoder,
+        single_embedder,
+    ):
         if not image_paths:
             return []
-
         results = []
         for start in range(0, len(image_paths), MAX_BATCH_SIZE):
             chunk = image_paths[start:start + MAX_BATCH_SIZE]
-            results.extend(self._embed_chunk(chunk, request_id))
+            results.extend(self._embed_chunk(
+                chunk,
+                request_id,
+                data_uri_encoder=data_uri_encoder,
+                single_embedder=single_embedder,
+            ))
         return results
 
     # ---------- 内部实现 ----------
 
-    def _embed_chunk(self, chunk, request_id):
+    def _embed_chunk(
+        self,
+        chunk,
+        request_id,
+        *,
+        data_uri_encoder=_to_data_uri,
+        single_embedder=None,
+    ):
+        fallback = single_embedder or self.embed_image
         try:
-            inputs = [{'image': _to_data_uri(path)} for path in chunk]
+            inputs = [{'image': data_uri_encoder(path)} for path in chunk]
             return self._call(inputs, request_id)
         except EmbeddingRateLimitExhaustedError as exc:
             # 429 重试已耗尽：逐张重试同样会被限流，只会发起更多请求、加剧限流。
@@ -163,7 +199,7 @@ class EmbeddingClient:
         degraded = []
         for path in chunk:
             try:
-                degraded.append(self.embed_image(path, request_id=request_id))
+                degraded.append(fallback(path, request_id=request_id))
             except Exception as exc:  # noqa: BLE001 - 单张失败只影响该张
                 logger.error(
                     'embedding.single.failed request_id=%s image_path=%s error=%s',

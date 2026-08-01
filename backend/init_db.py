@@ -42,5 +42,18 @@ def init_database():
         db.session.commit()
         print("content_hash 列与唯一索引已就绪！")
 
+        # 5. 旧表只做只读盘点，绝不在初始化期间自动删除或转换。
+        legacy_image_count = db.session.execute(
+            text('SELECT COUNT(*) FROM product_images')
+        ).scalar_one()
+        if legacy_image_count:
+            print(
+                '兼容迁移要求：product_images 中检测到 '
+                f'{legacy_image_count} 条旧图片记录；'
+                '已停止自动清理，请先制定并执行显式兼容迁移方案。'
+            )
+        else:
+            print("product_images 当前为空，无需兼容迁移。")
+
 if __name__ == '__main__':
     init_database()

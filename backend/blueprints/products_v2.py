@@ -24,6 +24,7 @@ from services.asset_ingest import (
     ImageAssetIngestService,
 )
 from services.image_normalizer import ImageNormalizationError
+from services import legacy_product_images
 from services.object_source import InMemoryObjectSource
 from services.object_storage import ObjectStorageError, OssObjectStorage
 products_v2_bp = Blueprint('products_v2', __name__, url_prefix='/api/products')
@@ -219,6 +220,22 @@ def products_with_active_images(products):
         ]
         result.append(product_dict)
     return result
+
+
+def legacy_images_require_migration():
+    """检查退休图片表，非空时阻止会触发级联删除的商品写操作。"""
+    audit = legacy_product_images.audit_legacy_product_images(
+        db.session.connection()
+    )
+    return audit.compatibility_required
+
+
+def legacy_images_error_response():
+    return error_response(
+        '检测到旧商品图片数据，请先制定兼容迁移方案后再删除商品',
+        'LEGACY_PRODUCT_IMAGES_REQUIRE_MIGRATION',
+        409,
+    )
 
 
 def asset_ingest_error_response(error):
@@ -555,6 +572,9 @@ def delete_product(model_number):
         if not product:
             return jsonify({'error': '产品不存在'}), 404
 
+        if legacy_images_require_migration():
+            return legacy_images_error_response()
+
         db.session.delete(product)
         db.session.commit()
 
@@ -586,6 +606,9 @@ def batch_delete_products():
         model_numbers = data['model_numbers']
         if not isinstance(model_numbers, list):
             return jsonify({'error': 'model_numbers 必须是数组'}), 400
+
+        if legacy_images_require_migration():
+            return legacy_images_error_response()
 
         # 批量删除
         deleted_count = Product.query.filter(

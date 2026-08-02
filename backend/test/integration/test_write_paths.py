@@ -9,6 +9,7 @@ from PIL import Image
 
 from models import ImageAsset, db
 from services.embedding import EmbeddingServiceError
+from services.legacy_product_images import LegacyProductImagesAudit
 from services.object_storage import ObjectStorageError, StoredObject
 
 
@@ -309,6 +310,59 @@ def test_delete_product_detaches_active_asset_without_deleting_oss(app):
     assert asset.model_number is None
     assert asset.status == 'active'
     assert set(storage.objects) == object_keys
+
+
+def test_delete_product_requires_compatibility_migration_when_legacy_audit_is_nonempty(
+    app,
+    monkeypatch,
+):
+    client = app.test_client()
+    created = client.post('/api/products', data={
+        'product': _product_payload('LEGACY-AUDIT-001'),
+    }, content_type='multipart/form-data')
+    assert created.status_code == 201
+
+    monkeypatch.setattr(
+        'services.legacy_product_images.audit_legacy_product_images',
+        lambda _connection: LegacyProductImagesAudit(True, 1),
+    )
+    response = client.delete('/api/products/LEGACY-AUDIT-001')
+
+    assert response.status_code == 409
+    assert response.get_json() == {
+        'error': '检测到旧商品图片数据，请先制定兼容迁移方案后再删除商品',
+        'error_code': 'LEGACY_PRODUCT_IMAGES_REQUIRE_MIGRATION',
+    }
+    assert client.get('/api/products/LEGACY-AUDIT-001').status_code == 200
+
+
+def test_batch_delete_requires_compatibility_migration_when_legacy_audit_is_nonempty(
+    app,
+    monkeypatch,
+):
+    client = app.test_client()
+    for model_number in ('LEGACY-AUDIT-002', 'LEGACY-AUDIT-003'):
+        created = client.post('/api/products', data={
+            'product': _product_payload(model_number),
+        }, content_type='multipart/form-data')
+        assert created.status_code == 201
+
+    monkeypatch.setattr(
+        'services.legacy_product_images.audit_legacy_product_images',
+        lambda _connection: LegacyProductImagesAudit(True, 1),
+    )
+    response = client.post(
+        '/api/products/batch-delete',
+        json={'model_numbers': ['LEGACY-AUDIT-002', 'LEGACY-AUDIT-003']},
+    )
+
+    assert response.status_code == 409
+    assert response.get_json() == {
+        'error': '检测到旧商品图片数据，请先制定兼容迁移方案后再删除商品',
+        'error_code': 'LEGACY_PRODUCT_IMAGES_REQUIRE_MIGRATION',
+    }
+    assert client.get('/api/products/LEGACY-AUDIT-002').status_code == 200
+    assert client.get('/api/products/LEGACY-AUDIT-003').status_code == 200
 
 
 def test_recreating_product_relinks_existing_upload_without_new_oss_objects(app):

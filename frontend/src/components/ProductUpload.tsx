@@ -18,6 +18,8 @@ import {
   Tooltip,
   Space,
   Empty,
+  Segmented,
+  Select,
 } from 'antd';
 import {
   PlusOutlined,
@@ -32,8 +34,14 @@ import {
   FileImageOutlined,
 } from '@ant-design/icons';
 import type { UploadFile } from 'antd/es/upload/interface';
-import type { Product, ProductFormData, VectorIndexEvent } from '../types/product';
+import type {
+  ImageAssetManagementItem,
+  Product,
+  ProductFormData,
+  VectorIndexEvent,
+} from '../types/product';
 import {
+  assignImageAssets,
   getProducts,
   createProduct,
   updateProduct,
@@ -44,7 +52,12 @@ import {
   downloadCSVTemplate,
   buildVectorIndex,
   getImageUrl,
+  getImageAssets,
 } from '../services/productApi';
+import { UnassignedAssetGrid } from './UnassignedAssetGrid';
+
+const ASSET_PAGE_SIZE = 24;
+type ManagementView = 'assets' | 'products';
 
 /** CSV 必填字段说明（用于导入弹窗展示） */
 const CSV_REQUIRED_FIELDS = [
@@ -62,6 +75,17 @@ export const ProductUpload: React.FC = () => {
   const [form] = Form.useForm();
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
   const [batchDeleteLoading, setBatchDeleteLoading] = useState(false);
+  const [activeView, setActiveView] = useState<ManagementView>('assets');
+  const [assets, setAssets] = useState<ImageAssetManagementItem[]>([]);
+  const [assetTotal, setAssetTotal] = useState(0);
+  const [assetPage, setAssetPage] = useState(1);
+  const [assetSearch, setAssetSearch] = useState('');
+  const [assetLoading, setAssetLoading] = useState(false);
+  const [assetError, setAssetError] = useState<string | null>(null);
+  const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
+  const [assignModalOpen, setAssignModalOpen] = useState(false);
+  const [targetModelNumber, setTargetModelNumber] = useState<string>();
+  const [assigning, setAssigning] = useState(false);
 
   // CSV 导入相关
   const [csvModalVisible, setCsvModalVisible] = useState(false);
@@ -76,6 +100,7 @@ export const ProductUpload: React.FC = () => {
 
   useEffect(() => {
     fetchProducts();
+    fetchAssets(1, '');
   }, []);
 
   const fetchProducts = async () => {
@@ -88,6 +113,58 @@ export const ProductUpload: React.FC = () => {
     } finally {
       setLoading(false);
     }
+  };
+
+  const fetchAssets = async (
+    page: number = assetPage,
+    search: string = assetSearch
+  ) => {
+    setAssetLoading(true);
+    setAssetError(null);
+    try {
+      const result = await getImageAssets({
+        page,
+        perPage: ASSET_PAGE_SIZE,
+        search,
+      });
+      setAssets(result.assets);
+      setAssetTotal(result.total);
+    } catch (error) {
+      setAssetError(
+        error instanceof Error ? error.message : '获取待归款图片失败'
+      );
+    } finally {
+      setAssetLoading(false);
+    }
+  };
+
+  const handleAssignAssets = async () => {
+    if (!targetModelNumber || selectedAssetIds.length === 0) return;
+    setAssigning(true);
+    try {
+      const result = await assignImageAssets(
+        selectedAssetIds,
+        targetModelNumber
+      );
+      message.success(
+        `已将 ${result.assigned_count + result.reused_count} 张图片关联到 ${targetModelNumber}`
+      );
+      setAssignModalOpen(false);
+      setTargetModelNumber(undefined);
+      setSelectedAssetIds([]);
+      await Promise.all([
+        fetchAssets(assetPage, assetSearch),
+        fetchProducts(),
+      ]);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '关联型号失败');
+    } finally {
+      setAssigning(false);
+    }
+  };
+
+  const refreshAll = () => {
+    void Promise.all([fetchProducts(), fetchAssets(assetPage, assetSearch)]);
   };
 
   const handleAddEdit = () => {
@@ -424,8 +501,11 @@ export const ProductUpload: React.FC = () => {
         <div>
           <div className="flex items-center gap-3">
             <h2 className="text-2xl font-bold text-slate-800 tracking-tight m-0">产品管理</h2>
+            <Tag bordered={false} className="bg-amber-50 text-amber-700 font-medium">
+              {assetTotal.toLocaleString('zh-CN')} 张待归款图片
+            </Tag>
             <Tag bordered={false} className="bg-teal-50 text-teal-700 font-medium">
-              {products.length} 个产品
+              {products.length.toLocaleString('zh-CN')} 个产品
             </Tag>
           </div>
           <p className="text-sm text-slate-400 mt-1 mb-0">
@@ -467,15 +547,36 @@ export const ProductUpload: React.FC = () => {
             <Button
               className="toolbar-btn"
               icon={<ReloadOutlined />}
-              onClick={fetchProducts}
-              loading={loading}
+              onClick={refreshAll}
+              loading={loading || assetLoading}
             />
           </Tooltip>
         </div>
       </div>
 
+      <div className="mb-5 animate-rise-delay-1">
+        <Segmented
+          value={activeView}
+          onChange={(value) => {
+            setActiveView(value as ManagementView);
+            setSelectedAssetIds([]);
+            setSelectedRowKeys([]);
+          }}
+          options={[
+            {
+              label: `待归款图片 (${assetTotal.toLocaleString('zh-CN')})`,
+              value: 'assets',
+            },
+            {
+              label: `产品资料 (${products.length.toLocaleString('zh-CN')})`,
+              value: 'products',
+            },
+          ]}
+        />
+      </div>
+
       {/* 批量选择上下文操作条：仅选中时浮现 */}
-      {selectedRowKeys.length > 0 && (
+      {activeView === 'products' && selectedRowKeys.length > 0 && (
         <div className="animate-rise flex items-center justify-between mb-4 px-4 py-2.5 rounded-xl bg-teal-50/80 border border-teal-100">
           <span className="text-sm text-teal-800">
             已选中 <b>{selectedRowKeys.length}</b> 个产品
@@ -503,7 +604,7 @@ export const ProductUpload: React.FC = () => {
       )}
 
       {/* 向量索引构建进度 */}
-      {showProgress && (
+      {activeView === 'products' && showProgress && (
         <div className="animate-rise mb-5 px-5 py-4 rounded-xl bg-white border border-slate-200 shadow-sm">
           <div className="flex items-center gap-2 mb-2">
             <ThunderboltOutlined className="text-amber-600" />
@@ -518,7 +619,34 @@ export const ProductUpload: React.FC = () => {
       )}
 
       <div className="animate-rise-delay-1">
-        <Table
+        {activeView === 'assets' ? (
+          <UnassignedAssetGrid
+            assets={assets}
+            total={assetTotal}
+            page={assetPage}
+            pageSize={ASSET_PAGE_SIZE}
+            loading={assetLoading}
+            error={assetError}
+            search={assetSearch}
+            selectedAssetIds={selectedAssetIds}
+            canAssign={products.length > 0}
+            onSearch={(value) => {
+              setAssetSearch(value);
+              setAssetPage(1);
+              setSelectedAssetIds([]);
+              void fetchAssets(1, value);
+            }}
+            onPageChange={(page) => {
+              setAssetPage(page);
+              setSelectedAssetIds([]);
+              void fetchAssets(page, assetSearch);
+            }}
+            onSelectionChange={setSelectedAssetIds}
+            onAssign={() => setAssignModalOpen(true)}
+            onRetry={() => void fetchAssets(assetPage, assetSearch)}
+          />
+        ) : (
+          <Table
           columns={columns}
           rowKey="model_number"
           dataSource={products}
@@ -542,8 +670,39 @@ export const ProductUpload: React.FC = () => {
             showQuickJumper: true,
             showTotal: (total) => `共 ${total} 条`,
           }}
-        />
+          />
+        )}
       </div>
+
+      <Modal
+        title={`关联 ${selectedAssetIds.length} 张图片`}
+        open={assignModalOpen}
+        okText="确定关联"
+        cancelText="取消"
+        confirmLoading={assigning}
+        okButtonProps={{ disabled: !targetModelNumber }}
+        onOk={handleAssignAssets}
+        onCancel={() => {
+          setAssignModalOpen(false);
+          setTargetModelNumber(undefined);
+        }}
+      >
+        <p className="text-sm text-slate-500 mt-0 mb-3">
+          仅可选择已存在的真实产品型号，本批图片将一次性完成关联。
+        </p>
+        <Select
+          showSearch
+          value={targetModelNumber}
+          placeholder="选择真实产品型号"
+          optionFilterProp="label"
+          options={products.map((product) => ({
+            value: product.model_number,
+            label: product.model_number,
+          }))}
+          onChange={setTargetModelNumber}
+          className="w-full"
+        />
+      </Modal>
 
       {/* 添加/编辑产品弹窗 */}
       <Modal

@@ -53,6 +53,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="只读扫描来源；不写 OSS、数据库，不调用 embedding。",
     )
     mode.add_argument(
+        "--verify-selection",
+        action="store_true",
+        help="只读下载清单图片，验证格式、哈希与试迁移覆盖范围。",
+    )
+    mode.add_argument(
         "--pilot",
         type=int,
         metavar="N",
@@ -127,6 +132,8 @@ def main(
     mode = (
         "preflight"
         if args.preflight
+        else "verify-selection"
+        if args.verify_selection
         else "pilot"
         if args.pilot is not None
         else "full"
@@ -172,10 +179,14 @@ def main(
             if args.selection_manifest
             else ()
         )
-        if selection_keys and mode not in {"dry-run", "pilot"}:
+        if selection_keys and mode not in {
+            "dry-run",
+            "pilot",
+            "verify-selection",
+        }:
             raise MigrationError(
                 "selection_manifest",
-                "--selection-manifest 仅可用于 dry-run 或 pilot 模式",
+                "--selection-manifest 仅可用于 dry-run、verify-selection 或 pilot 模式",
             )
         if selection_keys and args.retry_failed:
             raise MigrationError(

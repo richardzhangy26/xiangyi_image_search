@@ -2,22 +2,39 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 import time
+import warnings
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 from urllib.parse import urlparse
 
+from PIL import Image, UnidentifiedImageError
+
 from .embedding import MAX_BATCH_SIZE
+from .image_normalizer import ImageNormalizer
 from .object_source import ReadOnlyObjectSource, SourceObject
 from .source_preflight import is_image_key, safe_exception_summary
 
 REPORT_SCHEMA_VERSION = 1
 WRITE_MODES = frozenset({"pilot", "full"})
+VERIFY_SELECTION_MODE = "verify-selection"
+REQUIRED_SELECTION_COVERAGE = frozenset({
+    "chinese_space_path",
+    "nested_path",
+    "jpeg",
+    "png",
+    "webp",
+    "over_20_mib",
+    "duplicate_content",
+    "small_source",
+})
+LARGE_SOURCE_BYTES = 20 * 1024 * 1024
 REPORT_STAGES = (
     "download",
     "original",
@@ -114,8 +131,10 @@ class MigrationOptions:
         retry_failed_keys: Sequence[str] = (),
         retry_binding: Optional[RetryReportBinding] = None,
     ) -> "MigrationOptions":
-        if mode not in {"dry-run", "pilot", "full"}:
-            raise ValueError("迁移模式必须是 dry-run、pilot 或 full")
+        if mode not in {"dry-run", VERIFY_SELECTION_MODE, "pilot", "full"}:
+            raise ValueError(
+                "迁移模式必须是 dry-run、verify-selection、pilot 或 full"
+            )
         if mode == "pilot":
             if pilot_count is None or pilot_count <= 0:
                 raise ValueError("--pilot 必须大于 0")
@@ -137,6 +156,10 @@ class MigrationOptions:
                 raise ValueError(
                     "--pilot 数量必须与 --selection-manifest 项数一致"
                 )
+        elif mode == VERIFY_SELECTION_MODE:
+            raise ValueError(
+                "--verify-selection 必须提供 --selection-manifest"
+            )
         try:
             requested_batch_size = int(batch_size)
         except (TypeError, ValueError) as exc:
@@ -294,7 +317,13 @@ def run_migration(
         options,
     )
 
-    if options.mode in WRITE_MODES:
+    verification = None
+    if options.mode == VERIFY_SELECTION_MODE:
+        item_reports, verification = _verify_selected_images(
+            cached_source,
+            selected,
+        )
+    elif options.mode in WRITE_MODES:
         if ingest_service_factory is None:
             raise MigrationError(
                 "config",
@@ -349,6 +378,8 @@ def run_migration(
         status == "failed" or status.endswith("_conflict")
         for status in outcome_counts
     )
+    if verification and verification["missing"]:
+        has_issues = True
     elapsed_seconds = round(time.monotonic() - started_at, 3)
     scan_bytes = sum(item.size for item in objects)
     selected_bytes = sum(item.size for item in selected)
@@ -382,6 +413,7 @@ def run_migration(
             ),
             "missing": list(missing_retry_keys),
         },
+        **({"verification": verification} if verification else {}),
         "summary": {
             "scan": {
                 "objects": len(objects),
@@ -404,6 +436,159 @@ def run_migration(
         "elapsed_seconds": elapsed_seconds,
         "items": item_reports,
     }
+
+
+def _verify_selected_images(
+    source: ReadOnlyObjectSource,
+    selected: Sequence[SourceObject],
+) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    max_preview_edge = ImageNormalizer.from_env().max_edge
+    with tempfile.TemporaryDirectory(prefix="kodo-selection-") as directory:
+        temporary_root = Path(directory)
+        reports = [
+            _verify_selected_image(
+                source,
+                source_object,
+                temporary_root / f"source-{index}",
+                max_preview_edge=max_preview_edge,
+            )
+            for index, source_object in enumerate(selected)
+        ]
+
+    hashes = Counter(
+        report["content_hash"]
+        for report in reports
+        if report["status"] == "verified"
+    )
+    for report in reports:
+        content_hash = report.get("content_hash")
+        if content_hash and hashes[content_hash] > 1:
+            report["coverage_tags"].append("duplicate_content")
+
+    covered = sorted({
+        tag for report in reports for tag in report["coverage_tags"]
+    })
+    return reports, {
+        "covered": covered,
+        "missing": sorted(REQUIRED_SELECTION_COVERAGE - set(covered)),
+    }
+
+
+def _verify_selected_image(
+    source: ReadOnlyObjectSource,
+    source_object: SourceObject,
+    temporary_path: Path,
+    *,
+    max_preview_edge: int,
+) -> dict[str, Any]:
+    try:
+        source_head = source.head_object(source_object.key)
+        with temporary_path.open("w+b") as target:
+            downloaded_size = source.download_object(source_object.key, target)
+            actual_size = target.tell()
+        if (
+            downloaded_size != actual_size
+            or source_head.size != actual_size
+        ):
+            raise ValueError("来源 HEAD、下载返回值与实际字节数不一致")
+
+        content_hash = _hash_file(temporary_path)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(temporary_path) as image:
+                image.verify()
+            with Image.open(temporary_path) as image:
+                image.load()
+                image_format = image.format or "UNKNOWN"
+                width, height = image.size
+    except (
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        UnidentifiedImageError,
+        OSError,
+        ValueError,
+    ) as exc:
+        return _verification_failure(source_object, exc)
+    except Exception as exc:
+        return _verification_failure(source_object, exc)
+
+    return {
+        "source_relative_path": source_object.key,
+        "source_size": actual_size,
+        "status": "verified",
+        "content_hash": content_hash,
+        "image_format": image_format.upper(),
+        "source_width": width,
+        "source_height": height,
+        "coverage_tags": _selection_coverage_tags(
+            source_object,
+            image_format=image_format,
+            width=width,
+            height=height,
+            max_preview_edge=max_preview_edge,
+        ),
+        "stages": {},
+        "error_stage": None,
+        "error": None,
+    }
+
+
+def _verification_failure(
+    source_object: SourceObject,
+    error: BaseException,
+) -> dict[str, Any]:
+    return {
+        "source_relative_path": source_object.key,
+        "source_size": source_object.size,
+        "status": "failed",
+        "content_hash": None,
+        "image_format": None,
+        "source_width": None,
+        "source_height": None,
+        "coverage_tags": [],
+        "stages": {},
+        "error_stage": "verification",
+        "error": f"verification:{type(error).__name__}",
+    }
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source_file:
+        while chunk := source_file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _selection_coverage_tags(
+    source_object: SourceObject,
+    *,
+    image_format: str,
+    width: int,
+    height: int,
+    max_preview_edge: int,
+) -> list[str]:
+    source_relative_path = source_object.key
+    normalized_format = image_format.upper()
+    tags: list[str] = []
+    if " " in source_relative_path and any(
+        "\u4e00" <= character <= "\u9fff"
+        for character in source_relative_path
+    ):
+        tags.append("chinese_space_path")
+    if source_relative_path.count("/") >= 2:
+        tags.append("nested_path")
+    if normalized_format == "JPEG":
+        tags.append("jpeg")
+    elif normalized_format == "PNG":
+        tags.append("png")
+    elif normalized_format == "WEBP":
+        tags.append("webp")
+    if source_object.size > LARGE_SOURCE_BYTES:
+        tags.append("over_20_mib")
+    if max(width, height) <= max_preview_edge:
+        tags.append("small_source")
+    return tags
 
 
 def _validate_retry_binding(options: MigrationOptions, location) -> None:

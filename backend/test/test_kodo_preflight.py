@@ -29,6 +29,17 @@ def _png_bytes(color: str = "red") -> bytes:
     return output.getvalue()
 
 
+def _image_bytes(
+    image_format: str,
+    *,
+    color: str = 'red',
+    size: tuple[int, int] = (8, 6),
+) -> bytes:
+    output = io.BytesIO()
+    Image.new('RGB', size, color).save(output, format=image_format)
+    return output.getvalue()
+
+
 class _StreamingBody:
     def __init__(self, content: bytes):
         self._content = content
@@ -405,6 +416,121 @@ def test_selection_manifest_requires_matching_pilot_count(tmp_path):
 
     assert exit_code == 2
     assert json.loads(stderr.getvalue())['stage'] == 'selection_manifest'
+
+
+def test_verify_selection_reports_required_coverage_without_writers(
+    tmp_path,
+):
+    duplicate = _png_bytes('navy')
+    objects = {
+        '中文 空格/多层/图片.png': _png_bytes('red'),
+        '格式/照片.jpg': _image_bytes('JPEG', color='green'),
+        '格式/网页.webp': _image_bytes('WEBP', color='blue'),
+        '超大/图片.bmp': _image_bytes(
+            'BMP',
+            color='yellow',
+            size=(3000, 2400),
+        ),
+        '小图/图片.png': _png_bytes('purple'),
+        '重复/一.png': duplicate,
+        '重复/二.png': duplicate,
+        '普通/三.png': _png_bytes('orange'),
+        '普通/四.png': _png_bytes('pink'),
+        '普通/五.png': _png_bytes('gray'),
+    }
+    client = FakeReadOnlyS3Client(objects)
+    source = KodoS3Source(KodoConfig.from_env(_canonical_env()), client=client)
+    manifest_path = _write_selection_manifest(tmp_path, list(objects))
+    report_path = tmp_path / 'verification.json'
+
+    def forbidden_factory(_environment):
+        pytest.fail('只读选样验证不得构造 OSS 或 embedding 写端')
+
+    exit_code = main(
+        [
+            '--verify-selection',
+            '--selection-manifest',
+            str(manifest_path),
+            '--report-path',
+            str(report_path),
+        ],
+        environ=_canonical_env(),
+        source_factory=lambda _config: source,
+        storage_factory=forbidden_factory,
+        embedding_factory=forbidden_factory,
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    report = json.loads(report_path.read_text(encoding='utf-8'))
+    assert exit_code == 0
+    assert report['mode'] == 'verify-selection'
+    assert report['read_only'] is True
+    assert report['verification']['missing'] == []
+    duplicate_reports = [
+        item
+        for item in report['items']
+        if 'duplicate_content' in item['coverage_tags']
+    ]
+    assert [
+        item['source_relative_path'] for item in duplicate_reports
+    ] == ['重复/一.png', '重复/二.png']
+    assert all(
+        call[0] in {
+            'list_buckets',
+            'list_objects_v2',
+            'head_object',
+            'get_object',
+        }
+        for call in client.calls
+    )
+
+
+def test_verify_selection_reports_named_coverage_gaps(tmp_path):
+    objects = {
+        f'flat/image-{index}.png': _image_bytes(
+            'PNG',
+            color=(index * 20, 0, 0),
+        )
+        for index in range(10)
+    }
+    source = KodoS3Source(
+        KodoConfig.from_env(_canonical_env()),
+        client=FakeReadOnlyS3Client(objects),
+    )
+    manifest_path = _write_selection_manifest(tmp_path, list(objects))
+    report_path = tmp_path / 'verification.json'
+
+    exit_code = main(
+        [
+            '--verify-selection',
+            '--selection-manifest',
+            str(manifest_path),
+            '--report-path',
+            str(report_path),
+        ],
+        environ=_canonical_env(),
+        source_factory=lambda _config: source,
+        storage_factory=lambda _environment: pytest.fail(
+            '只读选样验证不得构造 OSS'
+        ),
+        embedding_factory=lambda _environment: pytest.fail(
+            '只读选样验证不得构造 embedding'
+        ),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    report = json.loads(report_path.read_text(encoding='utf-8'))
+    assert exit_code == 1
+    assert set(report['verification']['missing']) >= {
+        'chinese_space_path',
+        'nested_path',
+        'jpeg',
+        'webp',
+        'over_20_mib',
+        'duplicate_content',
+    }
 
 
 def test_public_image_key_classifier_is_case_insensitive():

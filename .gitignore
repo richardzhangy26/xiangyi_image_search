@@ -68,3 +68,4 @@ Thumbs.db
 *.log
 *.jpg
 .mcp.json
+.worktrees/

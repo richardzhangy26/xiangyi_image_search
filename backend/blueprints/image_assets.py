@@ -2,7 +2,7 @@
 
 import logging
 
-from flask import Blueprint, current_app, jsonify, redirect
+from flask import Blueprint, current_app, jsonify, redirect, request
 
 from models import ImageAsset, db
 from services.object_storage import ObjectStorageError, OssObjectStorage
@@ -14,6 +14,66 @@ image_assets_bp = Blueprint(
     __name__,
     url_prefix='/api/image-assets',
 )
+
+MANAGEMENT_ASSIGNMENTS = frozenset({'unassigned', 'assigned', 'all'})
+
+
+def _management_asset_dict(asset):
+    """返回产品管理页所需的最小安全字段集合。"""
+    return {
+        'asset_id': str(asset.id),
+        'model_number': asset.model_number,
+        'source_relative_path': asset.source_relative_path,
+        'preview_url': f'/api/image-assets/{asset.id}/preview',
+        'source_size': asset.source_size,
+        'source_mime_type': asset.source_mime_type,
+        'source_width': asset.source_width,
+        'source_height': asset.source_height,
+        'created_at': asset.created_at.isoformat() if asset.created_at else None,
+    }
+
+
+def _request_integer(name, default, minimum, maximum):
+    raw = request.args.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if minimum <= value <= maximum else None
+
+
+@image_assets_bp.get('')
+def list_image_assets():
+    assignment = request.args.get('assignment', 'unassigned')
+    page = _request_integer('page', 1, 1, 1_000_000)
+    per_page = _request_integer('per_page', 24, 1, 100)
+    if assignment not in MANAGEMENT_ASSIGNMENTS or page is None or per_page is None:
+        return jsonify({
+            'error': '图片资产列表参数无效',
+            'error_code': 'INVALID_IMAGE_ASSET_LIST_PARAMS',
+        }), 400
+
+    query = ImageAsset.query.filter(ImageAsset.status == 'active')
+    if assignment == 'unassigned':
+        query = query.filter(ImageAsset.model_number.is_(None))
+    elif assignment == 'assigned':
+        query = query.filter(ImageAsset.model_number.isnot(None))
+
+    search = (request.args.get('search') or '').strip()
+    if search:
+        query = query.filter(ImageAsset.source_relative_path.ilike(f'%{search}%'))
+
+    pagination = query.order_by(
+        ImageAsset.created_at.desc(), ImageAsset.id.desc()
+    ).paginate(page=page, per_page=per_page, error_out=False)
+    return jsonify({
+        'assets': [_management_asset_dict(asset) for asset in pagination.items],
+        'total': pagination.total,
+        'page': page,
+        'per_page': per_page,
+    })
 
 
 @image_assets_bp.get('/<uuid:asset_id>/preview')

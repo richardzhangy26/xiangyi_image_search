@@ -220,7 +220,13 @@ def _write_full_authorization(tmp_path, source):
     }
     reports = {}
     object_count = len(source.objects)
-    image_count = sum(is_image_key(key) for key in source.objects)
+    image_items = [
+        {'source_size': len(data)}
+        for key, data in source.objects.items()
+        if is_image_key(key)
+    ]
+    image_count = len(image_items)
+    image_bytes = sum(item['source_size'] for item in image_items)
     total_bytes = sum(len(data) for data in source.objects.values())
     for mode in ('preflight', 'dry-run'):
         report_path = tmp_path / f'{mode}.json'
@@ -248,7 +254,7 @@ def _write_full_authorization(tmp_path, source):
                     },
                     'selection': {
                         'images': image_count,
-                        'bytes': total_bytes,
+                        'bytes': image_bytes,
                     },
                 },
                 'options': {
@@ -256,7 +262,7 @@ def _write_full_authorization(tmp_path, source):
                     'selection_manifest': False,
                 },
                 'retry': {'enabled': False},
-                'items': [{} for _ in range(image_count)],
+                'items': image_items,
             })
         report_path.write_text(
             json.dumps(report),

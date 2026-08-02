@@ -634,10 +634,21 @@ def _read_only_scan(
         total_bytes = scan.get("bytes")
         selection = summary.get("selection")
         items = payload.get("items")
+        item_bytes = (
+            sum(item.get("source_size") for item in items)
+            if isinstance(items, list)
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("source_size"), int)
+                and item["source_size"] >= 0
+                for item in items
+            )
+            else None
+        )
         if (
             not isinstance(selection, dict)
             or selection.get("images") != images
-            or selection.get("bytes") != total_bytes
+            or selection.get("bytes") != item_bytes
             or not isinstance(items, list)
             or len(items) != images
         ):

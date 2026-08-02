@@ -20,6 +20,7 @@ from services.kodo_migration import (
     MigrationError,
     MigrationOptions,
     SelectionVerificationBinding,
+    load_full_migration_authorization,
     run_migration,
     verify_full_migration_authorization,
 )
@@ -193,7 +194,7 @@ def _write_full_authorization(tmp_path):
                     'selection_manifest': False,
                 },
                 'retry': {'enabled': False},
-                'items': [{}],
+                'items': [{'source_size': 1}],
             })
         report_path.write_text(
             json.dumps(report),
@@ -216,6 +217,53 @@ def _write_full_authorization(tmp_path):
         encoding='utf-8',
     )
     return authorization_path
+
+
+def test_full_authorization_allows_non_image_bytes_outside_image_selection(
+    tmp_path,
+):
+    authorization_path = _write_full_authorization(tmp_path)
+    preflight_path = tmp_path / 'preflight.json'
+    dry_run_path = tmp_path / 'dry-run.json'
+
+    preflight = json.loads(preflight_path.read_text(encoding='utf-8'))
+    preflight.update({
+        'total_objects': 2,
+        'image_objects': 1,
+        'total_bytes': 7,
+    })
+    preflight_path.write_text(json.dumps(preflight), encoding='utf-8')
+
+    dry_run = json.loads(dry_run_path.read_text(encoding='utf-8'))
+    dry_run['summary']['scan'] = {
+        'objects': 2,
+        'images': 1,
+        'non_images': 1,
+        'bytes': 7,
+    }
+    dry_run['summary']['selection'] = {'images': 1, 'bytes': 5}
+    dry_run['items'] = [{'source_size': 5}]
+    dry_run_path.write_text(json.dumps(dry_run), encoding='utf-8')
+
+    authorization = json.loads(
+        authorization_path.read_text(encoding='utf-8')
+    )
+    authorization['preflight_report']['sha256'] = hashlib.sha256(
+        preflight_path.read_bytes()
+    ).hexdigest()
+    authorization['dry_run_report']['sha256'] = hashlib.sha256(
+        dry_run_path.read_bytes()
+    ).hexdigest()
+    authorization_path.write_text(json.dumps(authorization), encoding='utf-8')
+
+    loaded = load_full_migration_authorization(authorization_path)
+
+    assert loaded.expected_scan == {
+        'objects': 2,
+        'images': 1,
+        'non_images': 1,
+        'bytes': 7,
+    }
 
 
 def test_z0_config_resolves_kodo_s3_location():

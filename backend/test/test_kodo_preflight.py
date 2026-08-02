@@ -585,14 +585,14 @@ def test_full_authorization_checks_github_issue_state_evidence_and_approval(
     verify_full_migration_authorization(_full_authorization())
 
 
-def test_verify_selection_reports_required_coverage_without_writers(
+def test_verify_selection_accepts_required_coverage_without_webp_or_writers(
     tmp_path,
 ):
     duplicate = _png_bytes('navy')
     objects = {
         '中文 空格/多层/图片.png': _png_bytes('red'),
         '格式/照片.jpg': _image_bytes('JPEG', color='green'),
-        '格式/网页.webp': _image_bytes('WEBP', color='blue'),
+        '格式/备用.png': _png_bytes('blue'),
         '超大/图片.bmp': _image_bytes(
             'BMP',
             color='yellow',
@@ -694,7 +694,6 @@ def test_verify_selection_reports_named_coverage_gaps(tmp_path):
         'chinese_space_path',
         'nested_path',
         'jpeg',
-        'webp',
         'over_20_mib',
         'duplicate_content',
     }

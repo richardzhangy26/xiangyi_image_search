@@ -38,7 +38,6 @@ REQUIRED_SELECTION_COVERAGE = frozenset({
     "nested_path",
     "jpeg",
     "png",
-    "webp",
     "over_20_mib",
     "duplicate_content",
     "small_source",

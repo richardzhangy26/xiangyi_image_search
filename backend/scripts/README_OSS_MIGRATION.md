@@ -21,8 +21,14 @@ python -m scripts.migrate_kodo_to_oss --preflight
 python -m scripts.migrate_kodo_to_oss --dry-run \
   --report-path reports/kodo-dry-run.json
 
+# 按精确清单只读下载、哈希和验证 10 张试迁移样本；不会构造写端
+python -m scripts.migrate_kodo_to_oss --verify-selection \
+  --selection-manifest reports/issue-10/selection.json \
+  --report-path reports/issue-10/selection-verification.json
+
 # 显式试迁移，不会自动继续全量
 python -m scripts.migrate_kodo_to_oss --pilot 10 \
+  --selection-manifest reports/issue-10/selection.json \
   --batch-size 20 \
   --report-path reports/kodo-pilot.json
 
@@ -48,11 +54,40 @@ python -m scripts.migrate_kodo_to_oss --full \
 
 - `--prefix PREFIX`：只扫描指定 Kodo 前缀。
 - `--limit N`：进一步限制本次选择的图片数。
+- `--selection-manifest PATH`：UTF-8 JSON 文件，且只包含有序、唯一的
+  `source_relative_paths` 数组。它只能用于 `--dry-run`、
+  `--verify-selection` 或 `--pilot`；不能与 `--retry-failed` 并用，
+  `--pilot N` 必须等于清单项数，`--full` 一律拒绝该参数。
 - `--retry-failed REPORT.json`：只选择旧报告中 `status=failed` 的来源
   Key。单独使用时仍是 dry-run；要写入必须同时显式指定 `--pilot N` 或
   `--full`。旧报告必须带有来源 provider、Bucket、S3 Bucket 和 prefix
   绑定；当前运行与这些字段不一致时会在列举对象前拒绝重试。
 - `--report-path PATH`：原子写入完整 UTF-8 JSON 报告。
+
+## Issue #10 的精确选样
+
+先完成 `--preflight` 和完整 `--dry-run`，再从实时盘点报告固定十个真实
+Kodo Key。清单文件只放在本地受控证据目录，不提交到仓库：
+
+```json
+{
+  "source_relative_paths": [
+    "来自 inventory.json 并已验证通过的精确 Kodo Key"
+  ]
+}
+```
+
+示例中的文字不是可用的来源路径，必须替换为本次盘点发现的十项真实 Key。
+写入前运行 `--verify-selection`；它仅执行 Kodo 的 list/HEAD/GET，逐项
+检查 SHA-256、真实格式和尺寸，并报告覆盖标签。通过的清单必须同时覆盖：
+
+- 含中文和空格的路径、多层目录；
+- 实际 JPEG、PNG、WebP；
+- 超过 20 MiB 的源图与一张不应放大的小图；
+- 一组不同路径但 SHA-256 相同的图片。
+
+任何缺项或解码失败均返回非零，且不会开始 OSS、embedding 或数据库写入。
+验证报告不包含凭证、完整签名 URL 或临时绝对路径。
 
 ## 报告
 
@@ -78,3 +113,6 @@ python -m scripts.migrate_kodo_to_oss --full \
 - 同来源路径内容变化只报告 `source_conflict`。
 - 不同来源路径内容相同仍建立独立图片资产，并复用兼容预览和向量。
 - 本仓库只交付迁移能力和自动化测试；不会自动执行真实试迁移或全量迁移。
+- #10 试迁移完成后必须附上脱敏报告、对象/数据库对账和搜索截图，并停止；
+  只有用户在 #10 或父 PRD 留下明确批准、再次完成 preflight/dry-run 并保存
+  数据库恢复点后，才允许手工运行 `--full`。

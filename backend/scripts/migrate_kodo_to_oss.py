@@ -193,6 +193,11 @@ def main(
                 "selection_manifest",
                 "--selection-manifest 不能与 --retry-failed 同时使用",
             )
+        if mode == "verify-selection" and not selection_keys:
+            raise MigrationError(
+                "selection_manifest",
+                "--verify-selection 必须提供 --selection-manifest",
+            )
         if selection_keys and mode == "pilot" and args.pilot != len(
             selection_keys
         ):

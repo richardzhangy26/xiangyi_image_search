@@ -533,6 +533,82 @@ def test_verify_selection_reports_named_coverage_gaps(tmp_path):
     }
 
 
+def test_verify_selection_requires_manifest_before_creating_source():
+    stderr = io.StringIO()
+
+    exit_code = main(
+        ['--verify-selection'],
+        environ=_canonical_env(),
+        source_factory=lambda _config: pytest.fail(
+            '未指定清单时不得创建来源客户端'
+        ),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert json.loads(stderr.getvalue())['stage'] == 'selection_manifest'
+
+
+def test_verify_selection_reports_decode_failure_without_raw_error_text(
+    tmp_path,
+):
+    source = KodoS3Source(
+        KodoConfig.from_env(_canonical_env()),
+        client=FakeReadOnlyS3Client({
+            '损坏/图片.png': b'not-an-image secret=must-not-leak',
+        }),
+    )
+    manifest_path = _write_selection_manifest(tmp_path, ['损坏/图片.png'])
+    report_path = tmp_path / 'verification.json'
+
+    exit_code = main(
+        [
+            '--verify-selection',
+            '--selection-manifest',
+            str(manifest_path),
+            '--report-path',
+            str(report_path),
+        ],
+        environ=_canonical_env(),
+        source_factory=lambda _config: source,
+        storage_factory=lambda _environment: pytest.fail(
+            '失败的只读验证不得构造 OSS'
+        ),
+        embedding_factory=lambda _environment: pytest.fail(
+            '失败的只读验证不得构造 embedding'
+        ),
+        stdout=io.StringIO(),
+        stderr=io.StringIO(),
+    )
+
+    report = json.loads(report_path.read_text(encoding='utf-8'))
+    item = report['items'][0]
+    assert exit_code == 1
+    assert item['status'] == 'failed'
+    assert item['error_stage'] == 'verification'
+    assert item['error'] == 'verification:UnidentifiedImageError'
+    assert 'must-not-leak' not in json.dumps(report, ensure_ascii=False)
+
+
+def test_full_rejects_selection_manifest_before_creating_source(tmp_path):
+    manifest_path = _write_selection_manifest(tmp_path, ['图片/一.png'])
+    stderr = io.StringIO()
+
+    exit_code = main(
+        ['--full', '--selection-manifest', str(manifest_path)],
+        environ=_canonical_env(),
+        source_factory=lambda _config: pytest.fail(
+            '--full 不得创建清单限定的来源客户端'
+        ),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert json.loads(stderr.getvalue())['stage'] == 'selection_manifest'
+
+
 def test_public_image_key_classifier_is_case_insensitive():
     assert is_image_key("中文 目录/主图.WEBP") is True
     assert is_image_key("中文 目录/说明.txt") is False

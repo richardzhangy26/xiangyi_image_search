@@ -189,6 +189,18 @@ def _run(
     return exit_code, output, error
 
 
+def _write_selection_manifest(tmp_path, source_relative_paths):
+    manifest_path = tmp_path / 'selection.json'
+    manifest_path.write_text(
+        json.dumps(
+            {'source_relative_paths': source_relative_paths},
+            ensure_ascii=False,
+        ),
+        encoding='utf-8',
+    )
+    return manifest_path
+
+
 def test_pilot_limits_images_clamps_batch_and_writes_a_reconciled_report(
     app,
     tmp_path,
@@ -259,6 +271,72 @@ def test_pilot_limits_images_clamps_batch_and_writes_a_reconciled_report(
     )
     assert complete_report["summary"] == terminal["summary"]
     assert all(not Path(path).exists() for path in source.downloaded_paths)
+
+
+def test_pilot_manifest_writes_exact_selected_images_and_reruns_idempotently(
+    app,
+    tmp_path,
+):
+    colors = (
+        'red', 'green', 'blue', 'yellow', 'purple', 'orange', 'pink',
+        'white', 'black', 'gray', 'cyan', 'brown',
+    )
+    source = FakeKodo({
+        f'候选/图片 {index:02d}.png': _png_bytes(color)
+        for index, color in enumerate(colors)
+    })
+    selected_paths = [
+        f'候选/图片 {index:02d}.png'
+        for index in reversed(range(2, 12))
+    ]
+    manifest_path = _write_selection_manifest(tmp_path, selected_paths)
+    storage = FakeOss()
+    embedding = FakeEmbedding()
+    first_report_path = tmp_path / 'first.json'
+
+    first_code, first_terminal, first_error = _run(
+        [
+            '--pilot',
+            '10',
+            '--selection-manifest',
+            str(manifest_path),
+            '--report-path',
+            str(first_report_path),
+        ],
+        app=app,
+        source=source,
+        storage=storage,
+        embedding=embedding,
+    )
+    uploaded_object_count = len(storage.put_calls)
+
+    second_code, second_terminal, second_error = _run(
+        [
+            '--pilot',
+            '10',
+            '--selection-manifest',
+            str(manifest_path),
+        ],
+        app=app,
+        source=source,
+        storage=storage,
+        embedding=embedding,
+    )
+
+    first_report = json.loads(first_report_path.read_text(encoding='utf-8'))
+    assert first_code == second_code == 0
+    assert first_error is second_error is None
+    assert first_terminal['options']['selection_manifest'] is True
+    assert first_terminal['options']['selection_count'] == 10
+    assert [
+        item['source_relative_path'] for item in first_report['items']
+    ] == selected_paths
+    assert {
+        row.source_relative_path for row in ImageAsset.query.all()
+    } == set(selected_paths)
+    assert embedding.batch_sizes == [10]
+    assert len(storage.put_calls) == uploaded_object_count
+    assert second_terminal['summary']['outcomes'] == {'existing': 10}
 
 
 def test_full_migration_keeps_duplicate_paths_and_rerun_is_idempotent(app):

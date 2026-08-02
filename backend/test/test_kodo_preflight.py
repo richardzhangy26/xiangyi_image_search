@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import hashlib
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -13,7 +14,15 @@ from PIL import Image
 
 from scripts.migrate_kodo_to_oss import create_parser, main
 from services.kodo_config import KodoConfig
-from services.kodo_migration import MigrationOptions, run_migration
+from services import kodo_migration
+from services.kodo_migration import (
+    FullMigrationAuthorization,
+    MigrationError,
+    MigrationOptions,
+    SelectionVerificationBinding,
+    run_migration,
+    verify_full_migration_authorization,
+)
 from services.kodo_source import DownloadSizeLimitExceeded, KodoS3Source
 from services.object_source import SourceLocation, SourceObject
 from services.source_preflight import (
@@ -122,6 +131,91 @@ def _write_selection_manifest(tmp_path, source_relative_paths):
         encoding='utf-8',
     )
     return manifest_path
+
+
+def _full_authorization(expected_scan=None) -> FullMigrationAuthorization:
+    return FullMigrationAuthorization(
+        provider='qiniu-kodo',
+        bucket='xiangxipackage',
+        s3_bucket='xiangxipackage',
+        prefix='',
+        issue_9_url='https://github.com/richardzhangy26/xiangyi_image_search/issues/9',
+        issue_10_evidence_url='https://github.com/richardzhangy26/xiangyi_image_search/issues/10#issuecomment-1',
+        user_approval_url='https://github.com/richardzhangy26/xiangyi_image_search/issues/10#issuecomment-2',
+        database_backup_reference='test-backup',
+        expected_scan=expected_scan or {
+            'objects': 1,
+            'images': 1,
+            'non_images': 0,
+            'bytes': 1,
+        },
+        preflight_generated_at=datetime(2026, 8, 2, 10, tzinfo=timezone.utc),
+        dry_run_generated_at=datetime(2026, 8, 2, 10, tzinfo=timezone.utc),
+    )
+
+
+def _write_full_authorization(tmp_path):
+    source = {
+        'provider': 'qiniu-kodo',
+        'bucket': 'xiangxipackage',
+        's3_bucket': 'xiangxipackage',
+        'prefix': '',
+    }
+    reports = {}
+    for mode in ('preflight', 'dry-run'):
+        report_path = tmp_path / f'{mode}.json'
+        report = {
+            'status': 'ok',
+            'generated_at': '2026-08-02T10:00:00+08:00',
+            'mode': mode,
+            'read_only': True,
+            'source': source,
+        }
+        if mode == 'preflight':
+            report.update({
+                'total_objects': 1,
+                'image_objects': 1,
+                'total_bytes': 1,
+            })
+        else:
+            report.update({
+                'summary': {
+                    'scan': {
+                        'objects': 1,
+                        'images': 1,
+                        'non_images': 0,
+                        'bytes': 1,
+                    },
+                    'selection': {'images': 1, 'bytes': 1},
+                },
+                'options': {
+                    'limit': None,
+                    'selection_manifest': False,
+                },
+                'retry': {'enabled': False},
+                'items': [{}],
+            })
+        report_path.write_text(
+            json.dumps(report),
+            encoding='utf-8',
+        )
+        reports[mode] = {
+            'path': report_path.name,
+            'sha256': hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        }
+    authorization_path = tmp_path / 'full-authorization.json'
+    authorization_path.write_text(
+        json.dumps({
+            'issue_9_url': 'https://github.com/richardzhangy26/xiangyi_image_search/issues/9',
+            'issue_10_evidence_url': 'https://github.com/richardzhangy26/xiangyi_image_search/issues/10#issuecomment-1',
+            'user_approval_url': 'https://github.com/richardzhangy26/xiangyi_image_search/issues/10#issuecomment-2',
+            'database_backup_reference': 'test-backup',
+            'preflight_report': reports['preflight'],
+            'dry_run_report': reports['dry-run'],
+        }),
+        encoding='utf-8',
+    )
+    return authorization_path
 
 
 def test_z0_config_resolves_kodo_s3_location():
@@ -418,6 +512,79 @@ def test_selection_manifest_requires_matching_pilot_count(tmp_path):
     assert json.loads(stderr.getvalue())['stage'] == 'selection_manifest'
 
 
+def test_pilot_requires_a_successful_selection_verification_before_source(
+    tmp_path,
+):
+    manifest_path = _write_selection_manifest(
+        tmp_path,
+        [f'样本/图片 {index}.png' for index in range(10)],
+    )
+    stderr = io.StringIO()
+
+    exit_code = main(
+        ['--pilot', '10', '--selection-manifest', str(manifest_path)],
+        environ=_canonical_env(),
+        source_factory=lambda _config: pytest.fail(
+            '未验证的试迁移不得创建来源客户端'
+        ),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert json.loads(stderr.getvalue())['stage'] == 'selection_verification'
+
+
+def test_full_requires_controlled_authorization_before_source_creation():
+    stderr = io.StringIO()
+
+    exit_code = main(
+        ['--full'],
+        environ=_canonical_env(),
+        source_factory=lambda _config: pytest.fail(
+            '未经授权的全量迁移不得创建来源客户端'
+        ),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert json.loads(stderr.getvalue())['stage'] == 'full_authorization'
+
+
+def test_full_authorization_checks_github_issue_state_evidence_and_approval(
+    monkeypatch,
+):
+    def fake_run(command, **_kwargs):
+        endpoint = command[-1]
+        payloads = {
+            'repos/richardzhangy26/xiangyi_image_search/issues/9': {
+                'state': 'closed',
+            },
+            'repos/richardzhangy26/xiangyi_image_search/issues/10': {
+                'state': 'closed',
+            },
+            'repos/richardzhangy26/xiangyi_image_search/issues/comments/1': {
+                'body': 'preflight、dry-run 和 pilot 试迁移证据已附。',
+                'user': {'login': 'agent'},
+                'issue_url': 'https://api.github.com/repos/richardzhangy26/xiangyi_image_search/issues/10',
+            },
+            'repos/richardzhangy26/xiangyi_image_search/issues/comments/2': {
+                'body': '批准全量迁移。',
+                'user': {'login': 'richardzhangy26'},
+                'issue_url': 'https://api.github.com/repos/richardzhangy26/xiangyi_image_search/issues/10',
+            },
+        }
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(payloads[endpoint]),
+        )
+
+    monkeypatch.setattr(kodo_migration.subprocess, 'run', fake_run)
+
+    verify_full_migration_authorization(_full_authorization())
+
+
 def test_verify_selection_reports_required_coverage_without_writers(
     tmp_path,
 ):
@@ -531,6 +698,51 @@ def test_verify_selection_reports_named_coverage_gaps(tmp_path):
         'over_20_mib',
         'duplicate_content',
     }
+
+
+def test_pilot_revalidates_hashes_before_constructing_writers():
+    duplicate = _png_bytes('navy')
+    objects = {
+        '中文 空格/多层/图片.png': _png_bytes('red'),
+        '格式/照片.jpg': _image_bytes('JPEG', color='green'),
+        '格式/网页.webp': _image_bytes('WEBP', color='blue'),
+        '超大/图片.bmp': _image_bytes(
+            'BMP', color='yellow', size=(3000, 2400),
+        ),
+        '小图/图片.png': _png_bytes('purple'),
+        '重复/一.png': duplicate,
+        '重复/二.png': duplicate,
+        '普通/图片 07.png': _png_bytes('white'),
+        '普通/图片 08.png': _png_bytes('black'),
+        '普通/图片 09.png': _png_bytes('gray'),
+    }
+    source = KodoS3Source(
+        KodoConfig.from_env(_canonical_env()),
+        client=FakeReadOnlyS3Client(objects),
+    )
+    paths = tuple(objects)
+    options = MigrationOptions.build(
+        mode='pilot',
+        pilot_count=10,
+        selection_keys=paths,
+        selection_verification=SelectionVerificationBinding(
+            provider='qiniu-kodo',
+            bucket='xiangxipackage',
+            s3_bucket='xiangxipackage',
+            prefix='',
+            source_relative_paths=paths,
+            content_hashes=('0' * 64,) * 10,
+        ),
+    )
+
+    with pytest.raises(MigrationError, match='selection_verification'):
+        run_migration(
+            source,
+            options=options,
+            ingest_service_factory=lambda _source: pytest.fail(
+                '哈希不一致时不得构造入库写端'
+            ),
+        )
 
 
 def test_verify_selection_requires_manifest_before_creating_source():
@@ -942,7 +1154,16 @@ def test_write_runner_chunks_selected_keys_before_calling_ingest_many():
     service = Service()
     report = run_migration(
         Source(),
-        options=MigrationOptions.build(mode="full", batch_size=2),
+        options=MigrationOptions.build(
+            mode="full",
+            batch_size=2,
+            full_authorization=_full_authorization({
+                'objects': 5,
+                'images': 5,
+                'non_images': 0,
+                'bytes': 15,
+            }),
+        ),
         ingest_service_factory=lambda _source: service,
     )
 
@@ -954,7 +1175,7 @@ def test_write_runner_chunks_selected_keys_before_calling_ingest_many():
     assert report["summary"]["outcomes"] == {"created": 5}
 
 
-def test_full_list_failure_stops_before_write_dependencies_and_redacts():
+def test_full_list_failure_stops_before_write_dependencies_and_redacts(tmp_path):
     class ListFailingSource:
         def resolve_location(self):
             return SourceLocation(
@@ -978,7 +1199,11 @@ def test_full_list_failure_stops_before_write_dependencies_and_redacts():
     stderr = io.StringIO()
 
     exit_code = main(
-        ["--full"],
+        [
+            "--full",
+            "--full-authorization",
+            str(_write_full_authorization(tmp_path)),
+        ],
         environ=_canonical_env(),
         source_factory=lambda _config: ListFailingSource(),
         storage_factory=lambda _environment: pytest.fail(
@@ -987,6 +1212,7 @@ def test_full_list_failure_stops_before_write_dependencies_and_redacts():
         embedding_factory=lambda _environment: pytest.fail(
             "列举失败后不得构造 embedding"
         ),
+        authorization_verifier=lambda _authorization: None,
         app=FakeApp(),
         stdout=stdout,
         stderr=stderr,

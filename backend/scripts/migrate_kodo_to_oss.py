@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence, TextIO
 
@@ -17,12 +18,17 @@ from services.kodo_config import KodoConfig, KodoConfigError
 from services.kodo_migration import (
     MigrationError,
     MigrationOptions,
+    load_full_migration_authorization,
     load_selection_manifest,
+    load_selection_verification_report,
     load_retry_report,
     run_migration,
+    validate_selection_options,
     validate_oss_write_target,
+    verify_full_migration_authorization,
     write_report_atomic,
 )
+from services.image_normalizer import DEFAULT_MAX_EDGE, ImageNormalizer
 from services.kodo_source import KodoS3Source
 from services.object_source import ReadOnlyObjectSource
 from services.object_storage import OssObjectStorage
@@ -103,6 +109,16 @@ def create_parser() -> argparse.ArgumentParser:
         help="试迁移使用的有序来源相对路径 JSON 清单。",
     )
     parser.add_argument(
+        "--verified-selection-report",
+        type=Path,
+        help="--pilot 必需：成功的 --verify-selection 完整报告。",
+    )
+    parser.add_argument(
+        "--full-authorization",
+        type=Path,
+        help="--full 必需：含 Issue、批准、备份和只读检查证据的授权 JSON。",
+    )
+    parser.add_argument(
         "--env",
         type=Path,
         default=Path(__file__).resolve().parents[1] / ".env",
@@ -123,6 +139,9 @@ def main(
         lambda environment: EmbeddingClient(
             api_key=environment.get("DASHSCOPE_API_KEY")
         )
+    ),
+    authorization_verifier: Callable[[Any], None] = (
+        verify_full_migration_authorization
     ),
     app=None,
     stdout: TextIO = sys.stdout,
@@ -179,34 +198,78 @@ def main(
             if args.selection_manifest
             else ()
         )
-        if selection_keys and mode not in {
-            "dry-run",
-            "pilot",
-            "verify-selection",
-        }:
-            raise MigrationError(
-                "selection_manifest",
-                "--selection-manifest 仅可用于 dry-run、verify-selection 或 pilot 模式",
+        try:
+            validate_selection_options(
+                mode=mode,
+                selection_keys=selection_keys,
+                retry_enabled=args.retry_failed is not None,
+                pilot_count=args.pilot,
+                selection_verification=None,
+                require_selection_verification=False,
             )
-        if selection_keys and args.retry_failed:
+        except ValueError as exc:
+            raise MigrationError("selection_manifest", str(exc)) from exc
+        if mode == "pilot" and args.verified_selection_report is None:
             raise MigrationError(
-                "selection_manifest",
-                "--selection-manifest 不能与 --retry-failed 同时使用",
+                "selection_verification",
+                "--pilot 必须提供 --verified-selection-report",
             )
-        if mode == "verify-selection" and not selection_keys:
+        if mode != "pilot" and args.verified_selection_report is not None:
             raise MigrationError(
-                "selection_manifest",
-                "--verify-selection 必须提供 --selection-manifest",
+                "selection_verification",
+                "--verified-selection-report 仅可用于 --pilot",
             )
-        if selection_keys and mode == "pilot" and args.pilot != len(
-            selection_keys
-        ):
+        selection_verification = (
+            load_selection_verification_report(
+                args.verified_selection_report.expanduser().resolve()
+            )
+            if args.verified_selection_report
+            else None
+        )
+        if mode == "full" and args.full_authorization is None:
             raise MigrationError(
-                "selection_manifest",
-                "--pilot 数量必须与 --selection-manifest 项数一致",
+                "full_authorization",
+                "--full 必须提供 --full-authorization",
             )
-    except MigrationError as exc:
-        _write_json(stderr, exc.to_dict())
+        if mode != "full" and args.full_authorization is not None:
+            raise MigrationError(
+                "full_authorization",
+                "--full-authorization 仅可用于 --full",
+            )
+        full_authorization = (
+            load_full_migration_authorization(
+                args.full_authorization.expanduser().resolve()
+            )
+            if args.full_authorization
+            else None
+        )
+        if full_authorization is not None:
+            authorization_verifier(full_authorization)
+        try:
+            validate_selection_options(
+                mode=mode,
+                selection_keys=selection_keys,
+                retry_enabled=args.retry_failed is not None,
+                pilot_count=args.pilot,
+                selection_verification=selection_verification,
+            )
+        except ValueError as exc:
+            raise MigrationError("selection_manifest", str(exc)) from exc
+        selection_max_edge = (
+            ImageNormalizer.from_env(environment).max_edge
+            if mode in {"pilot", "verify-selection"}
+            else None
+        )
+    except (MigrationError, ValueError) as exc:
+        if isinstance(exc, MigrationError):
+            payload = exc.to_dict()
+        else:
+            payload = {
+                "status": "failed",
+                "stage": "config",
+                "error": str(exc),
+            }
+        _write_json(stderr, payload)
         return 2
 
     if mode != "preflight":
@@ -228,6 +291,13 @@ def main(
                     retry_report.failed_keys if retry_report else ()
                 ),
                 retry_binding=retry_report,
+                selection_verification=selection_verification,
+                full_authorization=full_authorization,
+                selection_max_edge=(
+                    selection_max_edge
+                    if selection_max_edge is not None
+                    else DEFAULT_MAX_EDGE
+                ),
             )
         except (MigrationError, ValueError) as exc:
             if isinstance(exc, MigrationError):
@@ -267,9 +337,16 @@ def main(
 
         output = {
             "status": "ok",
+            "generated_at": datetime.now().astimezone().isoformat(),
             "mode": mode,
             "read_only": True,
             "compatibility_aliases_used": list(config.aliases_used),
+            "source": {
+                "provider": "qiniu-kodo",
+                "bucket": preflight_report.source_bucket,
+                "s3_bucket": preflight_report.s3_bucket,
+                "prefix": args.prefix,
+            },
             **preflight_report.to_dict(),
         }
         try:

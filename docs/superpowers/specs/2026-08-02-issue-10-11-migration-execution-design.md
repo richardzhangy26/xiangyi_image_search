@@ -22,7 +22,7 @@ Issue #11 是一次有条件的操作，不是 `--pilot` 的自动续步：必�
 
 ### 精确选样
 
-新增可用于 `--dry-run`、`--verify-selection` 和 `--pilot` 的 `--selection-manifest PATH` 参数。清单为 UTF-8 JSON，包含有序、唯一的 `source_relative_path` 数组；清单路径绝不写入数据库。它与 `--retry-failed` 互斥，且 `--full` 拒绝该参数，防止把局部清单误当全量迁移。
+新增可用于 `--dry-run`、`--verify-selection` 和 `--pilot` 的 `--selection-manifest PATH` 参数。清单为 UTF-8 JSON，包含有序、唯一的 `source_relative_path` 数组；清单路径绝不写入数据库。它与 `--retry-failed` 互斥，且 `--full` 拒绝该参数，防止把局部清单误当全量迁移。`--pilot` 只允许恰好 10 张，并且必须同时给出成功的 `--verified-selection-report`。
 
 CLI 仍会先完整列举当前前缀下的 Kodo 对象，再按清单顺序匹配 Key。不存在、非图片或重复 Key 都会在写入前作为明确配置/选择错误退出；因此选样不会静默缩减。`--pilot N` 与清单项目数必须相等，防止报告中的“10”掩盖漏项。原有 `--prefix` 仍约束来源扫描范围，所有清单项必须落在该范围内。
 
@@ -36,7 +36,7 @@ CLI 仍会先完整列举当前前缀下的 Kodo 对象，再按清单顺序匹�
 
 ### 试迁移与验收
 
-`--pilot 10 --selection-manifest` 在现有 OSS 私有 ACL、目标 Bucket/地域/隔离前缀和数据库可达性检查通过后，才调用统一入库服务。完整 JSON 报告写入指定本地证据目录，终端只输出已脱敏汇总。迁移结束后必须：
+`--pilot 10 --selection-manifest --verified-selection-report` 会先在只读路径重新下载十张源图，核对当前来源绑定、路径顺序、覆盖结论和每张 SHA-256 都等于成功验证报告；任何不一致均在构造 OSS、embedding 和数据库写端前停止。通过后，入库服务只从本次验证临时快照读取，不会再次读取 Kodo，避免验证到写入间的内容变化。只有该检查以及 OSS 私有 ACL、目标 Bucket/地域/隔离前缀和数据库可达性检查通过后，才调用统一入库服务。完整 JSON 报告写入指定本地证据目录，终端只输出已脱敏汇总。迁移结束后必须：
 
 1. 核对十项报告与 `image_assets`，确认每个来源路径都有一条资产且 `model_number` 为 `NULL`；重复哈希保留两行并复用兼容预览、向量。
 2. 对 OSS 原图逐项或抽样比较 SHA-256，检查私有 Bucket 与 Object Key；检查预览方向、比例、最长边、大小和小图未放大。
@@ -53,7 +53,7 @@ CLI 仍会先完整列举当前前缀下的 Kodo 对象，再按清单顺序匹�
 - 已保存数据库备份或可恢复点；
 - 再次运行只读 preflight 与全量 dry-run，固定当次图片数、非图片数、总字节和时间戳。
 
-满足门槛后才显式调用 `--full`。全量报告必须对账 Kodo、OSS 原图对象和活跃 `image_assets`，隔离失败/冲突并允许受绑定报告约束的定向重试。Kodo 全程只读，不根据路径推断商品资料，也不会删除来源对象。
+满足门槛后才显式调用 `--full --full-authorization PATH`。授权文件必须包含 #9 与 #10 证据链接、用户批准链接、数据库备份/恢复点标识，以及当次成功 preflight/dry-run 报告的相对路径和 SHA-256；CLI 会在创建写端前重新校验哈希、生成时间（过去 24 小时内）、完整扫描统计和与当前来源的 Bucket/S3 Bucket/prefix 绑定，并把当前全量枚举的统计与基线逐项比较。它还通过 GitHub API 验证 Issue #9 与 #10 已关闭、证据评论确实属于 Issue #10，且仓库所有者已在 Issue #10 或同仓库父 PRD 中作出不含否定语义的明确全量批准。全量报告必须对账 Kodo、OSS 原图对象和活跃 `image_assets`，隔离失败/冲突并允许受绑定报告约束的定向重试。Kodo 全程只读，不根据路径推断商品资料，也不会删除来源对象。
 
 ## 测试边界
 

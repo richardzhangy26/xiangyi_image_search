@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from services.object_storage import (
     ObjectStorageTargetInspection,
     StoredObject,
 )
+from services.source_preflight import is_image_key
 
 
 def _image_bytes(
@@ -174,16 +176,24 @@ def _run(
 ):
     stdout = io.StringIO()
     stderr = io.StringIO()
-    exit_code = main(
-        argv,
-        environ=_environment(),
-        source_factory=lambda _config: source,
-        storage_factory=lambda _environment: storage,
-        embedding_factory=lambda _environment: embedding,
-        app=app,
-        stdout=stdout,
-        stderr=stderr,
-    )
+    with tempfile.TemporaryDirectory() as directory:
+        resolved_argv = list(argv)
+        if '--full' in resolved_argv and '--full-authorization' not in resolved_argv:
+            resolved_argv.extend([
+                '--full-authorization',
+                str(_write_full_authorization(Path(directory), source)),
+            ])
+        exit_code = main(
+            resolved_argv,
+            environ=_environment(),
+            source_factory=lambda _config: source,
+            storage_factory=lambda _environment: storage,
+            embedding_factory=lambda _environment: embedding,
+            authorization_verifier=lambda _authorization: None,
+            app=app,
+            stdout=stdout,
+            stderr=stderr,
+        )
     output = json.loads(stdout.getvalue()) if stdout.getvalue() else None
     error = json.loads(stderr.getvalue()) if stderr.getvalue() else None
     return exit_code, output, error
@@ -201,10 +211,81 @@ def _write_selection_manifest(tmp_path, source_relative_paths):
     return manifest_path
 
 
+def _write_full_authorization(tmp_path, source):
+    source_binding = {
+        'provider': 'qiniu-kodo',
+        'bucket': 'xiangxipackage',
+        's3_bucket': 'xiangxipackage',
+        'prefix': '',
+    }
+    reports = {}
+    object_count = len(source.objects)
+    image_count = sum(is_image_key(key) for key in source.objects)
+    total_bytes = sum(len(data) for data in source.objects.values())
+    for mode in ('preflight', 'dry-run'):
+        report_path = tmp_path / f'{mode}.json'
+        report = {
+            'status': 'ok',
+            'generated_at': '2026-08-02T10:00:00+08:00',
+            'mode': mode,
+            'read_only': True,
+            'source': source_binding,
+        }
+        if mode == 'preflight':
+            report.update({
+                'total_objects': object_count,
+                'image_objects': image_count,
+                'total_bytes': total_bytes,
+            })
+        else:
+            report.update({
+                'summary': {
+                    'scan': {
+                        'objects': object_count,
+                        'images': image_count,
+                        'non_images': object_count - image_count,
+                        'bytes': total_bytes,
+                    },
+                    'selection': {
+                        'images': image_count,
+                        'bytes': total_bytes,
+                    },
+                },
+                'options': {
+                    'limit': None,
+                    'selection_manifest': False,
+                },
+                'retry': {'enabled': False},
+                'items': [{} for _ in range(image_count)],
+            })
+        report_path.write_text(
+            json.dumps(report),
+            encoding='utf-8',
+        )
+        reports[mode] = {
+            'path': report_path.name,
+            'sha256': hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        }
+    authorization_path = tmp_path / 'full-authorization.json'
+    authorization_path.write_text(
+        json.dumps({
+            'issue_9_url': 'https://github.com/richardzhangy26/xiangyi_image_search/issues/9',
+            'issue_10_evidence_url': 'https://github.com/richardzhangy26/xiangyi_image_search/issues/10#issuecomment-1',
+            'user_approval_url': 'https://github.com/richardzhangy26/xiangyi_image_search/issues/10#issuecomment-2',
+            'database_backup_reference': 'test-backup',
+            'preflight_report': reports['preflight'],
+            'dry_run_report': reports['dry-run'],
+        }),
+        encoding='utf-8',
+    )
+    return authorization_path
+
+
 def test_pilot_limits_images_clamps_batch_and_writes_a_reconciled_report(
     app,
     tmp_path,
 ):
+    duplicate = _png_bytes("navy")
     objects = {
         "中文 目录/多层/图片 00.png": _png_bytes("red"),
         "不同格式/相机照片.jpg": _image_bytes(
@@ -221,8 +302,8 @@ def test_pilot_limits_images_clamps_batch_and_writes_a_reconciled_report(
             size=(3000, 2400),
         ),
         "小图/不应放大.png": _png_bytes("purple"),
-        "普通/图片 05.png": _png_bytes("orange"),
-        "普通/图片 06.png": _png_bytes("pink"),
+        "重复/图片 05.png": duplicate,
+        "重复/图片 06.png": duplicate,
         "普通/图片 07.png": _png_bytes("white"),
         "普通/图片 08.png": _png_bytes("black"),
         "普通/图片 09.png": _png_bytes("gray"),
@@ -234,11 +315,33 @@ def test_pilot_limits_images_clamps_batch_and_writes_a_reconciled_report(
     storage = FakeOss()
     embedding = FakeEmbedding()
     report_path = tmp_path / "pilot-report.json"
+    selected_paths = list(objects)[:10]
+    manifest_path = _write_selection_manifest(tmp_path, selected_paths)
+    verification_path = tmp_path / "selection-verification.json"
+
+    verification_code, _verification, verification_error = _run(
+        [
+            "--verify-selection",
+            "--selection-manifest",
+            str(manifest_path),
+            "--report-path",
+            str(verification_path),
+        ],
+        app=app,
+        source=source,
+        storage=storage,
+        embedding=embedding,
+    )
+    source.calls.clear()
 
     exit_code, terminal, error = _run(
         [
             "--pilot",
             "10",
+            "--selection-manifest",
+            str(manifest_path),
+            "--verified-selection-report",
+            str(verification_path),
             "--batch-size",
             "999",
             "--report-path",
@@ -250,10 +353,12 @@ def test_pilot_limits_images_clamps_batch_and_writes_a_reconciled_report(
         embedding=embedding,
     )
 
+    assert verification_code == 0
+    assert verification_error is None
     assert exit_code == 0
     assert error is None
     assert ImageAsset.query.count() == 10
-    assert embedding.batch_sizes == [10]
+    assert embedding.batch_sizes == [9]
     complete_report = json.loads(report_path.read_text(encoding="utf-8"))
     assert terminal["mode"] == "pilot"
     assert terminal["read_only"] is False
@@ -270,6 +375,9 @@ def test_pilot_limits_images_clamps_batch_and_writes_a_reconciled_report(
         20 * 1024 * 1024
     )
     assert complete_report["summary"] == terminal["summary"]
+    assert [
+        key for operation, key in source.calls if operation == 'get'
+    ] == selected_paths
     assert all(not Path(path).exists() for path in source.downloaded_paths)
 
 
@@ -277,22 +385,45 @@ def test_pilot_manifest_writes_exact_selected_images_and_reruns_idempotently(
     app,
     tmp_path,
 ):
-    colors = (
-        'red', 'green', 'blue', 'yellow', 'purple', 'orange', 'pink',
-        'white', 'black', 'gray', 'cyan', 'brown',
-    )
+    duplicate = _png_bytes('navy')
     source = FakeKodo({
-        f'候选/图片 {index:02d}.png': _png_bytes(color)
-        for index, color in enumerate(colors)
+        '中文 空格/多层/图片.png': _png_bytes('red'),
+        '格式/照片.jpg': _image_bytes('green', image_format='JPEG'),
+        '格式/网页.webp': _image_bytes('blue', image_format='WEBP'),
+        '超大/图片.bmp': _image_bytes(
+            'yellow', image_format='BMP', size=(3000, 2400),
+        ),
+        '小图/图片.png': _png_bytes('purple'),
+        '重复/一.png': duplicate,
+        '重复/二.png': duplicate,
+        '普通/图片 07.png': _png_bytes('white'),
+        '普通/图片 08.png': _png_bytes('black'),
+        '普通/图片 09.png': _png_bytes('gray'),
+        'pilot 外/图片 10.png': _png_bytes('cyan'),
+        'pilot 外/图片 11.png': _png_bytes('brown'),
     })
     selected_paths = [
-        f'候选/图片 {index:02d}.png'
-        for index in reversed(range(2, 12))
+        key for key in list(source.objects)[:10]
     ]
     manifest_path = _write_selection_manifest(tmp_path, selected_paths)
     storage = FakeOss()
     embedding = FakeEmbedding()
     first_report_path = tmp_path / 'first.json'
+    verification_path = tmp_path / 'selection-verification.json'
+
+    verification_code, _verification, verification_error = _run(
+        [
+            '--verify-selection',
+            '--selection-manifest',
+            str(manifest_path),
+            '--report-path',
+            str(verification_path),
+        ],
+        app=app,
+        source=source,
+        storage=storage,
+        embedding=embedding,
+    )
 
     first_code, first_terminal, first_error = _run(
         [
@@ -300,6 +431,8 @@ def test_pilot_manifest_writes_exact_selected_images_and_reruns_idempotently(
             '10',
             '--selection-manifest',
             str(manifest_path),
+            '--verified-selection-report',
+            str(verification_path),
             '--report-path',
             str(first_report_path),
         ],
@@ -316,6 +449,8 @@ def test_pilot_manifest_writes_exact_selected_images_and_reruns_idempotently(
             '10',
             '--selection-manifest',
             str(manifest_path),
+            '--verified-selection-report',
+            str(verification_path),
         ],
         app=app,
         source=source,
@@ -324,6 +459,8 @@ def test_pilot_manifest_writes_exact_selected_images_and_reruns_idempotently(
     )
 
     first_report = json.loads(first_report_path.read_text(encoding='utf-8'))
+    assert verification_code == 0
+    assert verification_error is None
     assert first_code == second_code == 0
     assert first_error is second_error is None
     assert first_terminal['options']['selection_manifest'] is True
@@ -334,7 +471,7 @@ def test_pilot_manifest_writes_exact_selected_images_and_reruns_idempotently(
     assert {
         row.source_relative_path for row in ImageAsset.query.all()
     } == set(selected_paths)
-    assert embedding.batch_sizes == [10]
+    assert embedding.batch_sizes == [9]
     assert len(storage.put_calls) == uploaded_object_count
     assert second_terminal['summary']['outcomes'] == {'existing': 10}
 

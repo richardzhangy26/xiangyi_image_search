@@ -5,23 +5,32 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 import time
 import warnings
+from base64 import b64decode
 from collections import Counter, defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence, cast
 from urllib.parse import urlparse
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image
 
 from .embedding import MAX_BATCH_SIZE
-from .image_normalizer import ImageNormalizer
-from .object_source import ReadOnlyObjectSource, SourceObject
+from .image_normalizer import DEFAULT_MAX_EDGE
+from .object_source import ReadOnlyObjectSource, SourceObject, SourceObjectHead
 from .source_preflight import is_image_key, safe_exception_summary
 
 REPORT_SCHEMA_VERSION = 1
+GITHUB_REPOSITORY = "richardzhangy26/xiangyi_image_search"
+GITHUB_OWNER = "richardzhangy26"
+MAX_FULL_AUTHORIZATION_REPORT_AGE = timedelta(hours=24)
 WRITE_MODES = frozenset({"pilot", "full"})
 VERIFY_SELECTION_MODE = "verify-selection"
 REQUIRED_SELECTION_COVERAGE = frozenset({
@@ -35,6 +44,14 @@ REQUIRED_SELECTION_COVERAGE = frozenset({
     "small_source",
 })
 LARGE_SOURCE_BYTES = 20 * 1024 * 1024
+_POSITIVE_APPROVAL_PATTERN = re.compile(
+    r"(?:批准|同意|approve(?:d)?)\s*(?:执行|进行)?\s*(?:全量迁移|full migration)",
+    re.IGNORECASE,
+)
+_NEGATED_APPROVAL_PATTERN = re.compile(
+    r"(?:不|未|暂缓|拒绝|不能)[^\n]{0,12}(?:批准|同意|approve(?:d)?)",
+    re.IGNORECASE,
+)
 REPORT_STAGES = (
     "download",
     "original",
@@ -92,6 +109,54 @@ class LocationCachedObjectSource:
         )
 
 
+class VerifiedSelectionObjectSource:
+    """把已复验的试迁移源图固定为临时快照，消除验证与写入之间的 TOCTOU。"""
+
+    def __init__(
+        self,
+        source: ReadOnlyObjectSource,
+        selected: Sequence[SourceObject],
+        snapshot_root: Path,
+    ):
+        self._source = source
+        self._selected_by_key = {item.key: item for item in selected}
+        self._snapshot_paths = {
+            item.key: snapshot_root / f"source-{index}"
+            for index, item in enumerate(selected)
+        }
+
+    def resolve_location(self):
+        return self._source.resolve_location()
+
+    def iter_objects(self, prefix: str = ""):
+        return self._source.iter_objects(prefix)
+
+    def head_object(self, key: str):
+        selected = self._selected_by_key.get(key)
+        if selected is None:
+            return self._source.head_object(key)
+        return SourceObjectHead(
+            key=key,
+            size=self._snapshot_paths[key].stat().st_size,
+            etag=selected.etag,
+        )
+
+    def download_object(self, key: str, target, *, max_bytes=None):
+        snapshot_path = self._snapshot_paths.get(key)
+        if snapshot_path is None:
+            return self._source.download_object(
+                key,
+                target,
+                max_bytes=max_bytes,
+            )
+        snapshot_size = snapshot_path.stat().st_size
+        if max_bytes is not None and snapshot_size > max_bytes:
+            raise ValueError("试迁移快照超过读取上限")
+        with snapshot_path.open("rb") as snapshot:
+            shutil.copyfileobj(snapshot, target)
+        return snapshot_size
+
+
 @dataclass(frozen=True)
 class RetryReportBinding:
     """retry 报告必须绑定到原来源与原前缀，避免跨环境误迁移。"""
@@ -101,6 +166,42 @@ class RetryReportBinding:
     s3_bucket: str
     prefix: str
     failed_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SelectionVerificationBinding:
+    """成功只读验证报告对受控试迁移样本的不可变声明。"""
+
+    provider: str
+    bucket: str
+    s3_bucket: str
+    prefix: str
+    source_relative_paths: tuple[str, ...]
+    content_hashes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FullMigrationAuthorization:
+    """全量迁移所需的人工审批与只读检查证据绑定。"""
+
+    provider: str
+    bucket: str
+    s3_bucket: str
+    prefix: str
+    issue_9_url: str
+    issue_10_evidence_url: str
+    user_approval_url: str
+    database_backup_reference: str
+    expected_scan: Mapping[str, int]
+    preflight_generated_at: datetime
+    dry_run_generated_at: datetime
+
+
+@dataclass(frozen=True)
+class ReadOnlyReportEvidence:
+    source: Mapping[str, str]
+    generated_at: datetime
+    scan: Mapping[str, int]
 
 
 @dataclass(frozen=True)
@@ -116,6 +217,9 @@ class MigrationOptions:
     retry_enabled: bool = False
     retry_failed_keys: tuple[str, ...] = ()
     retry_binding: Optional[RetryReportBinding] = None
+    selection_verification: Optional[SelectionVerificationBinding] = None
+    full_authorization: Optional[FullMigrationAuthorization] = None
+    selection_max_edge: int = DEFAULT_MAX_EDGE
 
     @classmethod
     def build(
@@ -130,6 +234,9 @@ class MigrationOptions:
         retry_enabled: bool = False,
         retry_failed_keys: Sequence[str] = (),
         retry_binding: Optional[RetryReportBinding] = None,
+        selection_verification: Optional[SelectionVerificationBinding] = None,
+        full_authorization: Optional[FullMigrationAuthorization] = None,
+        selection_max_edge: int = DEFAULT_MAX_EDGE,
     ) -> "MigrationOptions":
         if mode not in {"dry-run", VERIFY_SELECTION_MODE, "pilot", "full"}:
             raise ValueError(
@@ -143,23 +250,21 @@ class MigrationOptions:
         if limit is not None and limit <= 0:
             raise ValueError("--limit 必须大于 0")
         normalized_selection_keys = tuple(selection_keys)
-        if normalized_selection_keys:
-            if retry_enabled or retry_failed_keys or retry_binding is not None:
-                raise ValueError(
-                    "--selection-manifest 不能与 --retry-failed 同时使用"
-                )
-            if mode == "full":
-                raise ValueError(
-                    "--full 不能使用 --selection-manifest"
-                )
-            if mode == "pilot" and len(normalized_selection_keys) != pilot_count:
-                raise ValueError(
-                    "--pilot 数量必须与 --selection-manifest 项数一致"
-                )
-        elif mode == VERIFY_SELECTION_MODE:
-            raise ValueError(
-                "--verify-selection 必须提供 --selection-manifest"
-            )
+        validate_selection_options(
+            mode=mode,
+            selection_keys=normalized_selection_keys,
+            retry_enabled=(
+                retry_enabled or bool(retry_failed_keys) or retry_binding is not None
+            ),
+            pilot_count=pilot_count,
+            selection_verification=selection_verification,
+        )
+        if mode == "full" and full_authorization is None:
+            raise ValueError("--full 必须提供 --full-authorization")
+        if mode != "full" and full_authorization is not None:
+            raise ValueError("--full-authorization 仅可用于 --full")
+        if selection_max_edge <= 0:
+            raise ValueError("图片预览最长边必须大于 0")
         try:
             requested_batch_size = int(batch_size)
         except (TypeError, ValueError) as exc:
@@ -186,13 +291,50 @@ class MigrationOptions:
             retry_enabled=retry_is_enabled,
             retry_failed_keys=tuple(dict.fromkeys(retry_failed_keys)),
             retry_binding=retry_binding,
+            selection_verification=selection_verification,
+            full_authorization=full_authorization,
+            selection_max_edge=selection_max_edge,
         )
 
 
-def load_selection_manifest(report_path: Path) -> tuple[str, ...]:
+def validate_selection_options(
+    *,
+    mode: str,
+    selection_keys: Sequence[str],
+    retry_enabled: bool,
+    pilot_count: Optional[int],
+    selection_verification: Optional[SelectionVerificationBinding],
+    require_selection_verification: bool = True,
+) -> None:
+    """在构造 Kodo 客户端前统一拒绝不安全的样本模式组合。"""
+    if selection_keys:
+        if retry_enabled:
+            raise ValueError("--selection-manifest 不能与 --retry-failed 同时使用")
+        if mode not in {"dry-run", VERIFY_SELECTION_MODE, "pilot"}:
+            raise ValueError(
+                "--selection-manifest 仅可用于 dry-run、verify-selection 或 pilot 模式"
+            )
+    elif mode in {VERIFY_SELECTION_MODE, "pilot"}:
+        raise ValueError(f"--{mode} 必须提供 --selection-manifest")
+
+    if mode == "pilot":
+        if pilot_count != 10 or len(selection_keys) != 10:
+            raise ValueError("--pilot 仅允许受控的 10 张清单试迁移")
+        if require_selection_verification and selection_verification is None:
+            raise ValueError("--pilot 必须提供 --verified-selection-report")
+        if (
+            selection_verification is not None
+            and selection_verification.source_relative_paths != tuple(selection_keys)
+        ):
+            raise ValueError("验证报告与 --selection-manifest 的来源路径或顺序不一致")
+    elif selection_verification is not None:
+        raise ValueError("--verified-selection-report 仅可用于 --pilot")
+
+
+def load_selection_manifest(manifest_path: Path) -> tuple[str, ...]:
     """读取受控试迁移的有序来源路径清单。"""
     try:
-        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise MigrationError(
             "selection_manifest",
@@ -221,6 +363,527 @@ def load_selection_manifest(report_path: Path) -> tuple[str, ...]:
             "source_relative_paths 必须是非空且唯一的字符串数组",
         )
     return tuple(source_relative_paths)
+
+
+def load_selection_verification_report(
+    report_path: Path,
+) -> SelectionVerificationBinding:
+    """读取成功的选样验证报告；报告中的路径和哈希将于写入前再次核验。"""
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise MigrationError(
+            "selection_verification",
+            safe_exception_summary(exc),
+        ) from exc
+
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != REPORT_SCHEMA_VERSION
+        or payload.get("mode") != VERIFY_SELECTION_MODE
+        or payload.get("status") != "ok"
+        or payload.get("read_only") is not True
+    ):
+        raise MigrationError(
+            "selection_verification",
+            "验证报告不是成功的 verify-selection 报告",
+        )
+    source = _require_source_binding(
+        payload.get("source"),
+        stage="selection_verification",
+    )
+    verification = payload.get("verification")
+    if (
+        not isinstance(verification, dict)
+        or verification.get("missing") != []
+        or not REQUIRED_SELECTION_COVERAGE.issubset(
+            set(verification.get("covered", []))
+        )
+    ):
+        raise MigrationError(
+            "selection_verification",
+            "验证报告未覆盖所有必需的 #10 样本类别",
+        )
+    items = payload.get("items")
+    if not isinstance(items, list) or len(items) != 10:
+        raise MigrationError(
+            "selection_verification",
+            "验证报告必须包含恰好 10 个已验证样本",
+        )
+
+    paths: list[str] = []
+    hashes: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise MigrationError("selection_verification", "验证报告项格式无效")
+        path = item.get("source_relative_path")
+        content_hash = item.get("content_hash")
+        if (
+            item.get("status") != "verified"
+            or not isinstance(path, str)
+            or not path
+            or not isinstance(content_hash, str)
+            or len(content_hash) != 64
+            or any(character not in "0123456789abcdef" for character in content_hash)
+        ):
+            raise MigrationError(
+                "selection_verification",
+                "验证报告包含未验证样本或无效哈希",
+            )
+        paths.append(path)
+        hashes.append(content_hash)
+    if len(set(paths)) != len(paths):
+        raise MigrationError("selection_verification", "验证报告包含重复来源路径")
+
+    return SelectionVerificationBinding(
+        **source,
+        source_relative_paths=tuple(paths),
+        content_hashes=tuple(hashes),
+    )
+
+
+def load_full_migration_authorization(
+    authorization_path: Path,
+) -> FullMigrationAuthorization:
+    """读取并校验全量迁移的人工批准、备份和本次只读检查证据。"""
+    try:
+        payload = json.loads(authorization_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise MigrationError(
+            "full_authorization",
+            safe_exception_summary(exc),
+        ) from exc
+
+    expected_fields = {
+        "issue_9_url",
+        "issue_10_evidence_url",
+        "user_approval_url",
+        "database_backup_reference",
+        "preflight_report",
+        "dry_run_report",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_fields:
+        raise MigrationError(
+            "full_authorization",
+            "授权文件字段必须完整且不含未识别字段",
+        )
+    issue_9_url = _require_github_issue_url(
+        payload.get("issue_9_url"),
+        issue_number=9,
+        require_comment=False,
+    )
+    issue_10_evidence_url = _require_github_issue_url(
+        payload.get("issue_10_evidence_url"),
+        issue_number=10,
+        require_comment=True,
+    )
+    user_approval_url = _require_approval_reference(
+        payload.get("user_approval_url"),
+    )
+    database_backup_reference = payload.get("database_backup_reference")
+    if (
+        not isinstance(database_backup_reference, str)
+        or not database_backup_reference.strip()
+    ):
+        raise MigrationError(
+            "full_authorization",
+            "授权文件必须记录数据库备份或恢复点标识",
+        )
+    preflight_evidence = _load_attested_read_only_report(
+        authorization_path,
+        payload.get("preflight_report"),
+        expected_mode="preflight",
+    )
+    dry_run_evidence = _load_attested_read_only_report(
+        authorization_path,
+        payload.get("dry_run_report"),
+        expected_mode="dry-run",
+    )
+    if preflight_evidence.source != dry_run_evidence.source:
+        raise MigrationError(
+            "full_authorization",
+            "preflight 与 dry-run 报告的来源绑定不一致",
+        )
+    if preflight_evidence.scan != dry_run_evidence.scan:
+        raise MigrationError(
+            "full_authorization",
+            "preflight 与 dry-run 报告的完整扫描统计不一致",
+        )
+    now = datetime.now().astimezone()
+    if (
+        preflight_evidence.generated_at > dry_run_evidence.generated_at
+        or now - preflight_evidence.generated_at
+        > MAX_FULL_AUTHORIZATION_REPORT_AGE
+        or now - dry_run_evidence.generated_at
+        > MAX_FULL_AUTHORIZATION_REPORT_AGE
+        or preflight_evidence.generated_at > now
+        or dry_run_evidence.generated_at > now
+    ):
+        raise MigrationError(
+            "full_authorization",
+            "preflight 与 dry-run 必须在过去 24 小时内按顺序重新执行",
+        )
+
+    return FullMigrationAuthorization(
+        **preflight_evidence.source,
+        issue_9_url=issue_9_url,
+        issue_10_evidence_url=issue_10_evidence_url,
+        user_approval_url=user_approval_url,
+        database_backup_reference=database_backup_reference.strip(),
+        expected_scan=preflight_evidence.scan,
+        preflight_generated_at=preflight_evidence.generated_at,
+        dry_run_generated_at=dry_run_evidence.generated_at,
+    )
+
+
+def _load_attested_read_only_report(
+    authorization_path: Path,
+    value: object,
+    *,
+    expected_mode: str,
+) -> ReadOnlyReportEvidence:
+    if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
+        raise MigrationError(
+            "full_authorization",
+            f"{expected_mode} 报告引用格式无效",
+        )
+    raw_path = value.get("path")
+    expected_hash = value.get("sha256")
+    if (
+        not isinstance(raw_path, str)
+        or not raw_path
+        or not isinstance(expected_hash, str)
+        or len(expected_hash) != 64
+        or any(character not in "0123456789abcdef" for character in expected_hash)
+    ):
+        raise MigrationError(
+            "full_authorization",
+            f"{expected_mode} 报告引用格式无效",
+        )
+    report_path = Path(raw_path)
+    if not report_path.is_absolute():
+        report_path = authorization_path.parent / report_path
+    try:
+        report_bytes = report_path.read_bytes()
+        payload = json.loads(report_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise MigrationError(
+            "full_authorization",
+            safe_exception_summary(exc),
+        ) from exc
+    if hashlib.sha256(report_bytes).hexdigest() != expected_hash:
+        raise MigrationError(
+            "full_authorization",
+            f"{expected_mode} 报告的 SHA-256 与授权文件不一致",
+        )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("status") != "ok"
+        or payload.get("mode") != expected_mode
+        or payload.get("read_only") is not True
+    ):
+        raise MigrationError(
+            "full_authorization",
+            f"{expected_mode} 报告不是成功的只读检查结果",
+        )
+    generated_at = _require_report_timestamp(payload.get("generated_at"))
+    source = _require_source_binding(
+        payload.get("source"), stage="full_authorization"
+    )
+    return ReadOnlyReportEvidence(
+        source=source,
+        generated_at=generated_at,
+        scan=_read_only_scan(payload, expected_mode=expected_mode),
+    )
+
+
+def _require_report_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise MigrationError("full_authorization", "只读报告缺少生成时间")
+    try:
+        generated_at = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise MigrationError("full_authorization", "只读报告生成时间无效") from exc
+    if generated_at.tzinfo is None:
+        raise MigrationError("full_authorization", "只读报告生成时间必须包含时区")
+    return generated_at
+
+
+def _read_only_scan(
+    payload: Mapping[str, Any],
+    *,
+    expected_mode: str,
+) -> dict[str, int]:
+    if expected_mode == "preflight":
+        objects = payload.get("total_objects")
+        images = payload.get("image_objects")
+        total_bytes = payload.get("total_bytes")
+        non_images = (
+            objects - images
+            if isinstance(objects, int) and isinstance(images, int)
+            else None
+        )
+    else:
+        summary = payload.get("summary")
+        scan = summary.get("scan") if isinstance(summary, dict) else None
+        if not isinstance(scan, dict):
+            raise MigrationError("full_authorization", "dry-run 报告缺少完整扫描统计")
+        assert isinstance(summary, dict)
+        objects = scan.get("objects")
+        images = scan.get("images")
+        non_images = scan.get("non_images")
+        total_bytes = scan.get("bytes")
+        selection = summary.get("selection")
+        items = payload.get("items")
+        if (
+            not isinstance(selection, dict)
+            or selection.get("images") != images
+            or selection.get("bytes") != total_bytes
+            or not isinstance(items, list)
+            or len(items) != images
+        ):
+            raise MigrationError(
+                "full_authorization",
+                "dry-run 报告不是完整可审计的盘点结果",
+            )
+        options = payload.get("options")
+        retry = payload.get("retry")
+        if (
+            not isinstance(options, dict)
+            or options.get("limit") is not None
+            or options.get("selection_manifest") is not False
+            or not isinstance(retry, dict)
+            or retry.get("enabled") is not False
+        ):
+            raise MigrationError(
+                "full_authorization",
+                "dry-run 报告必须覆盖完整来源范围",
+            )
+    if (
+        not isinstance(objects, int)
+        or objects < 0
+        or not isinstance(images, int)
+        or images < 0
+        or not isinstance(non_images, int)
+        or non_images < 0
+        or not isinstance(total_bytes, int)
+        or total_bytes < 0
+        or images + non_images != objects
+    ):
+        raise MigrationError("full_authorization", "只读报告扫描统计无效")
+    return {
+        "objects": objects,
+        "images": images,
+        "non_images": non_images,
+        "bytes": total_bytes,
+    }
+
+
+def _require_source_binding(value: object, *, stage: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise MigrationError(stage, "报告缺少来源绑定")
+    source = {
+        "provider": value.get("provider"),
+        "bucket": value.get("bucket"),
+        "s3_bucket": value.get("s3_bucket"),
+        "prefix": value.get("prefix"),
+    }
+    if (
+        not isinstance(source["provider"], str)
+        or not source["provider"]
+        or not isinstance(source["bucket"], str)
+        or not source["bucket"]
+        or not isinstance(source["s3_bucket"], str)
+        or not source["s3_bucket"]
+        or not isinstance(source["prefix"], str)
+    ):
+        raise MigrationError(stage, "报告来源绑定无效")
+    return cast(dict[str, str], source)
+
+
+def _require_github_issue_url(
+    value: object,
+    *,
+    issue_number: int,
+    require_comment: bool,
+) -> str:
+    if not isinstance(value, str):
+        raise MigrationError("full_authorization", "授权文件中的 GitHub Issue URL 无效")
+    parsed = urlparse(value)
+    expected_path = f"/{GITHUB_REPOSITORY}/issues/{issue_number}"
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "github.com"
+        or parsed.path != expected_path
+        or (require_comment and _issue_comment_id(parsed.fragment) is None)
+    ):
+        raise MigrationError(
+            "full_authorization",
+            f"URL 必须指向本仓库 Issue #{issue_number}"
+            + (" 的评论" if require_comment else ""),
+        )
+    return value
+
+
+def _require_approval_reference(value: object) -> str:
+    if not isinstance(value, str):
+        raise MigrationError("full_authorization", "用户批准引用无效")
+    parsed = urlparse(value)
+    issue_path = f"/{GITHUB_REPOSITORY}/issues/10"
+    is_issue_comment = (
+        parsed.scheme == "https"
+        and parsed.netloc == "github.com"
+        and parsed.path == issue_path
+        and _issue_comment_id(parsed.fragment) is not None
+    )
+    path_parts = parsed.path.split("/")
+    is_parent_prd = (
+        parsed.scheme == "https"
+        and parsed.netloc == "github.com"
+        and path_parts[:4] == ["", *GITHUB_REPOSITORY.split("/"), "blob"]
+        and len(path_parts) >= 6
+    )
+    if not (is_issue_comment or is_parent_prd):
+        raise MigrationError(
+            "full_authorization",
+            "用户批准必须是本仓库 Issue #10 评论或父 PRD 的 GitHub 文件链接",
+        )
+    return value
+
+
+def verify_full_migration_authorization(
+    authorization: FullMigrationAuthorization,
+) -> None:
+    """通过 GitHub API 验证 #9、#10 证据和仓库所有者的明确批准。"""
+    issue_9 = _github_api_json(f"repos/{GITHUB_REPOSITORY}/issues/9")
+    if issue_9.get("state") != "closed":
+        raise MigrationError("full_authorization", "Issue #9 尚未完成")
+    issue_10 = _github_api_json(f"repos/{GITHUB_REPOSITORY}/issues/10")
+    if issue_10.get("state") != "closed":
+        raise MigrationError("full_authorization", "Issue #10 尚未完成")
+
+    evidence_comment = _github_api_json(
+        _issue_comment_endpoint(authorization.issue_10_evidence_url)
+    )
+    evidence_body = evidence_comment.get("body")
+    if (
+        not _comment_belongs_to_issue_10(evidence_comment)
+        or not isinstance(evidence_body, str)
+        or not _has_issue_10_evidence(evidence_body)
+    ):
+        raise MigrationError(
+            "full_authorization",
+            "Issue #10 证据评论必须说明 preflight、dry-run 与试迁移验收",
+        )
+
+    parsed_approval = urlparse(authorization.user_approval_url)
+    approval_comment_id = _issue_comment_id(parsed_approval.fragment)
+    if approval_comment_id is not None:
+        approval = _github_api_json(
+            f"repos/{GITHUB_REPOSITORY}/issues/comments/{approval_comment_id}"
+        )
+        approval_body = approval.get("body")
+        login = (approval.get("user") or {}).get("login")
+        if (
+            not _comment_belongs_to_issue_10(approval)
+            or login != GITHUB_OWNER
+            or not isinstance(approval_body, str)
+        ):
+            raise MigrationError(
+                "full_authorization",
+                "全量批准必须由仓库所有者在 Issue #10 评论中明确给出",
+            )
+        approval_text = approval_body
+    else:
+        approval_text = _github_prd_content(parsed_approval)
+
+    if not _has_explicit_full_approval(approval_text):
+        raise MigrationError(
+            "full_authorization",
+            "用户批准内容未包含明确的全量迁移批准",
+        )
+
+
+def _github_api_json(endpoint: str) -> Mapping[str, Any]:
+    try:
+        completed = subprocess.run(
+            ["gh", "api", endpoint],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise MigrationError(
+            "full_authorization",
+            safe_exception_summary(exc),
+        ) from exc
+    if completed.returncode != 0:
+        raise MigrationError(
+            "full_authorization",
+            "无法通过 GitHub API 验证全量授权",
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise MigrationError(
+            "full_authorization",
+            "GitHub API 返回了无效响应",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise MigrationError(
+            "full_authorization",
+            "GitHub API 返回了无效授权数据",
+        )
+    return payload
+
+
+def _issue_comment_id(fragment: str) -> Optional[str]:
+    match = re.fullmatch(r"issuecomment-(\d+)", fragment)
+    return match.group(1) if match else None
+
+
+def _issue_comment_endpoint(url: str) -> str:
+    comment_id = _issue_comment_id(urlparse(url).fragment)
+    if comment_id is None:
+        raise MigrationError("full_authorization", "Issue #10 证据链接不是评论")
+    return f"repos/{GITHUB_REPOSITORY}/issues/comments/{comment_id}"
+
+
+def _has_issue_10_evidence(body: str) -> bool:
+    lowered = body.lower()
+    return "preflight" in lowered and "dry-run" in lowered and (
+        "pilot" in lowered or "试迁移" in body
+    )
+
+
+def _comment_belongs_to_issue_10(comment: Mapping[str, Any]) -> bool:
+    return comment.get("issue_url") == (
+        f"https://api.github.com/repos/{GITHUB_REPOSITORY}/issues/10"
+    )
+
+
+def _has_explicit_full_approval(text: str) -> bool:
+    return bool(
+        _POSITIVE_APPROVAL_PATTERN.search(text)
+        and not _NEGATED_APPROVAL_PATTERN.search(text)
+    )
+
+
+def _github_prd_content(parsed_url) -> str:
+    path_parts = parsed_url.path.split("/")
+    ref = path_parts[4]
+    content_path = "/".join(path_parts[5:])
+    payload = _github_api_json(
+        f"repos/{GITHUB_REPOSITORY}/contents/{content_path}?ref={ref}"
+    )
+    content = payload.get("content")
+    encoding = payload.get("encoding")
+    if not isinstance(content, str) or encoding != "base64":
+        raise MigrationError("full_authorization", "父 PRD 内容不可读取")
+    try:
+        return b64decode(content).decode("utf-8")
+    except (ValueError, UnicodeError) as exc:
+        raise MigrationError("full_authorization", "父 PRD 内容不可读取") from exc
 
 
 def load_retry_report(report_path: Path) -> RetryReportBinding:
@@ -287,6 +950,7 @@ def run_migration(
 ) -> dict[str, Any]:
     """扫描 Kodo，并在显式写模式下调用统一资产批量入库服务。"""
     started_at = time.monotonic()
+    generated_at = datetime.now().astimezone().isoformat()
     cached_source = (
         source
         if isinstance(source, LocationCachedObjectSource)
@@ -322,41 +986,84 @@ def run_migration(
         item_reports, verification = _verify_selected_images(
             cached_source,
             selected,
+            max_preview_edge=options.selection_max_edge,
         )
     elif options.mode in WRITE_MODES:
-        if ingest_service_factory is None:
-            raise MigrationError(
-                "config",
-                "写模式缺少图片资产入库服务",
-            )
-        try:
-            if before_write is not None:
-                before_write()
-            service = ingest_service_factory(cached_source)
-        except MigrationError:
-            raise
-        except Exception as exc:
-            raise MigrationError(
-                "write_preflight",
-                safe_exception_summary(exc),
-            ) from exc
-        try:
-            results = []
-            selected_keys = [item.key for item in selected]
-            for offset in range(0, len(selected_keys), options.batch_size):
-                batch = selected_keys[offset:offset + options.batch_size]
-                results.extend(
-                    service.ingest_many(
-                        batch,
-                        batch_size=options.batch_size,
-                    )
+        write_context = (
+            tempfile.TemporaryDirectory(prefix="kodo-pilot-snapshot-")
+            if options.mode == "pilot"
+            else nullcontext(None)
+        )
+        with write_context as temporary_directory:
+            ingest_source: ReadOnlyObjectSource = cached_source
+            if options.mode == "pilot":
+                if temporary_directory is None:
+                    raise MigrationError("config", "试迁移快照目录不可用")
+                snapshot_root = Path(temporary_directory)
+                item_reports, verification = _verify_selected_images(
+                    cached_source,
+                    selected,
+                    max_preview_edge=options.selection_max_edge,
+                    snapshot_root=snapshot_root,
                 )
-        except Exception as exc:
-            raise MigrationError(
-                "ingest",
-                safe_exception_summary(exc),
-            ) from exc
-        item_reports = _result_reports(selected, results)
+                _validate_current_selection_verification(
+                    options.selection_verification,
+                    location,
+                    options.prefix,
+                    selected,
+                    item_reports,
+                    verification,
+                )
+                ingest_source = VerifiedSelectionObjectSource(
+                    cached_source,
+                    selected,
+                    snapshot_root,
+                )
+            if options.mode == "full":
+                _validate_full_authorization(
+                    options.full_authorization,
+                    location,
+                    options.prefix,
+                    current_scan={
+                        "objects": len(objects),
+                        "images": len(image_objects),
+                        "non_images": len(objects) - len(image_objects),
+                        "bytes": sum(item.size for item in objects),
+                    },
+                )
+            if ingest_service_factory is None:
+                raise MigrationError(
+                    "config",
+                    "写模式缺少图片资产入库服务",
+                )
+            try:
+                if before_write is not None:
+                    before_write()
+                service = ingest_service_factory(ingest_source)
+            except MigrationError:
+                raise
+            except Exception as exc:
+                raise MigrationError(
+                    "write_preflight",
+                    safe_exception_summary(exc),
+                ) from exc
+            try:
+                results = []
+                selected_keys = [item.key for item in selected]
+                for offset in range(0, len(selected_keys), options.batch_size):
+                    batch = selected_keys[offset:offset + options.batch_size]
+                    results.extend(
+                        service.ingest_many(
+                            batch,
+                            batch_size=options.batch_size,
+                        )
+                    )
+            except Exception as exc:
+                raise MigrationError(
+                    "ingest",
+                    safe_exception_summary(exc),
+                ) from exc
+            item_reports = _result_reports(selected, results)
     else:
         item_reports = [
             {
@@ -386,6 +1093,7 @@ def run_migration(
 
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
+        "generated_at": generated_at,
         "status": "completed_with_issues" if has_issues else "ok",
         "mode": options.mode,
         "read_only": options.mode not in WRITE_MODES,
@@ -441,19 +1149,25 @@ def run_migration(
 def _verify_selected_images(
     source: ReadOnlyObjectSource,
     selected: Sequence[SourceObject],
+    *,
+    max_preview_edge: int,
+    snapshot_root: Optional[Path] = None,
 ) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
-    max_preview_edge = ImageNormalizer.from_env().max_edge
-    with tempfile.TemporaryDirectory(prefix="kodo-selection-") as directory:
-        temporary_root = Path(directory)
-        reports = [
-            _verify_selected_image(
+    if snapshot_root is None:
+        with tempfile.TemporaryDirectory(prefix="kodo-selection-") as directory:
+            reports = _verify_selected_images_at_root(
                 source,
-                source_object,
-                temporary_root / f"source-{index}",
+                selected,
+                temporary_root=Path(directory),
                 max_preview_edge=max_preview_edge,
             )
-            for index, source_object in enumerate(selected)
-        ]
+    else:
+        reports = _verify_selected_images_at_root(
+            source,
+            selected,
+            temporary_root=snapshot_root,
+            max_preview_edge=max_preview_edge,
+        )
 
     hashes = Counter(
         report["content_hash"]
@@ -472,6 +1186,25 @@ def _verify_selected_images(
         "covered": covered,
         "missing": sorted(REQUIRED_SELECTION_COVERAGE - set(covered)),
     }
+
+
+def _verify_selected_images_at_root(
+    source: ReadOnlyObjectSource,
+    selected: Sequence[SourceObject],
+    *,
+    temporary_root: Path,
+    max_preview_edge: int,
+) -> list[dict[str, Any]]:
+    temporary_root.mkdir(parents=True, exist_ok=True)
+    return [
+        _verify_selected_image(
+            source,
+            source_object,
+            temporary_root / f"source-{index}",
+            max_preview_edge=max_preview_edge,
+        )
+        for index, source_object in enumerate(selected)
+    ]
 
 
 def _verify_selected_image(
@@ -501,14 +1234,6 @@ def _verify_selected_image(
                 image.load()
                 image_format = image.format or "UNKNOWN"
                 width, height = image.size
-    except (
-        Image.DecompressionBombError,
-        Image.DecompressionBombWarning,
-        UnidentifiedImageError,
-        OSError,
-        ValueError,
-    ) as exc:
-        return _verification_failure(source_object, exc)
     except Exception as exc:
         return _verification_failure(source_object, exc)
 
@@ -522,6 +1247,7 @@ def _verify_selected_image(
         "source_height": height,
         "coverage_tags": _selection_coverage_tags(
             source_object,
+            source_size=actual_size,
             image_format=image_format,
             width=width,
             height=height,
@@ -563,6 +1289,7 @@ def _hash_file(path: Path) -> str:
 def _selection_coverage_tags(
     source_object: SourceObject,
     *,
+    source_size: int,
     image_format: str,
     width: int,
     height: int,
@@ -584,11 +1311,90 @@ def _selection_coverage_tags(
         tags.append("png")
     elif normalized_format == "WEBP":
         tags.append("webp")
-    if source_object.size > LARGE_SOURCE_BYTES:
+    if source_size > LARGE_SOURCE_BYTES:
         tags.append("over_20_mib")
     if max(width, height) <= max_preview_edge:
         tags.append("small_source")
     return tags
+
+
+def _validate_current_selection_verification(
+    binding: Optional[SelectionVerificationBinding],
+    location,
+    prefix: str,
+    selected: Sequence[SourceObject],
+    item_reports: Sequence[Mapping[str, Any]],
+    verification: Mapping[str, Sequence[str]],
+) -> None:
+    """在任何写端构造前确认 Kodo 当前内容仍等于已批准的验证样本。"""
+    if binding is None:
+        raise MigrationError(
+            "selection_verification",
+            "试迁移缺少成功的选样验证报告",
+        )
+    if (
+        binding.provider != "qiniu-kodo"
+        or binding.bucket != location.source_bucket
+        or binding.s3_bucket != location.s3_bucket
+        or binding.prefix != prefix
+    ):
+        raise MigrationError(
+            "selection_verification",
+            "验证报告的来源绑定与当前 Kodo 来源不一致",
+        )
+    selected_paths = tuple(item.key for item in selected)
+    if binding.source_relative_paths != selected_paths:
+        raise MigrationError(
+            "selection_verification",
+            "验证报告与当前选样清单不一致",
+        )
+    if verification.get("missing"):
+        raise MigrationError(
+            "selection_verification",
+            "当前来源不再覆盖所有必需的 #10 样本类别",
+        )
+    current_hashes = tuple(
+        item.get("content_hash")
+        for item in item_reports
+        if item.get("status") == "verified"
+    )
+    if (
+        len(current_hashes) != len(selected)
+        or current_hashes != binding.content_hashes
+    ):
+        raise MigrationError(
+            "selection_verification",
+            "当前来源内容与成功验证报告不一致",
+        )
+
+
+def _validate_full_authorization(
+    authorization: Optional[FullMigrationAuthorization],
+    location,
+    prefix: str,
+    *,
+    current_scan: Mapping[str, int],
+) -> None:
+    if authorization is None:
+        raise MigrationError(
+            "full_authorization",
+            "全量迁移缺少受控授权文件",
+        )
+    if (
+        authorization.provider != "qiniu-kodo"
+        or authorization.bucket != location.source_bucket
+        or authorization.s3_bucket != location.s3_bucket
+        or authorization.prefix != prefix
+    ):
+        raise MigrationError(
+            "full_authorization",
+            "授权文件的只读检查来源与当前运行不一致",
+        )
+    if dict(authorization.expected_scan) != dict(current_scan):
+        raise MigrationError(
+            "full_authorization",
+            "当前 Kodo 完整扫描与授权文件中的只读基线不一致",
+        )
 
 
 def _validate_retry_binding(options: MigrationOptions, location) -> None:

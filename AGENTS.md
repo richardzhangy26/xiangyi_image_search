@@ -84,6 +84,7 @@ SET LOCAL 保证连接归还连接池时不污染后续请求；服务在成功�
 
 - React 18 + TypeScript + Vite；Ant Design 5 和 Tailwind CSS。
 - ProductSearch（以图搜款）和 ProductUpload（产品管理）是当前路由组件。
+- ProductUpload 默认展示待归款图片，支持按来源路径搜索、分页、多选并关联既有型号；不自动推断或创建型号，也不提供解绑、跨型号改绑。
 - 前端通过 /api/ 访问后端；Nginx 只代理 API，不提供本地图片静态源。
 - 图片卡片使用私有预览入口，浏览器跟随 302 获取短时签名地址。
 
@@ -205,6 +206,7 @@ python -m pytest test/ --ignore=test/integration -v
 - 不在应用启动、普通部署或健康检查中隐式运行兼容审计或迁移。
 - Legacy TypeScript 组件（如 OrderManagement）未路由且可能有类型错误，除非重新启用，否则不要顺手修复。
 - 如果 Docker 报告历史容器名称冲突，只处理明确冲突的容器；不要删除数据库卷。
+- 完成稳定功能后，仅在改变架构事实、入口或操作约束时更新最近作用域的 AGENTS.md；记录当前事实，不记录实现过程。
 
 ## Agent skills
 

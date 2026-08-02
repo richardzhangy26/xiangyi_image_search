@@ -57,6 +57,10 @@ def test_retired_code_is_not_importable_or_referenced():
     assert importlib.util.find_spec('services.ingest') is None
     assert importlib.util.find_spec('blueprints.oss') is None
     assert not repo_file('backend/scripts/batch_upload_oss.py').exists()
+    assert not repo_file('backend/scripts/oss_uploader.py').exists()
+    assert not repo_file('backend/blueprints/products.py').exists()
+    assert not repo_file('backend/create_tables.sql').exists()
+    assert not repo_file('backend/services/parse_service.py').exists()
     active_sources = [
         repo_file('backend/app.py'),
         repo_file('backend/blueprints/products_v2.py'),
@@ -82,3 +86,14 @@ def test_legacy_ingest_write_mode_refuses_before_scanning(monkeypatch, tmp_path)
         match='已停用',
     ):
         ingest_images.run(object(), str(tmp_path), dry_run=False)
+
+
+def test_operational_docs_name_oss_as_authoritative_store():
+    agents = repo_file('AGENTS.md').read_text(encoding='utf-8')
+    migration = repo_file(
+        'backend/scripts/README_OSS_MIGRATION.md'
+    ).read_text(encoding='utf-8')
+    assert 'OSS 已成为正式图片源' in agents
+    assert 'Kodo 只读备份' in agents
+    assert 'python -m scripts.audit_legacy_product_images' in migration
+    assert 'python -m scripts.ingest_images --root' not in agents

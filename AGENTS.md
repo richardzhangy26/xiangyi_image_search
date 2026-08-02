@@ -2,265 +2,220 @@
 
 This file provides guidance to AI coding agents (Claude Code, Qoder, etc.) when working with code in this repository.
 
-## Project Overview
+## 项目概览
 
-**电子产品配件图像搜索系统 (Electronic Accessories Image Search System)** - AI-powered image search and product management system designed for camera straps, lanyards, and other electronic product accessories. Implements reverse image search (以图搜图) using Tongyi multimodal embeddings and PostgreSQL pgvector similarity search.
+**电子产品配件图像搜索系统 (Electronic Accessories Image Search System)** 面向跨境电商卖家和批发采购，使用通义多模态 embedding 与 PostgreSQL/pgvector 完成以图搜款。
 
-**Key Business Context**:
-- Target users: Cross-border e-commerce sellers, wholesale buyers
-- Use case: Quickly find products matching customer inquiry images
-- Core feature: Upload an image → find visually similar products in database
-- Data ownership: Local PostgreSQL plus a private Aliyun OSS image-asset prefix; credentials remain local
+- 用户上传一张图片后，系统从 image_assets 检索视觉相似的图片资产。
+- **OSS 已成为正式图片源**：原图和规范化预览都存放在私有 Aliyun OSS 的隔离前缀中。
+- Kodo 是迁移期间的**Kodo 只读备份**，只能由受控迁移命令读取，不能作为公开 URL 来源。
+- PostgreSQL 保存商品元数据、图片资产元数据和向量；凭证只保留在本地环境文件中。
 
-## Architecture
+## 架构
 
-### Backend (Flask + Python)
-- **Framework**: Flask with Flask-SQLAlchemy ORM
-- **Database**: Local PostgreSQL 16 + pgvector extension (database: `image_search`)
-  - Runs in Docker via `pgvector/pgvector:pg16` image
-  - ⚠️ Supabase / MySQL / SQLite / FAISS are all **fully removed** (July 2026 migration)
-- **AI Pipeline**:
-  - DashScope `tongyi-embedding-vision-plus-2026-03-06` model (Qwen3-based) generates **1024-dim** vectors
-  - Model + dimension defined as constants `EMBEDDING_MODEL` / `EMBEDDING_DIMENSION` in [backend/services/embedding.py](backend/services/embedding.py)（`backend/product_search.py` 兼容层再导出同名符号）
-  - pgvector performs in-database cosine similarity search with HNSW index
-  - **Stateless architecture**: No in-memory index, vectors stored natively in PostgreSQL
-- **Storage**:
-  - Independent `image_assets` store original bytes and normalized previews in private Aliyun OSS under the isolated `image-search/` prefix
-  - Legacy `product_images` still use `backend/uploads/product_images/{model_number}/`; Issue #6 intentionally keeps that flow intact
-- **Dev environment**: miniconda `base` env (`~/miniconda3/bin/python`), Python 3.9+
+### 后端 (Flask + Python)
 
-**Critical Files**:
-- [backend/app.py](backend/app.py) - Flask app init, DB config (`DATABASE_URL` or `DB_*` vars), CORS, blueprint registration, root logger config (`logging.basicConfig`)
-- [backend/services/embedding.py](backend/services/embedding.py) - `EmbeddingClient`: DashScope 调用，单张 + 批量（**硬上限 20 张/请求**）、429 重试、批失败降级为单张
-- [backend/models/image_asset.py](backend/models/image_asset.py) - 独立 `ImageAsset` 模型；型号可空、Product 删除时 `SET NULL`
-- [backend/services/image_normalizer.py](backend/services/image_normalizer.py) - EXIF、尺寸、透明背景、动图首帧和 2.5 MiB 硬上限
-- [backend/services/object_storage.py](backend/services/object_storage.py) - 私有 OSS HEAD/无覆盖上传/短时签名适配
-- [backend/services/asset_ingest.py](backend/services/asset_ingest.py) - 单张 Kodo 来源图片到 OSS、embedding 和 PostgreSQL 的纵向入库服务
-- [backend/services/vector_search.py](backend/services/vector_search.py) - `VectorSearchService`: pgvector 检索，SQL 内过采样 + `DISTINCT ON` 按型号折叠
-- [backend/services/ingest.py](backend/services/ingest.py) - `ImageIngestService`: SHA-256 全库去重 + 哈希命名落盘 + 入库，CLI 与 API 共用
-- [backend/product_search.py](backend/product_search.py) - 兼容层，仅再导出 `services/` 中的符号（`ImageSearchService = VectorSearchService`）
-- [backend/scripts/ingest_images.py](backend/scripts/ingest_images.py) - 目录批量导入 CLI
-- [backend/blueprints/products_v2.py](backend/blueprints/products_v2.py) - Product CRUD API（prefix `/api/products`）
-- [backend/blueprints/image_assets.py](backend/blueprints/image_assets.py) - 私有图片资产预览 302（prefix `/api/image-assets`）
-- [backend/models/product.py](backend/models/product.py) - `Product` / `ProductImage` SQLAlchemy models (pgvector `Vector(1024)`)
-- [backend/init_db.py](backend/init_db.py) - One-shot init: `CREATE EXTENSION vector` + `create_all()` + HNSW index
-- [postgres/init/01_init.sql](postgres/init/01_init.sql) - Docker auto-init SQL (extension + tables + HNSW index); keep in sync with models
+- Flask + Flask-SQLAlchemy。
+- PostgreSQL 16 + pgvector（数据库 image_search），由 Docker 提供。
+- DashScope tongyi-embedding-vision-plus-2026-03-06 生成 1024 维向量；向量在数据库内按余弦距离检索。
+- 无进程内向量索引，服务重启不会丢失检索数据。
 
-### Embedding Model (Tongyi / 通义千问)
+### 正式图片工作流
 
-| Item | Value |
-|------|-------|
-| Model | `tongyi-embedding-vision-plus-2026-03-06` (Qwen3 base) |
-| Dimension | 1024 (via `dimension` param; must match DB `vector(1024)` column) |
-| Metric | Cosine distance (embeddings normalized) |
-| Image cost | ~402 tokens/image at default `res_level=1` → ≈¥0.0002/image (0.0005元/千token) |
-| Text support | 30+ languages, same vector space as images → **text-to-image search works** |
-| Fusion vectors | Supported by putting text+image in one content object (future: image+instruction queries) |
+1. scripts.migrate_kodo_to_oss 对 Kodo 做只读 preflight、盘点和经授权的迁移；Kodo 不执行 Put/Delete。
+2. 迁移或产品上传经过 ImageAssetIngestService：在私有 OSS 中无覆盖写入原图和 preview-v1 预览，然后写入 image_assets 及其向量。
+3. VectorSearchService 只检索 image_assets.status = active 的向量。
+4. API 只返回资产 ID 和 /api/image-assets/<asset_id>/preview；该入口生成短时签名 URL 并返回私有 302，不保存或拼接公开 URL。
 
-**Key facts**:
-- Text and image vectors share one embedding space: a future natural-language product search endpoint only needs to embed the query text with the **same model** and reuse the existing cosine SQL query.
-- Never mix vectors from different models in one table — vector spaces are incompatible. Changing the model requires regenerating all vectors.
-- Cross-modal (text↔image) similarity values are much lower than image↔image; rank by top-k, do not apply absolute thresholds.
-- Legacy `multimodal-embedding-v1` was replaced (more expensive, weaker text-image alignment).
+product_images 是**未修改的退休兼容表**，不属于新库 schema、应用 ORM 或活动写路径。任何另行授权的兼容迁移前，先运行 python -m scripts.audit_legacy_product_images，根据只读审计结果制作人工迁移清单；本仓库不自动迁移、删除或覆盖它，也不物理清理旧对象。
 
-**Vector Search Workflow**:
-1. **Legacy product indexing**: Image upload → DashScope API (base64 Data URI, auto-compressed to ≤2.5MB JPEG) → 1024-dim vector → `product_images.vector`
-2. **Image Asset ingest**: Kodo original → private OSS original + deterministic `preview-v1` JPEG → DashScope 1024-dim vector → `image_assets.vector`
-3. **Current search**: Query image → embedding → `VectorSearchService.search_by_vector` 执行 SQL 内过采样 + `DISTINCT ON` 折叠（见下方 SQL Query Pattern）→ top-k
-4. Similarity score returned to clients: `min(1.0, max(0.0, 1.0 - cosine_distance))`
+### 关键文件
 
-### Frontend (React + TypeScript)
-- **Framework**: React 18 + TypeScript, Vite (dev server `localhost:5173`)
-- **UI**: Ant Design 5 + Tailwind CSS
-  - Global antd theme via `ConfigProvider` in [frontend/src/main.tsx](frontend/src/main.tsx): teal primary `#0d7a72`, amber accent `#d97b29`, paper background `#f6f4ef`, zh_CN locale
-  - Design language: "warm paper workbench" — noise-textured paper background, grouped toolbar, contextual batch-action bar, drag-and-drop CSV upload (see [frontend/src/index.css](frontend/src/index.css))
-- **Active components**: `ProductSearch` (以图搜款), `ProductUpload` (产品管理). Other components (orders/customers) are legacy and not routed.
-- API base URL resolves from `window.location.hostname` ([frontend/src/config.ts](frontend/src/config.ts)) — frontend calls backend on port 5000 directly; nginx also proxies `/api/` and `/uploads/` as same-origin fallback.
+- backend/app.py - Flask 初始化、数据库配置、CORS、蓝图注册和日志。
+- backend/models/image_asset.py - 独立 ImageAsset 模型；型号可空，商品删除时设为 NULL。
+- backend/services/image_normalizer.py - EXIF、尺寸、透明背景、动图首帧和 2.5 MiB 上限。
+- backend/services/object_storage.py - 私有 OSS HEAD、无覆盖上传和短时签名下载。
+- backend/services/asset_ingest.py - 来源图片到 OSS、embedding 和 PostgreSQL 的纵向入库服务。
+- backend/services/vector_search.py - pgvector 检索服务。
+- backend/services/kodo_source.py - Kodo S3 只读对象来源。
+- backend/scripts/migrate_kodo_to_oss.py - 受控 Kodo → 私有 OSS 迁移入口。
+- backend/scripts/audit_legacy_product_images.py - 独立、只读的退休兼容表审计入口。
+- backend/blueprints/products_v2.py - Product CRUD、CSV 导入和产品图片资产入库（/api/products）。
+- backend/blueprints/image_assets.py - 图片资产列表、归款和私有预览 302（/api/image-assets）。
+- backend/models/product.py - Product 商品元数据模型。
+- backend/init_db.py - 创建 pgvector 扩展、模型表和 image_assets HNSW 索引。
+- postgres/init/01_init.sql - Docker 首次启动 SQL；应与模型保持一致。
 
-## Docker Deployment (Current)
+### Embedding 模型
 
-Three services in [docker-compose.yml](docker-compose.yml), network `app-network`:
+| 项目 | 值 |
+| --- | --- |
+| Model | tongyi-embedding-vision-plus-2026-03-06（Qwen3 base） |
+| Dimension | 1024（数据库列为 vector(1024)） |
+| Metric | Cosine distance |
+| Text support | 30+ 语言；未来可用同一向量空间做文本搜图 |
 
-| Service | Image | Container | Ports | Notes |
-|---------|-------|-----------|-------|-------|
-| `db` | `pgvector/pgvector:pg16` | fashion-crm-db | `127.0.0.1:5433→5432` | Host port **5433** to avoid clashing with a local PostgreSQL on 5432 |
-| `backend` | built from `backend/Dockerfile` | fashion-crm-backend | `0.0.0.0:5000→5000` | Gunicorn 4 workers; healthcheck `GET /api/health` |
-| `frontend` | built from `frontend/Dockerfile` | fashion-crm-frontend | `0.0.0.0:80→80` | Nginx serves Vite build, proxies `/api/` + `/uploads/` to backend |
+不要把不同模型的向量混入同一张资产表。更换模型时必须重新生成全部资产向量。
 
-- **DB auto-init**: `postgres/init/*.sql` mounted to `/docker-entrypoint-initdb.d` — runs only on first startup of an empty `postgres_data` volume (extension, tables, HNSW index `m=16, ef_construction=64`).
-- **Volumes**: `postgres_data` (database), `./backend/uploads` and `./backend/data` bind mounts.
-- **Env**: root `.env` supplies `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DASHSCOPE_API_KEY` to compose.
-- **nginx gotcha**: `proxy_pass http://backend:5000;` (no trailing slash/path!) — backend routes already include the `/api` prefix; a trailing `/` would strip it and 404.
-- **CORS** is fully open (`origins: "*"`) — internal LAN tool.
+## 向量搜索实现
 
-```bash
-docker compose up -d              # start all (db → backend → frontend, healthcheck-gated)
-docker compose build backend      # rebuild after backend code changes
-docker compose build frontend && docker compose up -d frontend   # redeploy frontend
+**核心类**：VectorSearchService（backend/services/vector_search.py）。
+
+~~~
+search_similar_images(image_path, top_k=10, request_id=None) -> list
+search_by_vector(vector, top_k=10, request_id=None) -> list
+~~~
+
+查询只读活跃资产，并在事务内设置 HNSW 搜索参数；每个结果包含 asset_id、可选 model_number、来源相对路径、相似度和私有预览入口。相似度按 min(1.0, max(0.0, 1.0 - distance)) 返回。
+
+~~~
+SET LOCAL hnsw.ef_search = :ef;
+SELECT id, model_number, source_relative_path,
+       vector <=> CAST(:query_vector AS vector) AS distance
+FROM image_assets
+WHERE status = 'active'
+ORDER BY vector <=> CAST(:query_vector AS vector)
+LIMIT :top_k;
+~~~
+
+SET LOCAL 保证连接归还连接池时不污染后续请求；服务在成功和异常路径都会 rollback。
+
+## 前端
+
+- React 18 + TypeScript + Vite；Ant Design 5 和 Tailwind CSS。
+- ProductSearch（以图搜款）和 ProductUpload（产品管理）是当前路由组件。
+- 前端通过 /api/ 访问后端；Nginx 只代理 API，不提供本地图片静态源。
+- 图片卡片使用私有预览入口，浏览器跟随 302 获取短时签名地址。
+
+## Docker 部署
+
+docker-compose.yml 包含 db、backend、frontend 三个服务，网络为 app-network：
+
+| 服务 | 容器 | 端口 | 说明 |
+| --- | --- | --- | --- |
+| db | fashion-crm-db | 127.0.0.1:5433 → 5432 | pgvector PostgreSQL 16 |
+| backend | fashion-crm-backend | 0.0.0.0:5000 → 5000 | Gunicorn；健康检查 /api/health |
+| frontend | fashion-crm-frontend | 0.0.0.0:80 → 80 | Nginx 静态构建和 API 代理 |
+
+- 数据库卷 postgres_data 保存 PostgreSQL 数据。
+- 后端只挂载 ./backend/data:/app/data 供运行时数据使用；正式图片不落盘到容器文件系统，原图和预览均在私有 OSS。
+- postgres/init/*.sql 只在空数据库首次启动时执行，创建扩展、商品表、image_assets 和 HNSW 索引。
+- docker compose down -v 会删除数据库卷和向量，执行前必须确认已有备份；不执行旧图片对象的物理清理。
+
+~~~
+docker compose up -d
+docker compose build backend
+docker compose build frontend && docker compose up -d frontend
 docker compose logs -f backend
-docker compose down               # stop; data persists in volumes
-docker compose down -v            # ⚠️ deletes postgres_data (vectors lost)
-```
+docker compose down
+~~~
 
-**Backup**:
-```bash
+## 备份与恢复
+
+~~~
 docker exec fashion-crm-db pg_dump -U postgres image_search > backup_$(date +%Y%m%d).sql
-tar -czf uploads_backup_$(date +%Y%m%d).tar.gz backend/uploads/
-```
+~~~
 
-## Local Development (without Docker for app code)
+数据库备份覆盖商品、image_assets 元数据和向量。OSS 原图、预览及 Kodo 只读备份由对象存储侧的私有备份/版本策略负责；不要在应用脚本中删除、覆盖或公开它们。恢复时先恢复 PostgreSQL，再核对 OSS 对象和 image_assets 的来源绑定。
 
-```bash
-# Backend (uses miniconda base env; deps already installed)
+## 本地开发
+
+~~~
 cd backend
-cp .env.example .env      # set DASHSCOPE_API_KEY; DB points to localhost:5433 (dockerized PG)
-python init_db.py         # extension + tables + HNSW index (idempotent)
-python app.py             # http://0.0.0.0:5000
+cp .env.example .env       # 填写凭证和数据库连接
+python init_db.py
+python app.py              # http://0.0.0.0:5000
 
-# Frontend
-cd frontend
+cd ../frontend
 npm install
-npm run dev               # localhost:5173
+npm run dev                # http://localhost:5173
+~~~
 
-# Tests
-cd backend && python -m pytest test/ -v
-```
+数据库连接优先读取 DATABASE_URL，否则组合 DB_HOST、DB_PORT、DB_NAME、DB_USER、DB_PASSWORD。
 
-DB connection resolution in `app.py`: `DATABASE_URL` (full DSN, optional) → else `DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD` (defaults target local PostgreSQL).
+## 环境变量
 
-## Environment Variables
+backend/.env（由 .env.example 复制）中的必填项：
 
-`backend/.env` (from `.env.example`):
+- DASHSCOPE_API_KEY - DashScope embedding 凭证。
+- DB_HOST、DB_PORT、DB_NAME、DB_USER、DB_PASSWORD - PostgreSQL 连接。
+- OSS_ACCESS_KEY_ID、OSS_ACCESS_KEY_SECRET、OSS_ENDPOINT、OSS_BUCKET_NAME - 私有 OSS 原图/预览和签名下载。
+- QINIU_ACCESS_KEY、QINIU_SECRET_KEY、QINIU_BUCKET_NAME、QINIU_REGION - **Kodo 只读迁移来源**，仅供 migrate_kodo_to_oss 的 preflight/迁移读取，绝不生成公开 URL。
 
-**Required**:
-- `DASHSCOPE_API_KEY` - Aliyun DashScope API key (⚠️ embedding calls fail with "Access denied / overdue payment" if the Aliyun account balance is empty)
-- `DB_HOST=localhost`, `DB_PORT=5433`, `DB_NAME=image_search`, `DB_USER=postgres`, `DB_PASSWORD` - local dockerized PostgreSQL
-- `QINIU_ACCESS_KEY`, `QINIU_SECRET_KEY`, `QINIU_BUCKET_NAME`, `QINIU_REGION` - Kodo migration source/preflight
-- `OSS_ACCESS_KEY_ID`, `OSS_ACCESS_KEY_SECRET`, `OSS_ENDPOINT`, `OSS_BUCKET_NAME` - private OSS image-asset ingest and signed preview
+可选项：DATABASE_URL、QINIU_S3_BUCKET_NAME、OSS_IMAGE_BASE_PREFIX、OSS_SIGNED_URL_TTL_SECONDS、IMAGE_PREVIEW_MAX_EDGE、IMAGE_PREVIEW_MAX_MB、IMAGE_MAX_PIXELS、IMAGE_NORMALIZATION_VERSION、SEARCH_OVERSAMPLE、LOG_LEVEL。Docker Compose 会把容器内的数据库地址覆盖为 db:5432。
 
-**Optional**:
-- `DATABASE_URL` - full PostgreSQL DSN, overrides `DB_*`
-- `QINIU_S3_BUCKET_NAME` - explicit S3 bucket mapping when Get Service is ambiguous
-- `OSS_IMAGE_BASE_PREFIX`, `OSS_SIGNED_URL_TTL_SECONDS` - image-asset key namespace and preview URL TTL
-- `IMAGE_PREVIEW_MAX_EDGE`, `IMAGE_PREVIEW_MAX_MB`, `IMAGE_MAX_PIXELS`, `IMAGE_NORMALIZATION_VERSION` - deterministic preview limits/version
-- `DATASET_ROOT` - local dataset path
-- `SEARCH_OVERSAMPLE` - 检索过采样系数，默认 5（≈ 单型号平均图片数）。产品图片数普遍偏多时调大
-- `LOG_LEVEL` - root logger 级别，默认 `INFO`（见 `backend/app.py` 的 `logging.basicConfig`）
+## 数据库结构
 
-Docker Compose loads application credentials from ignored `backend/.env`; container `DB_HOST` / `DB_PORT` are explicitly overridden to `db:5432`. Root `.env` remains the Compose interpolation source for `DB_NAME`, `DB_USER`, `DB_PASSWORD`, and `VITE_API_BASE_URL`.
+**数据库**：image_search · **扩展**：vector
 
-## Database Schema
+### products
 
-**Database**: `image_search` · **Extension**: `vector` (pgvector 0.8+)
+主键为 model_number VARCHAR(100)；保存摄影师文件、阿里商品 URL、分类、规格、价格、参考链接以及创建/更新时间。CSV 导入只创建商品元数据。
 
-### `products` (primary key: `model_number` VARCHAR — NOT auto-increment id)
+### image_assets
 
-| Field | Type | Constraint |
-|-------|------|------------|
-| model_number | VARCHAR(100) | PRIMARY KEY |
-| photographer_file | VARCHAR(255) | NOT NULL |
-| alibaba_product_url | VARCHAR(500) | NOT NULL |
-| category | VARCHAR(100) | NOT NULL |
-| spec_cn_reference / spec_cn / spec_en | TEXT | NULL |
-| product_size / package_size | VARCHAR(200) | NULL |
-| price_1688, fob_price_tier1/2/3, intl_platform_price, competitor_price | NUMERIC(10,2) | NULL |
-| ref_link_1/2/3, intl_platform_url(_1/_2) | VARCHAR(500) | NULL |
-| created_at, updated_at | TIMESTAMP | AUTO |
+| 字段 | 说明 |
+| --- | --- |
+| id | UUID 主键 |
+| model_number | 可空外键；未归款资产为 NULL |
+| source_provider / source_bucket / source_relative_path / source_revision | 来源身份和修订号 |
+| oss_path / preview_oss_path | 私有 OSS 原图和规范化预览对象键 |
+| content_hash / source_size / source_mime_type / source_width / source_height | 原图内容和尺寸元数据 |
+| vector / embedding_model / embedding_dimension | 1024 维 pgvector 及模型绑定 |
+| normalization_version / status | 规范化版本；active 或 archived |
 
-### `product_images`
+索引包括内容哈希、型号、状态和只针对 active 资产的 HNSW cosine 索引。退休兼容表保持原样，不由新库初始化或应用写路径创建；如需兼容迁移，先单独执行只读审计并取得授权。
 
-| Field | Type | Constraint |
-|-------|------|------------|
-| id | SERIAL | PRIMARY KEY |
-| model_number | VARCHAR(100) | FK → products, CASCADE DELETE |
-| image_path | VARCHAR(255) | UNIQUE, NOT NULL (web path) |
-| vector | vector(1024) | NOT NULL |
-| content_hash | VARCHAR(64) | UNIQUE（全库），源文件 SHA-256，用于精确去重 |
-| original_path / oss_path | TEXT | NULL |
-| image_order | INT | DEFAULT 0 |
-| is_primary | BOOLEAN | DEFAULT FALSE |
-| created_at | TIMESTAMP | AUTO |
+## 产品与迁移操作
 
-**Indexes**: `idx_product_images_model_number`, `uq_product_images_content_hash` (UNIQUE), `idx_product_images_vector_hnsw` (HNSW, `vector_cosine_ops`, m=16, ef_construction=64)
+POST /api/products/import-csv 接受 UTF-8、GBK、GB2312 或 UTF-8-SIG CSV，必填列为 model_number、photographer_file、alibaba_product_url、category。产品图片通过产品 API 写入私有 OSS 和 image_assets，不会产生公开对象地址。
 
-Schema is defined twice — keep both in sync when changing models:
-1. [backend/models/product.py](backend/models/product.py) (SQLAlchemy, authoritative)
-2. [postgres/init/01_init.sql](postgres/init/01_init.sql) (Docker first-boot init)
+Kodo 迁移在 backend 目录运行：
 
-## Vector Search Implementation
+~~~
+python -m scripts.migrate_kodo_to_oss --preflight
+python -m scripts.migrate_kodo_to_oss --dry-run --report-path reports/kodo-dry-run.json
+python -m scripts.migrate_kodo_to_oss --verify-selection --selection-manifest reports/issue-10/selection.json --report-path reports/issue-10/selection-verification.json
+python -m scripts.migrate_kodo_to_oss --pilot 10 --selection-manifest reports/issue-10/selection.json --verified-selection-report reports/issue-10/selection-verification.json --report-path reports/kodo-pilot.json
+~~~
 
-**Core Class**: `VectorSearchService` ([backend/services/vector_search.py](backend/services/vector_search.py)) — stateless, no startup loading. `product_search.ImageSearchService` is a compat alias for the same class.
+不提供 --pilot 或 --full 时命令只读；全量写入还需要受控授权、数据库恢复点和新鲜 preflight/dry-run 报告。迁移报告包含对象统计、阶段状态、冲突和脱敏失败原因，不保存凭证或签名 URL。兼容审计是另一条命令，不能用迁移命令替代：
 
-```python
-search_similar_images(image_path, top_k=10, request_id=None) -> list   # embed + search_by_vector
-search_by_vector(vector, top_k=10, request_id=None) -> list            # SQL 内过采样 + 折叠
-```
+~~~
+python -m scripts.audit_legacy_product_images
+~~~
 
-**SQL Query Pattern**（cosine；先过采样再按型号折叠，不是取 top_k 张图后在 Python 里折叠）:
-```sql
-SET LOCAL hnsw.ef_search = :ef;   -- ef = max(fetch_n, 40)；LOCAL 避免污染连接池
-WITH candidates AS MATERIALIZED (
-    SELECT model_number, image_path, original_path, oss_path,
-           vector <=> CAST(:q AS vector) AS distance
-    FROM product_images ORDER BY vector <=> CAST(:q AS vector) LIMIT :fetch_n
-), best AS (
-    SELECT DISTINCT ON (model_number) * FROM candidates ORDER BY model_number, distance
-)
-SELECT * FROM best ORDER BY distance LIMIT :top_k;
-```
-- `fetch_n = clamp(top_k × SEARCH_OVERSAMPLE, top_k, 500)`，`SEARCH_OVERSAMPLE` 默认 5
-- `similarity = min(1.0, max(0.0, 1.0 - distance))` —— 实测向量 L2 范数 1.000282，必须夹上界
-- ⚠️ pgvector **不会**把 `ef_search` clamp 到 k（见 `src/hnswscan.c`），所以必须显式设置
-- CTE 用 `MATERIALIZED` 强制两阶段执行（先 HNSW 取候选，再折叠），否则 PostgreSQL 12+ 可能内联 CTE 改变执行形状
+审计只检查退休表是否存在及行数：表不存在或为空表示没有待处理的旧行；非空表示必须由人工制定、单独批准的兼容迁移清单。审计不会扫描文件、写入数据库、上传 OSS、删除表或删除对象。
 
-## CSV Import
+## 测试
 
-`POST /api/products/import-csv` (multipart field `csv_file`; UTF-8 / GBK / GB2312 / UTF-8-SIG auto-detected).
-
-**Required columns**: `model_number`, `photographer_file`, `alibaba_product_url`, `category`
-**Optional columns**: spec/price/link fields matching `products` columns. Rows with existing `model_number` are skipped.
-CSV import creates product rows only — images and vectors are added via the product image upload flow (create/update product endpoints call `extract_feature` per image).
-
-## 批量导入图片（CLI）
-
-目录约定：`{root}/{model_number}/**/*.{jpg,png,…}` —— 一级子目录名即型号，目录内部递归收图。
-
-```bash
+~~~
 cd backend
-python -m scripts.ingest_images --root data/摄像师拍摄素材 --dry-run    # 先看报告
-python -m scripts.ingest_images --root data/摄像师拍摄素材 --rebuild-index  # 首次全量
-python -m scripts.ingest_images --root data/摄像师拍摄素材              # 日常增量
-```
+python -m pytest test/ -v
+python -m pytest test/integration/ -v
+python -m pytest test/ --ignore=test/integration -v
+~~~
 
-- **顺序**：先 `POST /api/products/import-csv` 建产品，再跑本脚本导图。目录名匹配不上已有 `model_number` 的会被跳过并在报告中列出（常见于 `CS-08` 应为 `CS-008` 这类命名错误）。
-- **去重**：SHA-256 全库唯一。重复图片在调用 DashScope **之前**就被拦下，不花钱。
-- **幂等**：重跑同一目录零 API 调用，因此断点续传无需 checkpoint。
-- **性能**：实测批量 20 张/请求 = 89 ms/张（单张为 490 ms/张，约 5.5× 提升）。1000 张约 90 秒、¥0.2。
-- `--rebuild-index` 会先 `DROP` 再重建 HNSW 索引（pgvector 官方建议先灌数据后建索引），仅首次全量导入使用。
-- `--dry-run` 只扫描算哈希查重并报告，不调 API、不写库、不落盘；`--batch-size` clamp 到 `[1, 20]`；`--limit` 只处理前 N 张用于调试。
+集成测试使用 DB_HOST:DB_PORT（默认 localhost:5433）上的独立 image_search_test 数据库；连接不可用时会自动 skip。test/test_pgvector.py 和 test/benchmark_search.py 是手工基准脚本，不是 pytest 用例。
 
-## Testing
+## 重要约束
 
-```bash
-cd backend
-python -m pytest test/ -v                        # 全部（集成测试需要 docker compose up -d db）
-python -m pytest test/integration/ -v            # 仅集成测试（真 PostgreSQL）
-python -m pytest test/ --ignore=test/integration -v   # 仅单元测试（无需数据库）
-python -m pytest test/ --cov=. --cov-report=html
-```
+- 不执行 DROP、DELETE、覆盖上传或云对象清理来“迁移”旧数据；所有收缩动作必须另行授权并可回滚。
+- 图片正式来源始终是私有 OSS，Kodo 只读备份；预览始终经过 /api/image-assets/<asset_id>/preview 的短时签名 302。
+- 不在应用启动、普通部署或健康检查中隐式运行兼容审计或迁移。
+- Legacy TypeScript 组件（如 OrderManagement）未路由且可能有类型错误，除非重新启用，否则不要顺手修复。
+- 如果 Docker 报告历史容器名称冲突，只处理明确冲突的容器；不要删除数据库卷。
 
-集成测试连接 `DB_HOST:DB_PORT`（默认 `localhost:5433`）上的独立库 `image_search_test`，每个测试
-重建表结构，不污染开发数据。PostgreSQL 不可达时整套集成测试自动 skip。
+## Agent skills
 
-⚠️ `test/test_pgvector.py`、`test/benchmark_search.py` 是手工基准脚本，不是 pytest 用例。
+### Issue tracker
 
-## Important Architecture Notes
+Issues are tracked in GitHub Issues (richardzhangy26/xiangyi_image_search) via the gh CLI. See docs/agents/issue-tracker.md.
 
-- ⚠️ **Primary key**: products use `model_number` (VARCHAR), all FKs and API URLs reference it.
-- **Legacy product uploads**: max 16MB (Flask) / 20MB (nginx `client_max_body_size`); formats png/jpg/jpeg/gif/webp; stored under `backend/uploads/product_images/{model_number}/`.
-- **Blueprints**: `products_v2.py` and `image_assets.py` are registered. `products.py`, `customers.py`, `orders.py`, `product_search.py` (blueprint), `oss.py` are legacy/unregistered.
-- **批量导入**: 用 `python -m scripts.ingest_images`（见上方章节）。FAISS 时代的 `ingest_dataset.py` 已删除。
-- **图片去重**: `product_images.content_hash` 为源文件 SHA-256，**全库唯一**。同一张图在任何型号下只能入库一次；重复上传返回 `{skipped: true, duplicate_of: ...}`。近似去重（pHash）暂未实现。
-- **图片文件命名**: `uploads/product_images/{model_number}/{sha256前16位}{ext}`，不再用 UUID。同一张图永远落在同一路径，重复导入不产生新文件。
-- **Legacy TS components** (`OrderManagement` etc.) have type errors but are excluded from the routed app; don't "fix" them unless reactivating.
-- **Old container conflicts**: legacy containers named `fashion-crm-*` (MySQL-era / dockerhub images) may exist on dev machines; `docker rm` them if compose reports name conflicts. Legacy `mysql_data` volumes are orphaned and safe to ignore.
+### Triage labels
+
+Default triage vocabulary: needs-triage / needs-info / ready-for-agent / ready-for-human / wontfix. See docs/agents/triage-labels.md.
+
+### Domain docs
+
+Single-context: one CONTEXT.md + docs/adr/ at the repo root. See docs/agents/domain.md.

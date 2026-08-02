@@ -1,13 +1,29 @@
 # Kodo → 私有 OSS 图片资产迁移
 
-正式迁移入口是 `scripts.migrate_kodo_to_oss.py`。旧
-`migrate_oss_path.py` 只会拒绝执行，不再改写 `product_images.oss_path`
-或拼接公开七牛 URL。
+正式图片工作流只有一条：Kodo 作为只读备份来源，经过受控的
+`scripts.migrate_kodo_to_oss` 读取后，原图和规范化预览写入私有 OSS，向量与
+来源元数据写入 `image_assets`，检索结果通过私有预览 302 返回。Kodo 全程不执行
+Put/Delete，OSS 对象禁止覆盖，也不会构造公开 URL。
 
-旧 `scripts.ingest_images.py` 也不再写本机 `uploads` 或
-`product_images`；它只保留 `--dry-run` 只读盘点。不要用旧参数
-`--rebuild-index` 尝试导入，写模式会在扫描和 embedding 之前明确拒绝。
-本地文件夹写入 `ImageAsset` 的新入口尚未设计，不能回退到旧表。
+兼容审计与迁移严格分离。`product_images` 是未修改的退休表；在任何另行授权的
+人工兼容迁移前，先单独运行只读审计：
+
+```bash
+cd backend
+python -m scripts.audit_legacy_product_images
+```
+
+审计输出是脱敏 JSON：
+
+- `table_exists: false`：当前数据库没有退休表，无需兼容迁移。
+- `table_exists: true, row_count: 0`：退休表为空，仅保留结构，不需要迁移行。
+- `table_exists: true, row_count > 0`：存在待处理旧行，`compatibility_required` 应为
+  `true`；`required_actions` 会要求人工制作并批准兼容迁移清单。审计不会扫描本地
+  文件、上传 OSS、写入 `image_assets`、改写旧表或删除任何对象。
+
+历史本地导入和公开 URL 上传入口均已退役；它们的写模式会在扫描、embedding 和
+数据库写入之前拒绝。不要用旧脚本替代 Kodo → 私有 OSS 迁移，也不要把旧表当作
+正式图片源。
 
 ## 安全顺序
 

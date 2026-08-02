@@ -1286,4 +1286,5 @@ def test_legacy_public_url_migration_entry_refuses_to_run():
 
     assert exit_code == 2
     assert "已退役" in stderr.getvalue()
+    assert "未执行任何写入" in stderr.getvalue()
     assert "migrate_kodo_to_oss" in stderr.getvalue()

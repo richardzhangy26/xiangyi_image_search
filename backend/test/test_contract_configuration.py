@@ -1,6 +1,7 @@
 """运行时与新数据库部署契约测试。"""
 
 from pathlib import Path
+import importlib.util
 
 import pytest
 from sqlalchemy import inspect
@@ -50,3 +51,34 @@ def test_deployment_files_do_not_persist_or_proxy_legacy_uploads():
     assert './backend/uploads:/app/uploads' not in compose
     assert 'location /uploads/' not in nginx
     assert 'CREATE TABLE IF NOT EXISTS product_images' not in init_sql
+
+
+def test_retired_code_is_not_importable_or_referenced():
+    assert importlib.util.find_spec('services.ingest') is None
+    assert importlib.util.find_spec('blueprints.oss') is None
+    assert not repo_file('backend/scripts/batch_upload_oss.py').exists()
+    active_sources = [
+        repo_file('backend/app.py'),
+        repo_file('backend/blueprints/products_v2.py'),
+        repo_file('backend/models/__init__.py'),
+    ]
+    assert all(
+        'ProductImage' not in source.read_text(encoding='utf-8')
+        for source in active_sources
+    )
+
+
+def test_legacy_ingest_write_mode_refuses_before_scanning(monkeypatch, tmp_path):
+    from scripts import ingest_images
+
+    monkeypatch.setattr(
+        ingest_images,
+        'scan_directory',
+        lambda _root: pytest.fail('禁用检查后不应继续扫描'),
+    )
+
+    with pytest.raises(
+        ingest_images.LegacyProductImageIngestDisabledError,
+        match='已停用',
+    ):
+        ingest_images.run(object(), str(tmp_path), dry_run=False)

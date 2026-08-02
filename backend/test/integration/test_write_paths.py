@@ -2,13 +2,12 @@
 import io
 import hashlib
 import json
-import os
 from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image
 
-from models import ImageAsset, ProductImage, db
+from models import ImageAsset, db
 from services.embedding import EmbeddingServiceError
 from services.object_storage import ObjectStorageError, StoredObject
 
@@ -145,7 +144,6 @@ def test_create_product_uploads_private_image_asset_and_reads_stable_preview(app
     assert preview.status_code == 302
     assert preview.headers['Location'].startswith('https://private.example/')
 
-    assert ProductImage.query.count() == 0
     asset = ImageAsset.query.one()
     assert asset.model_number == 'CS-ASSET-001'
     assert asset.source_provider == 'product-upload'
@@ -156,14 +154,6 @@ def test_create_product_uploads_private_image_asset_and_reads_stable_preview(app
     listed = client.get('/api/products?page=0')
     assert listed.status_code == 200
     assert listed.get_json()['products'][0]['images'] == images
-
-    product_dir = os.path.join(
-        app.config['UPLOAD_FOLDER'],
-        'product_images',
-        'CS-ASSET-001',
-    )
-    assert not os.path.exists(product_dir)
-
 
 def test_update_product_creates_distinct_asset_and_reuses_compatible_content(app):
     storage, embedding = _install_asset_dependencies(app)
@@ -232,30 +222,6 @@ def test_delete_product_image_archives_asset_without_deleting_oss_objects(app):
     assert set(storage.objects) == object_keys
 
 
-def test_delete_product_with_legacy_images_requires_compatibility_migration(app):
-    client = app.test_client()
-    created = client.post('/api/products', data={
-        'product': _product_payload('LEGACY-001'),
-    }, content_type='multipart/form-data')
-    assert created.status_code == 201
-    db.session.add(ProductImage(
-        model_number='LEGACY-001',
-        image_path='/uploads/product_images/LEGACY-001/old.png',
-        vector=[0.1] * 1024,
-        content_hash='a' * 64,
-    ))
-    db.session.commit()
-
-    response = client.delete('/api/products/LEGACY-001')
-
-    assert response.status_code == 409
-    assert response.get_json()['error_code'] == (
-        'LEGACY_PRODUCT_IMAGES_REQUIRE_MIGRATION'
-    )
-    assert client.get('/api/products/LEGACY-001').status_code == 200
-    assert ProductImage.query.filter_by(model_number='LEGACY-001').count() == 1
-
-
 def test_same_content_twice_creates_distinct_assets_and_reuses_vector(app):
     storage, embedding = _install_asset_dependencies(app)
     client = app.test_client()
@@ -307,10 +273,6 @@ def test_update_failure_rolls_back_product_fields_and_all_new_assets(app):
     assert detail['photographer_file'] == 'p'
     assert detail['images'] == []
     assert ImageAsset.query.count() == 0
-    product_dir = os.path.join(app.config['UPLOAD_FOLDER'], 'product_images', 'CS-001')
-    assert not os.path.exists(product_dir)
-
-
 def test_invalid_image_rejects_product_without_asset(app):
     _install_asset_dependencies(app)
     client = app.test_client()
@@ -457,34 +419,6 @@ def test_batch_delete_detaches_all_active_assets(app):
         asset.model_number for asset in ImageAsset.query.all()
     } == {None}
     assert set(storage.objects) == object_keys
-
-
-def test_batch_delete_is_atomic_when_any_product_has_legacy_images(app):
-    client = app.test_client()
-    for model_number in ('CS-001', 'CS-002'):
-        response = client.post('/api/products', data={
-            'product': _product_payload(model_number),
-        }, content_type='multipart/form-data')
-        assert response.status_code == 201
-    db.session.add(ProductImage(
-        model_number='CS-002',
-        image_path='/uploads/product_images/CS-002/old.png',
-        vector=[0.1] * 1024,
-        content_hash='b' * 64,
-    ))
-    db.session.commit()
-
-    response = client.post(
-        '/api/products/batch-delete',
-        json={'model_numbers': ['CS-001', 'CS-002']},
-    )
-
-    assert response.status_code == 409
-    assert response.get_json()['error_code'] == (
-        'LEGACY_PRODUCT_IMAGES_REQUIRE_MIGRATION'
-    )
-    assert client.get('/api/products/CS-001').status_code == 200
-    assert client.get('/api/products/CS-002').status_code == 200
 
 
 def test_storage_error_returns_stable_message_and_rolls_back_product(app):

@@ -14,6 +14,7 @@ Kodo 正式迁移：
 """
 
 import argparse
+import hashlib
 import logging
 import os
 import sys
@@ -25,14 +26,49 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 
 from app import create_app  # noqa: E402
-from models import Product, db  # noqa: E402
+from models import ImageAsset, Product, db  # noqa: E402
 from services.embedding import MAX_BATCH_SIZE  # noqa: E402
-from services.ingest import (  # noqa: E402
-    ALLOWED_EXTENSIONS,
-    PendingImage,
-    find_existing_hashes,
-    hash_file,
-)
+
+ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp'}
+
+
+@dataclass
+class PendingImage:
+    """只读盘点阶段产出的候选项。"""
+
+    model_number: str
+    source_path: str
+    content_hash: str
+    image_order: int
+    is_primary: bool
+
+
+def hash_file(path):
+    """流式计算文件 SHA-256，避免盘点大图时占用过多内存。"""
+
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def find_existing_hashes(hashes):
+    """读取 image_assets 中已有哈希，供只读盘点展示重复来源。"""
+
+    if not hashes:
+        return {}
+
+    unique = list({value for value in hashes if value})
+    found = {}
+    for start in range(0, len(unique), 1000):
+        chunk = unique[start:start + 1000]
+        rows = db.session.query(
+            ImageAsset.content_hash,
+            ImageAsset.source_relative_path,
+        ).filter(ImageAsset.content_hash.in_(chunk)).all()
+        found.update({content_hash: source_path for content_hash, source_path in rows})
+    return found
 
 logger = logging.getLogger('ingest_images')
 

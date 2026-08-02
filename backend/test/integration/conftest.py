@@ -4,6 +4,8 @@
 且 Flask-SQLAlchemy 3.1 在 init_app() 阶段就创建了 engine。
 """
 import os
+import re
+import secrets
 import sys
 from pathlib import Path
 
@@ -15,6 +17,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BACKEND_DIR))
 
 TEST_DB_NAME = 'image_search_test'
+_SCHEMA_NAME_RE = re.compile(r'^[a-z0-9_]+$')
 
 
 def _dsn(database):
@@ -23,6 +26,14 @@ def _dsn(database):
     host = os.getenv('DB_HOST', 'localhost')
     port = os.getenv('DB_PORT', '5433')
     return f'postgresql://{user}:{password}@{host}:{port}/{database}'
+
+
+def _temporary_schema_name():
+    """Return a quoted-identifier-safe schema name for one test invocation."""
+    name = f'test_{secrets.token_hex(12)}'
+    if not _SCHEMA_NAME_RE.fullmatch(name):
+        raise AssertionError('generated schema name is not safe')
+    return name
 
 
 # 关键：必须在 import app 之前生效
@@ -74,7 +85,7 @@ def _test_database():
 
 @pytest.fixture()
 def app(_test_database, tmp_path):
-    """每个测试一套干净的表结构。"""
+    """每个测试使用独立 schema，绝不触碰 public 中的旧表。"""
     from app import create_app
     from models import db
 
@@ -84,20 +95,47 @@ def app(_test_database, tmp_path):
     os.makedirs(application.config['UPLOAD_FOLDER'], exist_ok=True)
 
     with application.app_context():
-        db.session.execute(text('CREATE EXTENSION IF NOT EXISTS vector'))
-        db.session.commit()
-        db.drop_all()
-        db.create_all()
-        # create_all() 不会建这个索引——models/product.py 没有用 SQLAlchemy Index
-        # 声明它，HNSW 索引只由 postgres/init/01_init.sql / backend/init_db.py 的
-        # 原生 SQL 创建。不补建的话，涉及 hnsw.ef_search 的检索测试会退化成
-        # Seq Scan 精确扫描，测不出近似最近邻检索的真实行为（见 T3 fix round 1）。
-        # 索引名与参数须与 postgres/init/01_init.sql、backend/init_db.py 保持一致。
-        db.session.execute(text(
-            'CREATE INDEX IF NOT EXISTS idx_product_images_vector_hnsw '
-            'ON product_images USING hnsw (vector vector_cosine_ops) '
-            'WITH (m = 16, ef_construction = 64)'
-        ))
-        db.session.commit()
-        yield application
+        # Do not let a session created by app setup retain the engine binding.
+        # The connection below remains open for the whole test so its
+        # search_path applies to every ORM request and vector query.
         db.session.remove()
+        original_engine = db.engines[None]
+        connection = db.engine.connect()
+        schema_name = _temporary_schema_name()
+        quoted_schema = f'"{schema_name}"'
+        try:
+            connection.execute(text('CREATE EXTENSION IF NOT EXISTS vector'))
+            connection.execute(text(f'CREATE SCHEMA {quoted_schema}'))
+            connection.execute(text(
+                f'SET search_path TO {quoted_schema}, public'
+            ))
+            connection.commit()
+
+            # Bind active metadata to this same connection.  create_all() is
+            # intentionally avoided because it would use the engine pool and
+            # could create tables in public instead of this temporary schema.
+            # Public may already contain same-named legacy/active tables.  A
+            # plain ``create_all(bind=connection)`` would see those through
+            # search_path and incorrectly skip creation in this schema; the
+            # translation map makes the DDL explicitly target this schema.
+            db.metadata.create_all(
+                bind=connection.execution_options(
+                    schema_translate_map={None: schema_name}
+                )
+            )
+            connection.commit()
+            # Flask-SQLAlchemy's Session.get_bind() selects db.engines[None]
+            # for mapped models, so replacing that entry is what makes request
+            # handlers and db.session share this search_path-bound connection.
+            db.engines[None] = connection
+
+            yield application
+        finally:
+            db.session.remove()
+            db.engines[None] = original_engine
+            try:
+                connection.rollback()
+                connection.execute(text(f'DROP SCHEMA {quoted_schema} CASCADE'))
+                connection.commit()
+            finally:
+                connection.close()

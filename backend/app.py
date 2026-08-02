@@ -3,7 +3,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file
 
-from flask import Flask, send_from_directory, request, jsonify, abort
+from flask import Flask, send_from_directory, jsonify, abort
 from flask_cors import CORS
 from pathlib import Path
 from models import db
@@ -61,9 +61,7 @@ def create_app(config_name='development'):
     })
     
     # 基础配置
-    app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
     app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-    app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['OSS_SIGNED_URL_TTL_SECONDS'] = int(
         os.getenv('OSS_SIGNED_URL_TTL_SECONDS', '600')
@@ -73,10 +71,6 @@ def create_app(config_name='development'):
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', '摄像师拍摄素材')
     )
     
-    # 确保上传目录存在
-    if not app.config['TESTING']:
-        os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'product_images'), exist_ok=True)
-
     # 初始化扩展
     db.init_app(app)
 
@@ -91,11 +85,6 @@ def create_app(config_name='development'):
     app.register_blueprint(products_v2_bp)
     app.register_blueprint(image_assets_bp)
     
-    # 添加静态文件路由
-    @app.route('/uploads/<path:filename>')
-    def serve_upload(filename):
-        return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
     @app.route('/dataset-images/<path:filename>')
     def serve_dataset_image(filename):
         dataset_root = app.config.get('DATASET_ROOT')

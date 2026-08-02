@@ -16,7 +16,7 @@ from datetime import datetime
 from urllib.parse import quote
 from flask_cors import cross_origin
 from sqlalchemy.exc import IntegrityError
-from models import db, ImageAsset, Product, ProductImage
+from models import db, ImageAsset, Product
 from product_search import EmbeddingServiceError, VectorSearchError
 from services.asset_ingest import (
     AssetIngestConflictError,
@@ -24,10 +24,11 @@ from services.asset_ingest import (
     ImageAssetIngestService,
 )
 from services.image_normalizer import ImageNormalizationError
-from services.ingest import ALLOWED_EXTENSIONS
 from services.object_source import InMemoryObjectSource
 from services.object_storage import ObjectStorageError, OssObjectStorage
 products_v2_bp = Blueprint('products_v2', __name__, url_prefix='/api/products')
+
+ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
 
 PRODUCT_UPLOAD_SOURCE_PROVIDER = 'product-upload'
 PRODUCT_UPLOAD_SOURCE_BUCKET = 'product-uploads'
@@ -218,22 +219,6 @@ def products_with_active_images(products):
         ]
         result.append(product_dict)
     return result
-
-
-def legacy_images_require_migration(model_numbers):
-    if not model_numbers:
-        return False
-    return ProductImage.query.filter(
-        ProductImage.model_number.in_(model_numbers)
-    ).first() is not None
-
-
-def legacy_images_error_response():
-    return error_response(
-        '检测到旧商品图片数据，请先制定兼容迁移方案后再删除商品',
-        'LEGACY_PRODUCT_IMAGES_REQUIRE_MIGRATION',
-        409,
-    )
 
 
 def asset_ingest_error_response(error):
@@ -570,9 +555,6 @@ def delete_product(model_number):
         if not product:
             return jsonify({'error': '产品不存在'}), 404
 
-        if legacy_images_require_migration([model_number]):
-            return legacy_images_error_response()
-
         db.session.delete(product)
         db.session.commit()
 
@@ -604,9 +586,6 @@ def batch_delete_products():
         model_numbers = data['model_numbers']
         if not isinstance(model_numbers, list):
             return jsonify({'error': 'model_numbers 必须是数组'}), 400
-
-        if legacy_images_require_migration(model_numbers):
-            return legacy_images_error_response()
 
         # 批量删除
         deleted_count = Product.query.filter(
@@ -665,37 +644,6 @@ def delete_product_image(model_number, asset_id):
             type(e).__name__,
         )
         return error_response('图片归档失败', 'IMAGE_ARCHIVE_FAILED', 500)
-
-
-@products_v2_bp.route('/<model_number>/images/<int:image_id>/set-primary', methods=['POST'])
-@cross_origin()
-def set_primary_image(model_number, image_id):
-    """设置主图"""
-    try:
-        # 取消当前主图
-        ProductImage.query.filter_by(
-            model_number=model_number,
-            is_primary=True
-        ).update({'is_primary': False})
-
-        # 设置新主图
-        product_image = ProductImage.query.filter_by(
-            id=image_id,
-            model_number=model_number
-        ).first()
-
-        if not product_image:
-            return jsonify({'error': '图片不存在'}), 404
-
-        product_image.is_primary = True
-        db.session.commit()
-
-        return jsonify({'message': '主图设置成功'})
-
-    except Exception as e:
-        db.session.rollback()
-        current_app.logger.error(f"设置主图失败: {str(e)}")
-        return jsonify({'error': str(e)}), 500
 
 
 # ========================================

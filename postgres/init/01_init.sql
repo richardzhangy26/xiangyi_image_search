@@ -46,23 +46,7 @@ CREATE TABLE IF NOT EXISTS products (
 
 COMMENT ON TABLE products IS '电子产品配件主表（相机肩带、挂绳等）';
 
--- 3) product_images 表（产品图片 + 1024 维向量）
-CREATE TABLE IF NOT EXISTS product_images (
-    id            SERIAL PRIMARY KEY,
-    model_number  VARCHAR(100) NOT NULL REFERENCES products(model_number) ON DELETE CASCADE,
-    image_path    VARCHAR(255) NOT NULL UNIQUE,
-    vector        vector(1024) NOT NULL,
-    content_hash  VARCHAR(64),
-    original_path TEXT,
-    oss_path      TEXT,
-    image_order   INTEGER DEFAULT 0,
-    is_primary    BOOLEAN DEFAULT FALSE,
-    created_at    TIMESTAMP DEFAULT NOW()
-);
-
-COMMENT ON TABLE product_images IS '产品图片表，存储图片路径和 DashScope 1024 维图像向量';
-
--- 4) image_assets 表（独立图片资产，不要求先关联商品）
+-- 3) image_assets 表（独立图片资产，不要求先关联商品）
 CREATE TABLE IF NOT EXISTS image_assets (
     id                    UUID PRIMARY KEY,
     model_number          VARCHAR(100) REFERENCES products(model_number) ON DELETE SET NULL,
@@ -99,21 +83,7 @@ CREATE TABLE IF NOT EXISTS image_assets (
 
 COMMENT ON TABLE image_assets IS '独立图片资产：可无商品型号，源图与预览存放于私有 OSS';
 
--- 5) 索引
--- 外键查询索引
-CREATE INDEX IF NOT EXISTS idx_product_images_model_number
-    ON product_images (model_number);
-
--- 内容哈希唯一索引（全库精确去重：同一张图只能入库一次）
-CREATE UNIQUE INDEX IF NOT EXISTS uq_product_images_content_hash
-    ON product_images (content_hash);
-
--- HNSW 向量索引（cosine 距离，embedding 为归一化向量，检索统一使用 cosine_distance）
-CREATE INDEX IF NOT EXISTS idx_product_images_vector_hnsw
-    ON product_images
-    USING hnsw (vector vector_cosine_ops)
-    WITH (m = 16, ef_construction = 64);
-
+-- 4) 索引
 CREATE INDEX IF NOT EXISTS idx_image_assets_content_hash
     ON image_assets (content_hash);
 
@@ -129,7 +99,6 @@ CREATE INDEX IF NOT EXISTS idx_image_assets_vector_active_hnsw
     WITH (m = 16, ef_construction = 64)
     WHERE status = 'active';
 
--- 6) 帮助优化器选用索引
+-- 5) 帮助优化器选用索引
 ANALYZE products;
-ANALYZE product_images;
 ANALYZE image_assets;

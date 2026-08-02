@@ -101,6 +101,18 @@ def _canonical_env() -> dict[str, str]:
     }
 
 
+def _write_selection_manifest(tmp_path, source_relative_paths):
+    manifest_path = tmp_path / 'selection.json'
+    manifest_path.write_text(
+        json.dumps(
+            {'source_relative_paths': source_relative_paths},
+            ensure_ascii=False,
+        ),
+        encoding='utf-8',
+    )
+    return manifest_path
+
+
 def test_z0_config_resolves_kodo_s3_location():
     config = KodoConfig.from_env(_canonical_env())
 
@@ -292,6 +304,107 @@ def test_dry_run_uses_only_read_operations():
         "head_object",
         "get_object",
     }
+
+
+def test_dry_run_selects_manifest_paths_in_declared_order_without_writers(
+    tmp_path,
+):
+    source = KodoS3Source(
+        KodoConfig.from_env(_canonical_env()),
+        client=FakeReadOnlyS3Client({
+            '二/图片.png': _png_bytes('blue'),
+            '一/图片.png': _png_bytes('red'),
+            '说明/readme.txt': b'not an image',
+        }),
+    )
+    manifest_path = _write_selection_manifest(
+        tmp_path,
+        ['一/图片.png', '二/图片.png'],
+    )
+    report_path = tmp_path / 'report.json'
+    stdout = io.StringIO()
+
+    def forbidden_factory(_environment):
+        pytest.fail('清单 dry-run 不得构造 OSS 或 embedding 写端')
+
+    exit_code = main(
+        [
+            '--dry-run',
+            '--selection-manifest',
+            str(manifest_path),
+            '--report-path',
+            str(report_path),
+        ],
+        environ=_canonical_env(),
+        source_factory=lambda _config: source,
+        storage_factory=forbidden_factory,
+        embedding_factory=forbidden_factory,
+        stdout=stdout,
+        stderr=io.StringIO(),
+    )
+
+    report = json.loads(report_path.read_text(encoding='utf-8'))
+    assert exit_code == 0
+    assert report['summary']['selection']['images'] == 2
+    assert [
+        item['source_relative_path']
+        for item in report['items']
+    ] == ['一/图片.png', '二/图片.png']
+
+
+@pytest.mark.parametrize(
+    'payload',
+    [
+        {},
+        {'source_relative_paths': []},
+        {'source_relative_paths': ['一/图片.png', '一/图片.png']},
+        {'source_relative_paths': ['一/图片.png', 3]},
+    ],
+)
+def test_invalid_selection_manifest_is_rejected_before_creating_source(
+    tmp_path,
+    payload,
+):
+    manifest_path = tmp_path / 'selection.json'
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    stderr = io.StringIO()
+
+    exit_code = main(
+        ['--dry-run', '--selection-manifest', str(manifest_path)],
+        environ=_canonical_env(),
+        source_factory=lambda _config: pytest.fail(
+            '无效清单不得创建来源客户端'
+        ),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert json.loads(stderr.getvalue())['stage'] == 'selection_manifest'
+
+
+def test_selection_manifest_requires_matching_pilot_count(tmp_path):
+    manifest_path = _write_selection_manifest(
+        tmp_path,
+        ['图/一.png', '图/二.png'],
+    )
+    stderr = io.StringIO()
+
+    exit_code = main(
+        ['--pilot', '1', '--selection-manifest', str(manifest_path)],
+        environ=_canonical_env(),
+        source_factory=lambda _config: pytest.fail(
+            '不匹配的清单不得创建来源客户端'
+        ),
+        stdout=io.StringIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 2
+    assert json.loads(stderr.getvalue())['stage'] == 'selection_manifest'
 
 
 def test_public_image_key_classifier_is_case_insensitive():

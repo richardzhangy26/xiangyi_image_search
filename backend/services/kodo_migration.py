@@ -95,6 +95,7 @@ class MigrationOptions:
     pilot_count: Optional[int] = None
     limit: Optional[int] = None
     batch_size: int = MAX_BATCH_SIZE
+    selection_keys: tuple[str, ...] = ()
     retry_enabled: bool = False
     retry_failed_keys: tuple[str, ...] = ()
     retry_binding: Optional[RetryReportBinding] = None
@@ -108,6 +109,7 @@ class MigrationOptions:
         pilot_count: Optional[int] = None,
         limit: Optional[int] = None,
         batch_size: int = MAX_BATCH_SIZE,
+        selection_keys: Sequence[str] = (),
         retry_enabled: bool = False,
         retry_failed_keys: Sequence[str] = (),
         retry_binding: Optional[RetryReportBinding] = None,
@@ -121,6 +123,20 @@ class MigrationOptions:
             raise ValueError("只有 pilot 模式可以设置 pilot_count")
         if limit is not None and limit <= 0:
             raise ValueError("--limit 必须大于 0")
+        normalized_selection_keys = tuple(selection_keys)
+        if normalized_selection_keys:
+            if retry_enabled or retry_failed_keys or retry_binding is not None:
+                raise ValueError(
+                    "--selection-manifest 不能与 --retry-failed 同时使用"
+                )
+            if mode == "full":
+                raise ValueError(
+                    "--full 不能使用 --selection-manifest"
+                )
+            if mode == "pilot" and len(normalized_selection_keys) != pilot_count:
+                raise ValueError(
+                    "--pilot 数量必须与 --selection-manifest 项数一致"
+                )
         try:
             requested_batch_size = int(batch_size)
         except (TypeError, ValueError) as exc:
@@ -143,10 +159,45 @@ class MigrationOptions:
             pilot_count=pilot_count,
             limit=limit,
             batch_size=effective_batch_size,
+            selection_keys=normalized_selection_keys,
             retry_enabled=retry_is_enabled,
             retry_failed_keys=tuple(dict.fromkeys(retry_failed_keys)),
             retry_binding=retry_binding,
         )
+
+
+def load_selection_manifest(report_path: Path) -> tuple[str, ...]:
+    """读取受控试迁移的有序来源路径清单。"""
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise MigrationError(
+            "selection_manifest",
+            safe_exception_summary(exc),
+        ) from exc
+
+    if not isinstance(payload, dict) or set(payload) != {
+        "source_relative_paths"
+    }:
+        raise MigrationError(
+            "selection_manifest",
+            "清单必须只包含 source_relative_paths 字段",
+        )
+    source_relative_paths = payload.get("source_relative_paths")
+    if (
+        not isinstance(source_relative_paths, list)
+        or not source_relative_paths
+        or any(
+            not isinstance(path, str) or not path
+            for path in source_relative_paths
+        )
+        or len(set(source_relative_paths)) != len(source_relative_paths)
+    ):
+        raise MigrationError(
+            "selection_manifest",
+            "source_relative_paths 必须是非空且唯一的字符串数组",
+        )
+    return tuple(source_relative_paths)
 
 
 def load_retry_report(report_path: Path) -> RetryReportBinding:
@@ -237,7 +288,11 @@ def run_migration(
         ) from exc
 
     image_objects = [item for item in objects if is_image_key(item.key)]
-    selected, missing_retry_keys = _select_objects(image_objects, options)
+    selected, missing_retry_keys = _select_objects(
+        objects,
+        image_objects,
+        options,
+    )
 
     if options.mode in WRITE_MODES:
         if ingest_service_factory is None:
@@ -314,6 +369,8 @@ def run_migration(
             "pilot": options.pilot_count,
             "limit": options.limit,
             "batch_size": options.batch_size,
+            "selection_manifest": bool(options.selection_keys),
+            "selection_count": len(options.selection_keys),
         },
         "retry": {
             "enabled": options.retry_enabled,
@@ -501,9 +558,35 @@ def write_report_atomic(report_path: Path, report: dict[str, Any]) -> None:
 
 
 def _select_objects(
+    objects: Sequence[SourceObject],
     image_objects: Sequence[SourceObject],
     options: MigrationOptions,
 ) -> tuple[list[SourceObject], tuple[str, ...]]:
+    if options.selection_keys:
+        objects_by_key = {item.key: item for item in objects}
+        images_by_key = {item.key: item for item in image_objects}
+        missing_selection = [
+            key for key in options.selection_keys if key not in objects_by_key
+        ]
+        non_image = [
+            key
+            for key in options.selection_keys
+            if key in objects_by_key and key not in images_by_key
+        ]
+        if missing_selection:
+            raise MigrationError(
+                "selection_manifest",
+                "清单包含当前筛选范围内不存在的来源路径: "
+                + ", ".join(missing_selection[:5]),
+            )
+        if non_image:
+            raise MigrationError(
+                "selection_manifest",
+                "清单包含不受支持的图片来源路径: "
+                + ", ".join(non_image[:5]),
+            )
+        return [images_by_key[key] for key in options.selection_keys], ()
+
     if options.retry_enabled:
         by_key = {item.key: item for item in image_objects}
         selected = [

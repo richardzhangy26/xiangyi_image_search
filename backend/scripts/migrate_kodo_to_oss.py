@@ -17,6 +17,7 @@ from services.kodo_config import KodoConfig, KodoConfigError
 from services.kodo_migration import (
     MigrationError,
     MigrationOptions,
+    load_selection_manifest,
     load_retry_report,
     run_migration,
     validate_oss_write_target,
@@ -92,6 +93,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="只选择前一份报告中 status=failed 的来源项。",
     )
     parser.add_argument(
+        "--selection-manifest",
+        type=Path,
+        help="试迁移使用的有序来源相对路径 JSON 清单。",
+    )
+    parser.add_argument(
         "--env",
         type=Path,
         default=Path(__file__).resolve().parents[1] / ".env",
@@ -159,6 +165,67 @@ def main(
         return 2
 
     try:
+        selection_keys = (
+            load_selection_manifest(
+                args.selection_manifest.expanduser().resolve()
+            )
+            if args.selection_manifest
+            else ()
+        )
+        if selection_keys and mode not in {"dry-run", "pilot"}:
+            raise MigrationError(
+                "selection_manifest",
+                "--selection-manifest 仅可用于 dry-run 或 pilot 模式",
+            )
+        if selection_keys and args.retry_failed:
+            raise MigrationError(
+                "selection_manifest",
+                "--selection-manifest 不能与 --retry-failed 同时使用",
+            )
+        if selection_keys and mode == "pilot" and args.pilot != len(
+            selection_keys
+        ):
+            raise MigrationError(
+                "selection_manifest",
+                "--pilot 数量必须与 --selection-manifest 项数一致",
+            )
+    except MigrationError as exc:
+        _write_json(stderr, exc.to_dict())
+        return 2
+
+    if mode != "preflight":
+        try:
+            retry_report = (
+                load_retry_report(args.retry_failed.expanduser().resolve())
+                if args.retry_failed
+                else None
+            )
+            options = MigrationOptions.build(
+                mode=mode,
+                prefix=args.prefix,
+                pilot_count=args.pilot,
+                limit=args.limit,
+                batch_size=args.batch_size,
+                selection_keys=selection_keys,
+                retry_enabled=args.retry_failed is not None,
+                retry_failed_keys=(
+                    retry_report.failed_keys if retry_report else ()
+                ),
+                retry_binding=retry_report,
+            )
+        except (MigrationError, ValueError) as exc:
+            if isinstance(exc, MigrationError):
+                payload = exc.to_dict()
+            else:
+                payload = {
+                    "status": "failed",
+                    "stage": "config",
+                    "error": str(exc),
+                }
+            _write_json(stderr, payload)
+            return 2
+
+    try:
         source = source_factory(config)
     except Exception as exc:
         _write_json(
@@ -199,36 +266,6 @@ def main(
             _write_json(stderr, exc.to_dict())
             return 1
         return 0
-
-    try:
-        retry_report = (
-            load_retry_report(args.retry_failed.expanduser().resolve())
-            if args.retry_failed
-            else None
-        )
-        options = MigrationOptions.build(
-            mode=mode,
-            prefix=args.prefix,
-            pilot_count=args.pilot,
-            limit=args.limit,
-            batch_size=args.batch_size,
-            retry_enabled=args.retry_failed is not None,
-            retry_failed_keys=(
-                retry_report.failed_keys if retry_report else ()
-            ),
-            retry_binding=retry_report,
-        )
-    except (MigrationError, ValueError) as exc:
-        if isinstance(exc, MigrationError):
-            payload = exc.to_dict()
-        else:
-            payload = {
-                "status": "failed",
-                "stage": "config",
-                "error": str(exc),
-            }
-        _write_json(stderr, payload)
-        return 2
 
     def ingest_service_factory(ingest_source):
         storage = storage_factory(environment)

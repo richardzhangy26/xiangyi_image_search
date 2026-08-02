@@ -12,6 +12,8 @@ import type {
   VectorIndexEvent,
   ProductFormData,
   ProductImageWriteSummary,
+  ImageAssetListResponse,
+  ImageAssetAssignmentResponse,
 } from '../types/product';
 import { API_BASE_URL } from '../config';
 
@@ -59,6 +61,48 @@ export const getProducts = async (params?: {
     throw new Error(error.error || '获取产品列表失败');
   }
 
+  return response.json();
+};
+
+/** 获取待归款图片资产。 */
+export const getImageAssets = async (params: {
+  page: number;
+  perPage: number;
+  search?: string;
+}): Promise<ImageAssetListResponse> => {
+  const query = new URLSearchParams({
+    assignment: 'unassigned',
+    page: String(params.page),
+    per_page: String(params.perPage),
+  });
+  if (params.search) query.set('search', params.search);
+
+  const response = await fetch(`${API_BASE_URL}/api/image-assets?${query}`, {
+    method: 'GET',
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({
+      error: '获取待归款图片失败',
+    }));
+    throw new Error(error.error || '获取待归款图片失败');
+  }
+  return response.json();
+};
+
+/** 将图片资产事务化关联到一个已有型号。 */
+export const assignImageAssets = async (
+  assetIds: string[],
+  modelNumber: string
+): Promise<ImageAssetAssignmentResponse> => {
+  const response = await fetch(`${API_BASE_URL}/api/image-assets/assign`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ asset_ids: assetIds, model_number: modelNumber }),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: '关联型号失败' }));
+    throw new Error(error.error || '关联型号失败');
+  }
   return response.json();
 };
 

@@ -85,6 +85,32 @@ export interface ProductListResponse {
   per_page: number;
 }
 
+/** 产品管理页使用的安全图片资产摘要。 */
+export interface ImageAssetManagementItem {
+  asset_id: string;
+  model_number: string | null;
+  source_relative_path: string;
+  preview_url: string;
+  source_size: number;
+  source_mime_type: string;
+  source_width: number;
+  source_height: number;
+  created_at: string | null;
+}
+
+export interface ImageAssetListResponse {
+  assets: ImageAssetManagementItem[];
+  total: number;
+  page: number;
+  per_page: number;
+}
+
+export interface ImageAssetAssignmentResponse {
+  model_number: string;
+  assigned_count: number;
+  reused_count: number;
+}
+
 /** 图片资产级搜索结果；商品型号允许尚未补充。 */
 export interface ImageAssetSearchResult {
   asset_id: string;

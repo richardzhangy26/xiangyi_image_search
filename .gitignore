@@ -22,6 +22,7 @@ var/
 
 # Environment variables
 .env
+.env.backup
 .venv
 env/
 venv/
@@ -57,6 +58,7 @@ Thumbs.db
 # Data files
 /data/
 /uploads/
+backups/
 /images/
 商品信息/
 商品信息.zip

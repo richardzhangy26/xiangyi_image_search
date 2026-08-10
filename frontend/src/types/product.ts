@@ -54,7 +54,9 @@ export interface ProductImage {
   model_number: string | null;    // 关联产品型号
   image_path: string;             // 站内私有预览路径（兼容字段）
   preview_url: string;            // 站内私有预览路径
+  display_name: string;           // 用户可编辑的资产显示名称
   source_relative_path: string;   // 上传时的来源路径/文件名
+  version: number;                // 乐观并发版本
   content_hash: string;           // 原图 SHA-256
   original_path: null;            // 正式图片不再使用本机路径
   image_order: number;            // 图片排序
@@ -65,12 +67,17 @@ export interface ProductImage {
 export interface ProductImageWriteResult {
   asset_id: string;
   source_relative_path: string;
-  status: 'created' | 'existing';
+  status: 'created' | 'existing' | 'source_conflict' | 'in_recycle_bin';
+  recovery_action?: {
+    type: 'open_recycle_bin';
+    asset_id: string;
+  };
 }
 
 export interface ProductImageWriteSummary {
   uploaded_images: number;
   reused_images: number;
+  recycle_bin_images: number;
   skipped_duplicates: string[];
   image_results: ProductImageWriteResult[];
 }
@@ -89,7 +96,11 @@ export interface ProductListResponse {
 export interface ImageAssetManagementItem {
   asset_id: string;
   model_number: string | null;
+  display_name: string;
   source_relative_path: string;
+  version: number;
+  status: 'active' | 'archived';
+  archived_at: string | null;
   preview_url: string;
   source_size: number;
   source_mime_type: string;
@@ -105,17 +116,139 @@ export interface ImageAssetListResponse {
   per_page: number;
 }
 
+export interface ArchivedImageAssetListResponse extends ImageAssetListResponse {
+  archived_total: number;
+}
+
 export interface ImageAssetAssignmentResponse {
   model_number: string;
   assigned_count: number;
   reused_count: number;
 }
 
+export interface ImageAssetArchiveItemResult {
+  asset_id: string;
+  status: 'archived' | 'already_archived' | 'unchanged' | 'rejected';
+  version: number | null;
+  error_code?: string;
+  error?: string;
+}
+
+export interface ImageAssetArchiveResponse {
+  batch_id: string;
+  status: 'succeeded' | 'rejected';
+  archived_count: number;
+  already_archived_count: number;
+  items: ImageAssetArchiveItemResult[];
+  error_code?: string;
+  error?: string;
+}
+
+export interface ImageAssetRestoreItemResult {
+  asset_id: string;
+  status: 'restored' | 'already_active' | 'unchanged' | 'rejected';
+  version: number | null;
+  error_code?: string;
+  error?: string;
+}
+
+export interface ImageAssetRestoreResponse {
+  batch_id: string;
+  status: 'succeeded' | 'rejected';
+  restored_count: number;
+  already_active_count: number;
+  items: ImageAssetRestoreItemResult[];
+  error_code?: string;
+  error?: string;
+}
+
+export type ImageImportStatus =
+  | 'queued'
+  | 'embedding'
+  | 'completed'
+  | 'failed'
+  | 'awaiting_retry'
+  | 'cancelled';
+
+/** 服务端持久保存、页面刷新后可恢复的图片导入状态。 */
+export interface ImageImportItem {
+  item_id: string;
+  display_name: string;
+  source_relative_path: string;
+  source_revision: number;
+  status: ImageImportStatus;
+  asset_id: string | null;
+  failure_message: string | null;
+  attempt_count: number;
+  max_auto_attempts: number;
+  last_error_class: string | null;
+  last_attempt_at: string | null;
+  next_retry_at: string | null;
+  cancel_requested_at: string | null;
+  cancelled_at: string | null;
+  recovery_action?: {
+    type: 'open_recycle_bin';
+    asset_id: string;
+  } | null;
+  created_at: string | null;
+  updated_at: string | null;
+  embedding_started_at: string | null;
+  completed_at: string | null;
+  failed_at: string | null;
+}
+
+/** 单项/批量取消的逐项可理解结果。 */
+export type ImageImportCancelResult =
+  | 'cancelled'
+  | 'cancel_requested'
+  | 'already_cancelled'
+  | 'completed_rejected'
+  | 'not_found';
+
+export interface ImageImportCancelItemOutcome {
+  item_id: string;
+  result: ImageImportCancelResult;
+}
+
+export interface ImageImportCancelBatchResponse {
+  items: ImageImportCancelItemOutcome[];
+  cancelled_count: number;
+  batch_id: string;
+}
+
+export interface ImageImportListResponse {
+  items: ImageImportItem[];
+  total: number;
+  page: number;
+  per_page: number;
+  unresolved_count: number;
+  processing_count: number;
+}
+
+export interface ImageImportQueueItem {
+  item_id: string | null;
+  asset_id: string | null;
+  source_relative_path: string;
+  status: 'queued' | 'existing_task' | 'existing' | 'in_recycle_bin';
+  recovery_action: {
+    type: 'open_recycle_bin';
+    asset_id: string;
+  } | null;
+}
+
+export interface ImageImportCreateResponse {
+  items: ImageImportQueueItem[];
+  queued_count: number;
+}
+
 /** 图片资产级搜索结果；商品型号允许尚未补充。 */
 export interface ImageAssetSearchResult {
   asset_id: string;
   model_number: string | null;
+  display_name: string;
+  source_relative_path: string;
   relative_path: string;
+  version: number;
   preview_url: string;
   similarity: number;
 }

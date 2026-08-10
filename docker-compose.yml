@@ -61,6 +61,62 @@ services:
       - app-network
     restart: unless-stopped
 
+  # PostgreSQL 持久队列 worker；与 HTTP 进程独立，可安全水平扩展。
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: fashion-crm-backend:latest
+    container_name: fashion-crm-image-import-worker
+    command: ["python", "-m", "scripts.run_image_import_worker"]
+    env_file:
+      - ./backend/.env
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-image_search}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - TZ=Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # 导入暂存对象清理任务（Issue #22）。
+  # 默认不启动：位于 cleanup profile 之后，且进程自身还要求
+  # IMPORT_CLEANUP_ENABLED=true。真实 OSS 清理启用需单独明确授权。
+  cleanup:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: fashion-crm-backend:latest
+    container_name: fashion-crm-import-cleanup
+    command: ["python", "-m", "scripts.run_import_cleanup"]
+    profiles: ["cleanup"]
+    env_file:
+      - ./backend/.env
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-image_search}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - IMPORT_CLEANUP_ENABLED=${IMPORT_CLEANUP_ENABLED:-false}
+      - TZ=Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    networks:
+      - app-network
+    restart: unless-stopped
+
   # React 前端服务
   frontend:
     build:

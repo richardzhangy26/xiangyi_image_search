@@ -1,9 +1,10 @@
 /**
  * 产品上传管理组件 - 电子产品配件
  */
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Table,
+  Alert,
   Button,
   Modal,
   Form,
@@ -20,6 +21,7 @@ import {
   Empty,
   Segmented,
   Select,
+  Badge,
 } from 'antd';
 import {
   PlusOutlined,
@@ -36,8 +38,10 @@ import {
 import type { UploadFile } from 'antd/es/upload/interface';
 import type {
   ImageAssetManagementItem,
+  ImageImportItem,
   Product,
   ProductFormData,
+  ProductImageWriteSummary,
   VectorIndexEvent,
 } from '../types/product';
 import {
@@ -53,11 +57,22 @@ import {
   buildVectorIndex,
   getImageUrl,
   getImageAssets,
+  getArchivedImageAssets,
+  archiveImageAssets,
+  restoreImageAssets,
+  createImageImports,
+  getImageImportItems,
+  retryImageImportItem,
+  cancelImageImportItems,
 } from '../services/productApi';
 import { UnassignedAssetGrid } from './UnassignedAssetGrid';
+import type { AssetAssignment } from './UnassignedAssetGrid';
+import { ArchivedAssetGrid } from './ArchivedAssetGrid';
+import { ImageImportTaskDrawer } from './ImageImportTaskDrawer';
 
 const ASSET_PAGE_SIZE = 24;
-type ManagementView = 'assets' | 'products';
+const IMPORT_PAGE_SIZE = 20;
+type ManagementView = 'assets' | 'archived' | 'products';
 
 /** CSV 必填字段说明（用于导入弹窗展示） */
 const CSV_REQUIRED_FIELDS = [
@@ -80,12 +95,46 @@ export const ProductUpload: React.FC = () => {
   const [assetTotal, setAssetTotal] = useState(0);
   const [assetPage, setAssetPage] = useState(1);
   const [assetSearch, setAssetSearch] = useState('');
+  const [assetAssignment, setAssetAssignment] = useState<AssetAssignment>('unassigned');
   const [assetLoading, setAssetLoading] = useState(false);
   const [assetError, setAssetError] = useState<string | null>(null);
+  const assetRequestSequence = useRef(0);
   const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
   const [assignModalOpen, setAssignModalOpen] = useState(false);
   const [targetModelNumber, setTargetModelNumber] = useState<string>();
   const [assigning, setAssigning] = useState(false);
+  const [archiveModalOpen, setArchiveModalOpen] = useState(false);
+  const [archiving, setArchiving] = useState(false);
+  const [archivedAssets, setArchivedAssets] = useState<
+    ImageAssetManagementItem[]
+  >([]);
+  const [archivedTotal, setArchivedTotal] = useState(0);
+  const [archivedCount, setArchivedCount] = useState(0);
+  const [archivedPage, setArchivedPage] = useState(1);
+  const [archivedSearch, setArchivedSearch] = useState('');
+  const [archivedLoading, setArchivedLoading] = useState(false);
+  const [archivedError, setArchivedError] = useState<string | null>(null);
+  const [recycleBinNoticeCount, setRecycleBinNoticeCount] = useState(0);
+  const [selectedArchivedAssetIds, setSelectedArchivedAssetIds] = useState<
+    string[]
+  >([]);
+  const [restoring, setRestoring] = useState(false);
+  const archivedRequestSequence = useRef(0);
+  const [imageImportModalOpen, setImageImportModalOpen] = useState(false);
+  const [imageImportFiles, setImageImportFiles] = useState<UploadFile[]>([]);
+  const [imageImportUploading, setImageImportUploading] = useState(false);
+  const [imageImportDrawerOpen, setImageImportDrawerOpen] = useState(false);
+  const [imageImportItems, setImageImportItems] = useState<ImageImportItem[]>([]);
+  const [imageImportTotal, setImageImportTotal] = useState(0);
+  const [imageImportPage, setImageImportPage] = useState(1);
+  const [imageImportUnresolved, setImageImportUnresolved] = useState(0);
+  const [imageImportProcessing, setImageImportProcessing] = useState(0);
+  const [imageImportLoading, setImageImportLoading] = useState(false);
+  const [imageImportError, setImageImportError] = useState<string | null>(null);
+  const [retryingImportIds, setRetryingImportIds] = useState<string[]>([]);
+  const [cancelSelectionIds, setCancelSelectionIds] = useState<string[]>([]);
+  const [cancellingImports, setCancellingImports] = useState(false);
+  const completedImportIds = useRef<Set<string> | null>(null);
 
   // CSV 导入相关
   const [csvModalVisible, setCsvModalVisible] = useState(false);
@@ -100,8 +149,18 @@ export const ProductUpload: React.FC = () => {
 
   useEffect(() => {
     fetchProducts();
-    fetchAssets(1, '');
+    fetchAssets(1, '', 'unassigned');
+    fetchArchivedAssets(1, '');
+    fetchImageImports(1);
   }, []);
+
+  useEffect(() => {
+    if (imageImportProcessing === 0) return undefined;
+    const interval = window.setInterval(() => {
+      void fetchImageImports(imageImportPage);
+    }, 3000);
+    return () => window.clearInterval(interval);
+  }, [imageImportProcessing, imageImportPage]);
 
   const fetchProducts = async () => {
     setLoading(true);
@@ -117,24 +176,170 @@ export const ProductUpload: React.FC = () => {
 
   const fetchAssets = async (
     page: number = assetPage,
-    search: string = assetSearch
+    search: string = assetSearch,
+    assignment: AssetAssignment = assetAssignment
   ) => {
+    const requestSequence = ++assetRequestSequence.current;
     setAssetLoading(true);
     setAssetError(null);
     try {
       const result = await getImageAssets({
+        assignment,
         page,
         perPage: ASSET_PAGE_SIZE,
         search,
       });
+      if (requestSequence !== assetRequestSequence.current) return;
       setAssets(result.assets);
       setAssetTotal(result.total);
     } catch (error) {
+      if (requestSequence !== assetRequestSequence.current) return;
       setAssetError(
-        error instanceof Error ? error.message : '获取待归款图片失败'
+        error instanceof Error ? error.message : '获取图片资产失败'
       );
     } finally {
-      setAssetLoading(false);
+      if (requestSequence === assetRequestSequence.current) {
+        setAssetLoading(false);
+      }
+    }
+  };
+
+  const fetchArchivedAssets = async (
+    page: number = archivedPage,
+    search: string = archivedSearch
+  ) => {
+    const requestSequence = ++archivedRequestSequence.current;
+    setArchivedLoading(true);
+    setArchivedError(null);
+    try {
+      const result = await getArchivedImageAssets({
+        page,
+        perPage: ASSET_PAGE_SIZE,
+        search,
+      });
+      if (requestSequence !== archivedRequestSequence.current) return;
+      setArchivedAssets(result.assets);
+      setArchivedTotal(result.total);
+      setArchivedCount(result.archived_total);
+    } catch (error) {
+      if (requestSequence !== archivedRequestSequence.current) return;
+      setArchivedError(
+        error instanceof Error ? error.message : '获取回收站图片失败'
+      );
+    } finally {
+      if (requestSequence === archivedRequestSequence.current) {
+        setArchivedLoading(false);
+      }
+    }
+  };
+
+  const fetchImageImports = async (page: number = imageImportPage) => {
+    setImageImportLoading(true);
+    setImageImportError(null);
+    try {
+      const result = await getImageImportItems({
+        page,
+        perPage: IMPORT_PAGE_SIZE,
+      });
+      setImageImportItems(result.items);
+      setImageImportTotal(result.total);
+      setImageImportPage(result.page);
+      setImageImportUnresolved(result.unresolved_count);
+      setImageImportProcessing(result.processing_count);
+
+      const currentCompleted = new Set(
+        result.items
+          .filter((item) => item.status === 'completed' && item.asset_id)
+          .map((item) => item.item_id)
+      );
+      const previousCompleted = completedImportIds.current;
+      completedImportIds.current = currentCompleted;
+      if (
+        previousCompleted
+        && [...currentCompleted].some((itemId) => !previousCompleted.has(itemId))
+      ) {
+        void fetchAssets(assetPage, assetSearch, assetAssignment);
+      }
+    } catch (error) {
+      setImageImportError(
+        error instanceof Error ? error.message : '获取图片导入任务失败'
+      );
+    } finally {
+      setImageImportLoading(false);
+    }
+  };
+
+  const handleCreateImageImports = async () => {
+    const files = imageImportFiles
+      .map((item) => item.originFileObj)
+      .filter((item): item is File => Boolean(item));
+    if (files.length === 0) return;
+    setImageImportUploading(true);
+    try {
+      const result = await createImageImports(files);
+      const recycleCount = result.items.filter(
+        (item) => item.status === 'in_recycle_bin'
+      ).length;
+      if (result.queued_count > 0) {
+        message.success(`已排队 ${result.queued_count} 张图片`);
+      }
+      if (recycleCount > 0) {
+        setRecycleBinNoticeCount(recycleCount);
+      }
+      setImageImportModalOpen(false);
+      setImageImportFiles([]);
+      setImageImportDrawerOpen(true);
+      await Promise.all([
+        fetchImageImports(1),
+        fetchAssets(assetPage, assetSearch, assetAssignment),
+      ]);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '图片导入失败');
+    } finally {
+      setImageImportUploading(false);
+    }
+  };
+
+  const handleRetryImportItem = async (itemId: string) => {
+    setRetryingImportIds((current) => (
+      current.includes(itemId) ? current : [...current, itemId]
+    ));
+    try {
+      await retryImageImportItem(itemId);
+      message.success('已重新排队，稍后自动重试');
+      await fetchImageImports(imageImportPage);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '手工重试失败');
+    } finally {
+      setRetryingImportIds((current) => current.filter((id) => id !== itemId));
+    }
+  };
+
+  const handleBulkCancelImports = async () => {
+    if (cancelSelectionIds.length === 0) return;
+    setCancellingImports(true);
+    try {
+      const result = await cancelImageImportItems(cancelSelectionIds);
+      const rejected = result.items.filter(
+        (item) => item.result === 'completed_rejected'
+      ).length;
+      const done = result.items.filter(
+        (item) => item.result === 'cancelled'
+        || item.result === 'cancel_requested'
+        || item.result === 'already_cancelled'
+      ).length;
+      if (done > 0) {
+        message.success(`已处理 ${done} 项取消请求`);
+      }
+      if (rejected > 0) {
+        message.warning(`${rejected} 项已形成正式资产，不能取消，请使用回收站`);
+      }
+      setCancelSelectionIds([]);
+      await fetchImageImports(imageImportPage);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '批量取消失败');
+    } finally {
+      setCancellingImports(false);
     }
   };
 
@@ -153,7 +358,8 @@ export const ProductUpload: React.FC = () => {
       setTargetModelNumber(undefined);
       setSelectedAssetIds([]);
       await Promise.all([
-        fetchAssets(assetPage, assetSearch),
+        fetchAssets(assetPage, assetSearch, assetAssignment),
+        fetchArchivedAssets(archivedPage, archivedSearch),
         fetchProducts(),
       ]);
     } catch (error) {
@@ -163,8 +369,88 @@ export const ProductUpload: React.FC = () => {
     }
   };
 
+  const handleArchiveAssets = async () => {
+    if (selectedAssetIds.length === 0) return;
+    setArchiving(true);
+    try {
+      const result = await archiveImageAssets(selectedAssetIds);
+      message.success(
+        `已处理 ${result.archived_count + result.already_archived_count} 张图片`
+      );
+      setArchiveModalOpen(false);
+      setSelectedAssetIds([]);
+      await Promise.all([
+        fetchAssets(assetPage, assetSearch, assetAssignment),
+        fetchArchivedAssets(archivedPage, archivedSearch),
+      ]);
+    } catch (error) {
+      message.error(
+        error instanceof Error ? error.message : '图片移入回收站失败'
+      );
+    } finally {
+      setArchiving(false);
+    }
+  };
+
+  const handleRestoreAssets = async () => {
+    if (selectedArchivedAssetIds.length === 0) return;
+    setRestoring(true);
+    try {
+      const result = await restoreImageAssets(selectedArchivedAssetIds);
+      message.success(
+        `已处理 ${result.restored_count + result.already_active_count} 张图片`
+      );
+      setSelectedArchivedAssetIds([]);
+      setArchivedPage(1);
+      await Promise.all([
+        fetchArchivedAssets(1, archivedSearch),
+        fetchAssets(assetPage, assetSearch, assetAssignment),
+      ]);
+    } catch (error) {
+      message.error(
+        error instanceof Error ? error.message : '图片恢复失败'
+      );
+    } finally {
+      setRestoring(false);
+    }
+  };
+
   const refreshAll = () => {
-    void Promise.all([fetchProducts(), fetchAssets(assetPage, assetSearch)]);
+    void Promise.all([
+      fetchProducts(),
+      fetchAssets(assetPage, assetSearch, assetAssignment),
+      fetchArchivedAssets(archivedPage, archivedSearch),
+      fetchImageImports(imageImportPage),
+    ]);
+  };
+
+  const reportProductWriteOutcome = (
+    result: ProductImageWriteSummary,
+    defaultMessage: string
+  ) => {
+    if (result.uploaded_images > 0) {
+      message.success(`成功导入 ${result.uploaded_images} 张新图片`);
+    }
+    if (result.reused_images > 0) {
+      message.info(
+        `${result.reused_images} 张图片已按来源身份幂等复用`
+      );
+    }
+    if (result.uploaded_images === 0 && result.reused_images === 0) {
+      message.success(defaultMessage);
+    }
+    if (result.recycle_bin_images > 0) {
+      setRecycleBinNoticeCount(result.recycle_bin_images);
+    }
+  };
+
+  const openRecycleBinFromImport = () => {
+    setActiveView('archived');
+    setArchivedSearch('');
+    setArchivedPage(1);
+    setSelectedAssetIds([]);
+    setSelectedArchivedAssetIds([]);
+    void fetchArchivedAssets(1, '');
   };
 
   const handleAddEdit = () => {
@@ -191,7 +477,11 @@ export const ProductUpload: React.FC = () => {
               .map((image) => image.asset_id) || [];
 
           // 先保存字段和新图片；只有保存成功后才归档被移除的既有资产。
-          await updateProduct(editingProduct.model_number, productData, imageFiles);
+          const writeResult = await updateProduct(
+            editingProduct.model_number,
+            productData,
+            imageFiles
+          );
           const archiveResults = await Promise.allSettled(
             removedAssetIds.map((assetId) =>
               deleteProductImage(editingProduct.model_number, assetId)
@@ -201,23 +491,43 @@ export const ProductUpload: React.FC = () => {
             (result) => result.status === 'rejected'
           ).length;
           if (failedArchiveCount > 0) {
-            await fetchProducts();
+            await Promise.all([
+              fetchProducts(),
+              fetchAssets(assetPage, assetSearch, assetAssignment),
+              fetchArchivedAssets(archivedPage, archivedSearch),
+            ]);
             throw new Error(
               `产品信息已更新，但有 ${failedArchiveCount} 张图片归档失败；请重试保存`
             );
           }
-          message.success('产品更新成功');
+          reportProductWriteOutcome(writeResult, '产品更新成功');
         } else {
           // 创建产品
-          await createProduct(productData as ProductFormData, imageFiles);
-          message.success('产品创建成功');
+          const writeResult = await createProduct(
+            productData as ProductFormData,
+            imageFiles
+          );
+          reportProductWriteOutcome(writeResult, '产品创建成功');
         }
 
         setIsModalVisible(false);
         form.resetFields();
-        fetchProducts();
+        await Promise.all([
+          fetchProducts(),
+          fetchAssets(assetPage, assetSearch, assetAssignment),
+          fetchArchivedAssets(archivedPage, archivedSearch),
+        ]);
       } catch (err) {
-        message.error(err instanceof Error ? err.message : '操作失败');
+        const errorCode = (
+          err && typeof err === 'object' && 'errorCode' in err
+            ? (err as { errorCode?: unknown }).errorCode
+            : undefined
+        );
+        message.error(
+          errorCode === 'IMAGE_ASSET_SOURCE_CONFLICT'
+            ? '来源身份冲突，现有图片未被覆盖'
+            : err instanceof Error ? err.message : '操作失败'
+        );
       } finally {
         setLoading(false);
       }
@@ -228,7 +538,11 @@ export const ProductUpload: React.FC = () => {
     try {
       await deleteProduct(modelNumber);
       message.success('产品删除成功');
-      fetchProducts();
+      await Promise.all([
+        fetchProducts(),
+        fetchAssets(assetPage, assetSearch, assetAssignment),
+        fetchArchivedAssets(archivedPage, archivedSearch),
+      ]);
     } catch (err) {
       message.error(err instanceof Error ? err.message : '删除失败');
     }
@@ -241,7 +555,7 @@ export const ProductUpload: React.FC = () => {
       const imageList: UploadFile[] =
         product.images?.map((img) => ({
           uid: img.asset_id,
-          name: img.source_relative_path.split('/').pop() || '商品图片',
+          name: img.display_name,
           status: 'done',
           url: getImageUrl(img.preview_url),
         })) || [];
@@ -269,7 +583,11 @@ export const ProductUpload: React.FC = () => {
       const modelNumbers = selectedRowKeys as string[];
       const result = await batchDeleteProducts(modelNumbers);
       message.success(result.message || '批量删除成功');
-      fetchProducts();
+      await Promise.all([
+        fetchProducts(),
+        fetchAssets(assetPage, assetSearch, assetAssignment),
+        fetchArchivedAssets(archivedPage, archivedSearch),
+      ]);
       setSelectedRowKeys([]);
     } catch (error) {
       message.error(error instanceof Error ? error.message : '批量删除失败');
@@ -502,7 +820,7 @@ export const ProductUpload: React.FC = () => {
           <div className="flex items-center gap-3">
             <h2 className="text-2xl font-bold text-slate-800 tracking-tight m-0">产品管理</h2>
             <Tag bordered={false} className="bg-amber-50 text-amber-700 font-medium">
-              {assetTotal.toLocaleString('zh-CN')} 张待归款图片
+              {assetTotal.toLocaleString('zh-CN')} 张图片资产
             </Tag>
             <Tag bordered={false} className="bg-teal-50 text-teal-700 font-medium">
               {products.length.toLocaleString('zh-CN')} 个产品
@@ -523,6 +841,23 @@ export const ProductUpload: React.FC = () => {
           >
             添加产品
           </Button>
+
+          <Button
+            icon={<FileImageOutlined />}
+            className="toolbar-btn"
+            onClick={() => setImageImportModalOpen(true)}
+          >
+            导入图片
+          </Button>
+
+          <Badge count={imageImportUnresolved} overflowCount={99}>
+            <Button
+              className="toolbar-btn"
+              onClick={() => setImageImportDrawerOpen(true)}
+            >
+              导入任务
+            </Button>
+          </Badge>
 
           <Space.Compact className="toolbar-btn">
             <Button icon={<UploadOutlined />} onClick={() => setCsvModalVisible(true)}>
@@ -548,7 +883,8 @@ export const ProductUpload: React.FC = () => {
               className="toolbar-btn"
               icon={<ReloadOutlined />}
               onClick={refreshAll}
-              loading={loading || assetLoading}
+              loading={loading || assetLoading || archivedLoading}
+              disabled={restoring}
             />
           </Tooltip>
         </div>
@@ -557,15 +893,21 @@ export const ProductUpload: React.FC = () => {
       <div className="mb-5 animate-rise-delay-1">
         <Segmented
           value={activeView}
+          disabled={restoring}
           onChange={(value) => {
             setActiveView(value as ManagementView);
             setSelectedAssetIds([]);
+            setSelectedArchivedAssetIds([]);
             setSelectedRowKeys([]);
           }}
           options={[
             {
-              label: `待归款图片 (${assetTotal.toLocaleString('zh-CN')})`,
+              label: `图片资产 (${assetTotal.toLocaleString('zh-CN')})`,
               value: 'assets',
+            },
+            {
+              label: `回收站 (${archivedCount.toLocaleString('zh-CN')})`,
+              value: 'archived',
             },
             {
               label: `产品资料 (${products.length.toLocaleString('zh-CN')})`,
@@ -574,6 +916,23 @@ export const ProductUpload: React.FC = () => {
           ]}
         />
       </div>
+
+      {recycleBinNoticeCount > 0 && (
+        <Alert
+          className="mb-5"
+          type="warning"
+          showIcon
+          closable
+          message={`${recycleBinNoticeCount} 张图片已在回收站，未自动恢复`}
+          description="来源身份与内容均相同，因此没有创建重复资产。请在回收站中显式选择是否恢复。"
+          action={(
+            <Button onClick={openRecycleBinFromImport}>
+              前往回收站
+            </Button>
+          )}
+          onClose={() => setRecycleBinNoticeCount(0)}
+        />
+      )}
 
       {/* 批量选择上下文操作条：仅选中时浮现 */}
       {activeView === 'products' && selectedRowKeys.length > 0 && (
@@ -628,22 +987,73 @@ export const ProductUpload: React.FC = () => {
             loading={assetLoading}
             error={assetError}
             search={assetSearch}
+            assignment={assetAssignment}
             selectedAssetIds={selectedAssetIds}
             canAssign={products.length > 0}
             onSearch={(value) => {
               setAssetSearch(value);
               setAssetPage(1);
               setSelectedAssetIds([]);
-              void fetchAssets(1, value);
+              void fetchAssets(1, value, assetAssignment);
+            }}
+            onAssignmentChange={(assignment) => {
+              setAssetAssignment(assignment);
+              setAssetPage(1);
+              setSelectedAssetIds([]);
+              void fetchAssets(1, assetSearch, assignment);
             }}
             onPageChange={(page) => {
               setAssetPage(page);
               setSelectedAssetIds([]);
-              void fetchAssets(page, assetSearch);
+              void fetchAssets(page, assetSearch, assetAssignment);
             }}
             onSelectionChange={setSelectedAssetIds}
             onAssign={() => setAssignModalOpen(true)}
-            onRetry={() => void fetchAssets(assetPage, assetSearch)}
+            onArchive={() => setArchiveModalOpen(true)}
+            onRetry={() => void fetchAssets(
+              assetPage,
+              assetSearch,
+              assetAssignment
+            )}
+            onAssetRenamed={(renamedAsset) => {
+              setAssets((current) => current.map((asset) =>
+                asset.asset_id === renamedAsset.asset_id
+                  ? renamedAsset
+                  : asset
+              ));
+              if (assetSearch) {
+                void fetchAssets(assetPage, assetSearch, assetAssignment);
+              }
+            }}
+          />
+        ) : activeView === 'archived' ? (
+          <ArchivedAssetGrid
+            assets={archivedAssets}
+            total={archivedTotal}
+            page={archivedPage}
+            pageSize={ASSET_PAGE_SIZE}
+            loading={archivedLoading}
+            error={archivedError}
+            search={archivedSearch}
+            selectedAssetIds={selectedArchivedAssetIds}
+            restoring={restoring}
+            onSearch={(value) => {
+              setArchivedSearch(value);
+              setArchivedPage(1);
+              setSelectedArchivedAssetIds([]);
+              void fetchArchivedAssets(1, value);
+            }}
+            onPageChange={(page) => {
+              setArchivedPage(page);
+              setSelectedArchivedAssetIds([]);
+              void fetchArchivedAssets(page, archivedSearch);
+            }}
+            onSelectionChange={setSelectedArchivedAssetIds}
+            onRestore={() => void handleRestoreAssets()}
+            onRetry={() => void fetchArchivedAssets(
+              archivedPage,
+              archivedSearch
+            )}
           />
         ) : (
           <Table
@@ -675,6 +1085,68 @@ export const ProductUpload: React.FC = () => {
       </div>
 
       <Modal
+        title="导入待归款图片"
+        open={imageImportModalOpen}
+        okText="开始导入"
+        cancelText="关闭"
+        confirmLoading={imageImportUploading}
+        okButtonProps={{ disabled: imageImportFiles.length === 0 }}
+        onOk={handleCreateImageImports}
+        onCancel={() => {
+          setImageImportModalOpen(false);
+          setImageImportFiles([]);
+        }}
+      >
+        <p className="text-sm text-slate-500 mt-0">
+          图片校验并写入私有存储后会立即返回，向量由独立任务继续生成。
+        </p>
+        <Upload.Dragger
+          multiple
+          maxCount={20}
+          accept="image/*"
+          beforeUpload={() => false}
+          fileList={imageImportFiles}
+          onChange={({ fileList }) => setImageImportFiles(fileList)}
+        >
+          <p className="ant-upload-drag-icon">
+            <InboxOutlined />
+          </p>
+          <p>点击或拖拽图片到此处</p>
+          <p className="text-xs text-slate-400">单次最多 20 张</p>
+        </Upload.Dragger>
+      </Modal>
+
+      <ImageImportTaskDrawer
+        open={imageImportDrawerOpen}
+        onClose={() => setImageImportDrawerOpen(false)}
+        items={imageImportItems}
+        total={imageImportTotal}
+        page={imageImportPage}
+        pageSize={IMPORT_PAGE_SIZE}
+        unresolvedCount={imageImportUnresolved}
+        processingCount={imageImportProcessing}
+        loading={imageImportLoading}
+        error={imageImportError}
+        onPageChange={(page) => void fetchImageImports(page)}
+        onRefresh={() => void fetchImageImports(imageImportPage)}
+        onOpenAsset={() => {
+          setImageImportDrawerOpen(false);
+          setActiveView('assets');
+          setAssetAssignment('unassigned');
+          setAssetSearch('');
+          setAssetPage(1);
+          void fetchAssets(1, '', 'unassigned');
+        }}
+        onOpenRecycleBin={openRecycleBinFromImport}
+        onRetryItem={(itemId) => void handleRetryImportItem(itemId)}
+        retryingItemIds={retryingImportIds}
+        selectedCancelIds={cancelSelectionIds}
+        onCancelSelectionChange={setCancelSelectionIds}
+        onBulkCancel={() => void handleBulkCancelImports()}
+        cancelling={cancellingImports}
+      />
+
+      <Modal
         title={`关联 ${selectedAssetIds.length} 张图片`}
         open={assignModalOpen}
         okText="确定关联"
@@ -702,6 +1174,22 @@ export const ProductUpload: React.FC = () => {
           onChange={setTargetModelNumber}
           className="w-full"
         />
+      </Modal>
+
+      <Modal
+        title={`确认将选中的 ${selectedAssetIds.length} 张图片移入回收站？`}
+        open={archiveModalOpen}
+        okText="确认移入回收站"
+        cancelText="取消"
+        okButtonProps={{ danger: true }}
+        confirmLoading={archiving}
+        onOk={handleArchiveAssets}
+        onCancel={() => setArchiveModalOpen(false)}
+      >
+        <p>
+          移入后，这些图片将立即从普通搜索和向量搜索中隐藏，
+          但不会删除原图、预览或向量，仍可从回收站恢复。
+        </p>
       </Modal>
 
       {/* 添加/编辑产品弹窗 */}

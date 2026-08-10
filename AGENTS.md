@@ -23,9 +23,11 @@ This file provides guidance to AI coding agents (Claude Code, Qoder, etc.) when 
 ### 正式图片工作流
 
 1. scripts.migrate_kodo_to_oss 对 Kodo 做只读 preflight、盘点和经授权的迁移；Kodo 不执行 Put/Delete。
-2. 迁移或产品上传经过 ImageAssetIngestService：在私有 OSS 中无覆盖写入原图和 preview-v1 预览，然后写入 image_assets 及其向量。
-3. VectorSearchService 只检索 image_assets.status = active 的向量。
-4. API 只返回资产 ID 和 /api/image-assets/<asset_id>/preview；该入口生成短时签名 URL 并返回私有 302，不保存或拼接公开 URL。
+2. 迁移或兼容产品上传经过 ImageAssetIngestService；产品管理页的独立图片导入在完成图片校验与私有 OSS 无覆盖写入后创建 image_import_items 排队项并立即返回。
+3. 独立 worker 用 PostgreSQL `FOR UPDATE SKIP LOCKED` 与租约领取任务，在请求外生成 embedding；只有模型和 1024 维有限向量校验通过后，才在同一事务中创建正式 image_assets 并完成任务。
+4. VectorSearchService 只检索 image_assets.status = active 的向量。
+5. API 只返回资产 ID 和 /api/image-assets/<asset_id>/preview；该入口生成短时签名 URL 并返回私有 302，不保存或拼接公开 URL。
+6. 未归款资产可原地移入回收站并批量恢复；恢复只改变生命周期字段和版本，复用原资产 ID、向量及 OSS 绑定，不重新上传或生成 embedding。
 
 product_images 是**未修改的退休兼容表**，不属于新库 schema、应用 ORM 或活动写路径。任何另行授权的兼容迁移前，先运行 python -m scripts.audit_legacy_product_images，根据只读审计结果制作人工迁移清单；本仓库不自动迁移、删除或覆盖它，也不物理清理旧对象。
 
@@ -33,15 +35,20 @@ product_images 是**未修改的退休兼容表**，不属于新库 schema、应
 
 - backend/app.py - Flask 初始化、数据库配置、CORS、蓝图注册和日志。
 - backend/models/image_asset.py - 独立 ImageAsset 模型；型号可空，商品删除时设为 NULL。
+- backend/models/image_import_item.py - queued、embedding、completed、failed 四态持久导入项及 worker claim 租约。
 - backend/services/image_normalizer.py - EXIF、尺寸、透明背景、动图首帧和 2.5 MiB 上限。
-- backend/services/object_storage.py - 私有 OSS HEAD、无覆盖上传和短时签名下载。
+- backend/services/object_storage.py - 私有 OSS HEAD、无覆盖上传、worker 私有下载和短时签名下载。
 - backend/services/asset_ingest.py - 来源图片到 OSS、embedding 和 PostgreSQL 的纵向入库服务。
+- backend/services/image_import_worker.py - 多实例任务领取、结果校验、原子资产提升和失败落库。
+- backend/services/asset_recycle_bin.py - 归档资产只读列表、计数与最多 100 张的原子批量恢复服务。
 - backend/services/vector_search.py - pgvector 检索服务。
 - backend/services/kodo_source.py - Kodo S3 只读对象来源。
 - backend/scripts/migrate_kodo_to_oss.py - 受控 Kodo → 私有 OSS 迁移入口。
 - backend/scripts/audit_legacy_product_images.py - 独立、只读的退休兼容表审计入口。
+- backend/scripts/run_image_import_worker.py - 独立持久导入 worker 进程入口。
 - backend/blueprints/products_v2.py - Product CRUD、CSV 导入和产品图片资产入库（/api/products）。
-- backend/blueprints/image_assets.py - 图片资产列表、归款和私有预览 302（/api/image-assets）。
+- backend/blueprints/image_assets.py - 活跃/归档图片资产列表、归款、归档、恢复和私有预览 302（/api/image-assets）。
+- backend/blueprints/image_imports.py - 图片导入排队、持久任务列表和详情（/api/image-imports）。
 - backend/models/product.py - Product 商品元数据模型。
 - backend/init_db.py - 创建 pgvector 扩展、模型表和 image_assets HNSW 索引。
 - postgres/init/01_init.sql - Docker 首次启动 SQL；应与模型保持一致。
@@ -84,18 +91,19 @@ SET LOCAL 保证连接归还连接池时不污染后续请求；服务在成功�
 
 - React 18 + TypeScript + Vite；Ant Design 5 和 Tailwind CSS。
 - ProductSearch（以图搜款）和 ProductUpload（产品管理）是当前路由组件。
-- ProductUpload 默认展示待归款图片，支持按来源路径搜索、分页、多选并关联既有型号；不自动推断或创建型号，也不提供解绑、跨型号改绑。
+- ProductUpload 默认展示待归款图片，并提供独立回收站标签、图片导入入口、未解决任务徽标和持久任务抽屉；刷新后任务状态从服务端恢复。页面不自动推断或创建型号，也不提供任务重试/取消、解绑、跨型号改绑或永久清除。
 - 前端通过 /api/ 访问后端；Nginx 只代理 API，不提供本地图片静态源。
 - 图片卡片使用私有预览入口，浏览器跟随 302 获取短时签名地址。
 
 ## Docker 部署
 
-docker-compose.yml 包含 db、backend、frontend 三个服务，网络为 app-network：
+docker-compose.yml 包含 db、backend、worker、frontend 四个服务，网络为 app-network：
 
 | 服务 | 容器 | 端口 | 说明 |
 | --- | --- | --- | --- |
 | db | fashion-crm-db | 127.0.0.1:5433 → 5432 | pgvector PostgreSQL 16 |
 | backend | fashion-crm-backend | 0.0.0.0:5000 → 5000 | Gunicorn；健康检查 /api/health |
+| worker | fashion-crm-image-import-worker | 无 | PostgreSQL 持久队列的独立 embedding worker |
 | frontend | fashion-crm-frontend | 0.0.0.0:80 → 80 | Nginx 静态构建和 API 代理 |
 
 - 数据库卷 postgres_data 保存 PostgreSQL 数据。
@@ -160,12 +168,17 @@ backend/.env（由 .env.example 复制）中的必填项：
 | id | UUID 主键 |
 | model_number | 可空外键；未归款资产为 NULL |
 | source_provider / source_bucket / source_relative_path / source_revision | 来源身份和修订号 |
+| display_name / version | 可编辑显示名称与乐观并发版本 |
 | oss_path / preview_oss_path | 私有 OSS 原图和规范化预览对象键 |
 | content_hash / source_size / source_mime_type / source_width / source_height | 原图内容和尺寸元数据 |
 | vector / embedding_model / embedding_dimension | 1024 维 pgvector 及模型绑定 |
-| normalization_version / status | 规范化版本；active 或 archived |
+| normalization_version / status / archived_at | 规范化版本；active 或 archived 生命周期及归档时间 |
 
 索引包括内容哈希、型号、状态和只针对 active 资产的 HNSW cosine 索引。退休兼容表保持原样，不由新库初始化或应用写路径创建；如需兼容迁移，先单独执行只读审计并取得授权。
+
+### image_import_items
+
+持久保存已通过图片校验并写入私有 OSS 的导入项，状态仅为 queued、embedding、completed、failed。表中保存四列来源身份、对象绑定、规范化元数据、预期模型/维度、正式 asset_id 以及 claim token/generation/owner/lease；worker 崩溃后只通过过期租约恢复领取，失败任务不会自动重试，也不会产生正式资产或占位向量。
 
 ## 产品与迁移操作
 
@@ -203,6 +216,9 @@ python -m pytest test/ --ignore=test/integration -v
 
 - 不执行 DROP、DELETE、覆盖上传或云对象清理来“迁移”旧数据；所有收缩动作必须另行授权并可回滚。
 - 图片正式来源始终是私有 OSS，Kodo 只读备份；预览始终经过 /api/image-assets/<asset_id>/preview 的短时签名 302。
+- 回收站只保存 image_assets 的归档状态；恢复不得复制对象、重算向量或更改来源身份，自动过期与永久清除不属于当前应用能力。
+- 图片导入以 source_provider、source_bucket、source_relative_path、source_revision 组成的来源身份去重：相同来源身份和同一内容返回既有结果；同一来源身份但内容不同返回来源冲突且绝不覆盖；命中归档来源身份时返回回收站结果且不自动恢复；不同来源路径即使内容相同也分别创建资产，只允许复用兼容预览和向量。
+- 图片导入任务只由独立 worker 处理；HTTP 请求内不启动线程或可靠内存队列。失败项不自动重试，当前没有手工重试、取消、退避、暂存对象清理或永久删除能力。
 - 不在应用启动、普通部署或健康检查中隐式运行兼容审计或迁移。
 - Legacy TypeScript 组件（如 OrderManagement）未路由且可能有类型错误，除非重新启用，否则不要顺手修复。
 - 如果 Docker 报告历史容器名称冲突，只处理明确冲突的容器；不要删除数据库卷。

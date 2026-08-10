@@ -2,7 +2,13 @@
 
 from types import SimpleNamespace
 
-from services.object_storage import ObjectSpec, OssObjectStorage
+import pytest
+
+from services.object_storage import (
+    ObjectSpec,
+    ObjectStorageError,
+    OssObjectStorage,
+)
 
 
 class FakeBucket:
@@ -42,6 +48,11 @@ class FakeBucket:
 
     def put_object(self, key, data, headers=None):
         self.calls.append(('put_bytes', key, data, headers))
+
+    def get_object_to_file(self, key, filename):
+        self.calls.append(('download', key, filename))
+        with open(filename, 'wb') as target:
+            target.write(b'private-preview')
 
     def sign_url(self, method, key, expires, headers=None, params=None,
                  slash_safe=False):
@@ -128,3 +139,28 @@ def test_private_signing_does_not_change_bucket_acl():
 
     assert signed == 'https://private.example/signed'
     assert bucket.calls == [('sign', 'GET', 'preview/key.jpg', 600, True)]
+
+
+def test_private_download_writes_only_the_requested_target(tmp_path):
+    bucket = FakeBucket()
+    target = tmp_path / 'worker-preview.jpg'
+
+    OssObjectStorage(bucket).download_file('preview/key.jpg', target)
+
+    assert target.read_bytes() == b'private-preview'
+    assert bucket.calls == [('download', 'preview/key.jpg', str(target))]
+
+
+def test_private_download_maps_provider_failure_without_raw_message(tmp_path):
+    class SecretFailureBucket(FakeBucket):
+        def get_object_to_file(self, key, filename):
+            raise RuntimeError('secret-signature-and-provider-body')
+
+    with pytest.raises(ObjectStorageError) as captured:
+        OssObjectStorage(SecretFailureBucket()).download_file(
+            'preview/key.jpg',
+            tmp_path / 'worker-preview.jpg',
+        )
+
+    assert str(captured.value) == 'OSS 下载失败: RuntimeError'
+    assert 'secret-signature' not in str(captured.value)

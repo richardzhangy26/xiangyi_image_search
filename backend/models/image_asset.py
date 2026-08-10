@@ -7,6 +7,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import Uuid, text
 
 from . import db
+from services.asset_display_name import default_display_name
 
 
 class ImageAsset(db.Model):
@@ -26,6 +27,14 @@ class ImageAsset(db.Model):
     source_bucket = db.Column(db.String(255), nullable=False)
     source_relative_path = db.Column(db.Text, nullable=False)
     source_revision = db.Column(db.Integer, nullable=False, default=1)
+    display_name = db.Column(
+        db.Text,
+        nullable=False,
+        default=lambda context: default_display_name(
+            context.get_current_parameters()['source_relative_path']
+        ),
+    )
+    version = db.Column(db.BigInteger, nullable=False, default=1)
 
     oss_path = db.Column(db.Text, nullable=False, unique=True)
     preview_oss_path = db.Column(db.Text, nullable=False)
@@ -75,6 +84,10 @@ class ImageAsset(db.Model):
             'embedding_dimension = 1024',
             name='ck_image_assets_embedding_dimension',
         ),
+        db.CheckConstraint(
+            'version >= 1',
+            name='ck_image_assets_version',
+        ),
         db.Index('idx_image_assets_content_hash', 'content_hash'),
         db.Index('idx_image_assets_model_number', 'model_number'),
         db.Index('idx_image_assets_status', 'status'),
@@ -97,6 +110,8 @@ class ImageAsset(db.Model):
             'source_bucket': self.source_bucket,
             'source_relative_path': self.source_relative_path,
             'source_revision': self.source_revision,
+            'display_name': self.display_name,
+            'version': self.version,
             'oss_path': self.oss_path,
             'preview_oss_path': self.preview_oss_path,
             'content_hash': self.content_hash,

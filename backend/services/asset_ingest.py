@@ -5,11 +5,15 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
 
-from models import ImageAsset, db
+from sqlalchemy.exc import IntegrityError
+
+from models import ImageAsset, ImageImportItem, db
+from services.asset_display_name import default_display_name
 from services.embedding import (
     EMBEDDING_DIMENSION,
     EMBEDDING_MODEL,
@@ -59,7 +63,11 @@ class AssetIngestConflictError(AssetIngestError):
         *,
         stage: str = 'database',
         kind: str = 'source_conflict',
+        asset_id: Optional[str] = None,
+        source_relative_path: str = '',
     ):
+        self.asset_id = asset_id
+        self.source_relative_path = source_relative_path
         super().__init__(message, stage=stage, kind=kind)
 
 
@@ -75,6 +83,16 @@ class AssetIngestResult:
     stages: dict[str, str] = field(default_factory=dict)
     error_stage: Optional[str] = None
     error: Optional[str] = None
+    recovery_action: Optional[dict[str, str]] = None
+
+
+@dataclass(frozen=True)
+class ImageImportQueueResult:
+    status: str
+    item_id: Optional[str]
+    asset_id: Optional[str]
+    source_relative_path: str
+    recovery_action: Optional[dict[str, str]] = None
 
 
 @dataclass
@@ -187,6 +205,140 @@ class ImageAssetIngestService:
             if commit:
                 db.session.rollback()
             raise
+
+    def queue_one(
+        self,
+        source_relative_path: str,
+        *,
+        request_id: Optional[str] = None,
+        commit: bool = True,
+    ) -> ImageImportQueueResult:
+        """验证并写入私有对象后持久排队，不在请求内生成 embedding。"""
+        if not source_relative_path:
+            raise ValueError('来源相对路径不能为空')
+
+        location = self._source.resolve_location()
+        try:
+            with tempfile.TemporaryDirectory(prefix='image-import-') as temp_dir:
+                prepared_or_existing = self._prepare_one(
+                    source_relative_path,
+                    location=location,
+                    temp_dir=Path(temp_dir),
+                    item_index=0,
+                    model_number=None,
+                    content_cache={},
+                    stages={},
+                )
+                if isinstance(prepared_or_existing, AssetIngestResult):
+                    result = ImageImportQueueResult(
+                        status=prepared_or_existing.status,
+                        item_id=None,
+                        asset_id=prepared_or_existing.asset_id,
+                        source_relative_path=source_relative_path,
+                        recovery_action=prepared_or_existing.recovery_action,
+                    )
+                    self._commit_if_requested(commit)
+                    return result
+                return self._persist_import_item(
+                    prepared_or_existing,
+                    request_id=request_id or uuid.uuid4().hex,
+                    commit=commit,
+                )
+        except Exception:
+            if commit:
+                db.session.rollback()
+            raise
+
+    def _persist_import_item(
+        self,
+        prepared: _PreparedAsset,
+        *,
+        request_id: str,
+        commit: bool,
+    ) -> ImageImportQueueResult:
+        existing = self._find_import_item(
+            source_bucket=prepared.source_bucket,
+            source_relative_path=prepared.source_relative_path,
+        )
+        if existing is not None:
+            result = self._existing_import_result(existing, prepared)
+            self._commit_if_requested(commit)
+            return result
+
+        item = ImageImportItem(
+            source_provider=self._source_provider,
+            source_bucket=prepared.source_bucket,
+            source_relative_path=prepared.source_relative_path,
+            source_revision=1,
+            display_name=default_display_name(prepared.source_relative_path),
+            oss_path=prepared.oss_path,
+            preview_oss_path=prepared.preview_oss_path,
+            content_hash=prepared.content_hash,
+            source_size=prepared.source_size,
+            source_mime_type=prepared.source_mime_type,
+            source_width=prepared.source_width,
+            source_height=prepared.source_height,
+            normalization_version=prepared.normalization_version,
+            expected_embedding_model=EMBEDDING_MODEL,
+            expected_embedding_dimension=EMBEDDING_DIMENSION,
+            status='queued',
+            asset_id=None,
+            request_id=request_id,
+        )
+        try:
+            with db.session.begin_nested():
+                db.session.add(item)
+                db.session.flush()
+        except IntegrityError as exc:
+            winner = self._find_import_item(
+                source_bucket=prepared.source_bucket,
+                source_relative_path=prepared.source_relative_path,
+            )
+            if winner is None:
+                raise AssetIngestError(
+                    '数据库导入项唯一性冲突，但无法读取既有任务',
+                    stage='database',
+                ) from exc
+            result = self._existing_import_result(winner, prepared)
+            self._commit_if_requested(commit)
+            return result
+
+        self._commit_if_requested(commit)
+        return ImageImportQueueResult(
+            status='queued',
+            item_id=str(item.id),
+            asset_id=None,
+            source_relative_path=prepared.source_relative_path,
+        )
+
+    def _find_import_item(
+        self,
+        *,
+        source_bucket: str,
+        source_relative_path: str,
+    ):
+        return ImageImportItem.query.filter_by(
+            source_provider=self._source_provider,
+            source_bucket=source_bucket,
+            source_relative_path=source_relative_path,
+            source_revision=1,
+        ).one_or_none()
+
+    @staticmethod
+    def _existing_import_result(existing, prepared) -> ImageImportQueueResult:
+        if existing.content_hash != prepared.content_hash:
+            raise AssetIngestConflictError(
+                '来源冲突：同一导入来源身份的内容已经变化',
+                stage='database',
+                kind='source_conflict',
+                source_relative_path=prepared.source_relative_path,
+            )
+        return ImageImportQueueResult(
+            status='existing_task',
+            item_id=str(existing.id),
+            asset_id=(str(existing.asset_id) if existing.asset_id else None),
+            source_relative_path=prepared.source_relative_path,
+        )
 
     def ingest_many(
         self,
@@ -442,19 +594,16 @@ class ImageAssetIngestService:
             self._normalizer.normalization_version,
             content_hash,
         )
-        existing = ImageAsset.query.filter_by(
-            source_provider=self._source_provider,
+        existing = self._find_source_asset(
             source_bucket=location.source_bucket,
             source_relative_path=source_relative_path,
-            source_revision=1,
-        ).one_or_none()
+        )
         if existing is not None:
-            if existing.content_hash != content_hash:
-                raise AssetIngestConflictError(
-                    '来源冲突：同一来源路径的内容已经变化',
-                    stage='database',
-                    kind='source_conflict',
-                )
+            self._assert_same_source_content(
+                existing,
+                content_hash=content_hash,
+                source_relative_path=source_relative_path,
+            )
             self._assert_compatible_existing(
                 existing,
                 original_key=original_key,
@@ -472,7 +621,7 @@ class ImageAssetIngestService:
                 'database': 'reused',
             })
             return self._result(
-                'existing',
+                self._existing_status(existing),
                 existing,
                 source_relative_path=source_relative_path,
                 source_size=actual_size,
@@ -621,6 +770,8 @@ class ImageAssetIngestService:
             source_bucket=prepared.source_bucket,
             source_relative_path=prepared.source_relative_path,
             source_revision=1,
+            display_name=default_display_name(prepared.source_relative_path),
+            version=1,
             oss_path=prepared.oss_path,
             preview_oss_path=prepared.preview_oss_path,
             content_hash=prepared.content_hash,
@@ -635,10 +786,50 @@ class ImageAssetIngestService:
             status='active',
         )
         try:
-            db.session.add(asset)
-            db.session.flush()
-            if commit:
-                db.session.commit()
+            with db.session.begin_nested():
+                db.session.add(asset)
+                db.session.flush()
+        except IntegrityError as exc:
+            winner = self._find_source_asset(
+                source_bucket=prepared.source_bucket,
+                source_relative_path=prepared.source_relative_path,
+            )
+            if winner is None:
+                if commit:
+                    db.session.rollback()
+                raise AssetIngestError(
+                    '数据库来源身份唯一性冲突，但无法读取既有资产',
+                    stage='database',
+                ) from exc
+            try:
+                self._assert_same_source_content(
+                    winner,
+                    content_hash=prepared.content_hash,
+                    source_relative_path=prepared.source_relative_path,
+                )
+                self._assert_compatible_existing(
+                    winner,
+                    original_key=prepared.oss_path,
+                    preview_key=prepared.preview_oss_path,
+                )
+            except Exception:
+                if commit:
+                    db.session.rollback()
+                raise
+            prepared.stages.update({
+                'original': 'reused',
+                'preview': 'reused',
+                'embedding': 'reused',
+                'database': 'reused',
+            })
+            self._commit_if_requested(commit)
+            return self._result(
+                self._existing_status(winner),
+                winner,
+                source_relative_path=prepared.source_relative_path,
+                source_size=prepared.source_size,
+                stages=prepared.stages,
+            )
         except Exception as exc:
             if commit:
                 db.session.rollback()
@@ -646,6 +837,8 @@ class ImageAssetIngestService:
                 f'数据库写入失败: {type(exc).__name__}',
                 stage='database',
             ) from exc
+
+        self._commit_if_requested(commit)
 
         prepared.stages['database'] = 'new'
         return self._result(
@@ -742,11 +935,12 @@ class ImageAssetIngestService:
         try:
             self._storage.put_file(key, source_path, spec=spec)
         except ObjectStorageConflictError as exc:
-            raise AssetIngestConflictError(
-                f'OSS {conflict_name}对象冲突，已存在对象未被覆盖',
-                stage='original',
-                kind='oss_conflict',
-            ) from exc
+            return self._reuse_after_write_conflict(
+                key,
+                spec=spec,
+                conflict_name=conflict_name,
+                cause=exc,
+            )
         except ObjectStorageError as exc:
             raise AssetIngestError(
                 f'OSS {conflict_name}上传失败',
@@ -767,11 +961,12 @@ class ImageAssetIngestService:
         try:
             self._storage.put_bytes(key, data, spec=spec)
         except ObjectStorageConflictError as exc:
-            raise AssetIngestConflictError(
-                f'OSS {conflict_name}对象冲突，已存在对象未被覆盖',
-                stage='preview',
-                kind='oss_conflict',
-            ) from exc
+            return self._reuse_after_write_conflict(
+                key,
+                spec=spec,
+                conflict_name=conflict_name,
+                cause=exc,
+            )
         except ObjectStorageError as exc:
             raise AssetIngestError(
                 f'OSS {conflict_name}上传失败',
@@ -805,6 +1000,22 @@ class ImageAssetIngestService:
             conflict_name=conflict_name,
         )
         return False
+
+    def _reuse_after_write_conflict(
+        self,
+        key: str,
+        *,
+        spec: ObjectSpec,
+        conflict_name: str,
+        cause: ObjectStorageConflictError,
+    ) -> str:
+        if not self._object_needs_upload(key, spec, conflict_name):
+            return 'reused'
+        raise AssetIngestConflictError(
+            f'OSS {conflict_name}对象冲突，已存在对象未被覆盖',
+            stage='original' if conflict_name == '原图' else 'preview',
+            kind='oss_conflict',
+        ) from cause
 
     @staticmethod
     def _assert_matching(
@@ -854,6 +1065,62 @@ class ImageAssetIngestService:
                 stage='database',
                 kind='version_conflict',
             )
+
+    def _find_source_asset(
+        self,
+        *,
+        source_bucket: str,
+        source_relative_path: str,
+    ):
+        return ImageAsset.query.filter_by(
+            source_provider=self._source_provider,
+            source_bucket=source_bucket,
+            source_relative_path=source_relative_path,
+            source_revision=1,
+        ).one_or_none()
+
+    @staticmethod
+    def _assert_same_source_content(
+        existing,
+        *,
+        content_hash: str,
+        source_relative_path: str,
+    ) -> None:
+        if existing.content_hash != content_hash:
+            raise AssetIngestConflictError(
+                '来源冲突：同一来源身份的内容已经变化',
+                stage='database',
+                kind='source_conflict',
+                asset_id=str(existing.id),
+                source_relative_path=source_relative_path,
+            )
+
+    @staticmethod
+    def _existing_status(existing) -> str:
+        if existing.status == 'active':
+            return 'existing'
+        if existing.status == 'archived':
+            return 'in_recycle_bin'
+        raise AssetIngestConflictError(
+            '来源记录处于不支持的生命周期状态',
+            stage='database',
+            kind='version_conflict',
+            asset_id=str(existing.id),
+            source_relative_path=existing.source_relative_path,
+        )
+
+    @staticmethod
+    def _commit_if_requested(commit: bool) -> None:
+        if not commit:
+            return
+        try:
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            raise AssetIngestError(
+                f'数据库提交失败: {type(exc).__name__}',
+                stage='database',
+            ) from exc
 
     def _validate_existing_asset_objects(
         self,
@@ -1004,6 +1271,14 @@ class ImageAssetIngestService:
         source_size: int = 0,
         stages: Optional[dict[str, str]] = None,
     ) -> AssetIngestResult:
+        recovery_action = (
+            {
+                'type': 'open_recycle_bin',
+                'asset_id': str(asset.id),
+            }
+            if status == 'in_recycle_bin'
+            else None
+        )
         return AssetIngestResult(
             status=status,
             asset_id=str(asset.id),
@@ -1015,6 +1290,7 @@ class ImageAssetIngestService:
             ),
             source_size=source_size or asset.source_size,
             stages=dict(stages or {}),
+            recovery_action=recovery_action,
         )
 
     @staticmethod
@@ -1050,13 +1326,21 @@ class ImageAssetIngestService:
             completed_stages.update(prepared.stages)
         return AssetIngestResult(
             status=status,
-            asset_id=None,
+            asset_id=(
+                exc.asset_id
+                if isinstance(exc, AssetIngestConflictError)
+                else None
+            ),
             content_hash=prepared.content_hash if prepared else None,
             oss_path=prepared.oss_path if prepared else None,
             preview_oss_path=(
                 prepared.preview_oss_path if prepared else None
             ),
-            source_relative_path=source_relative_path,
+            source_relative_path=(
+                exc.source_relative_path or source_relative_path
+                if isinstance(exc, AssetIngestConflictError)
+                else source_relative_path
+            ),
             source_size=prepared.source_size if prepared else 0,
             stages=completed_stages,
             error_stage=stage,

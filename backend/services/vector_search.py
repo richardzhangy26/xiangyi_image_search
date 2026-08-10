@@ -22,7 +22,9 @@ MIN_EF_SEARCH = 40       # pgvector 的 hnsw.ef_search 默认值
 _SEARCH_SQL = text("""
 SELECT id,
        model_number,
+       display_name,
        source_relative_path,
+       version,
        vector <=> CAST(:query_vector AS vector) AS distance
 FROM image_assets
 WHERE status = 'active'
@@ -84,7 +86,10 @@ class VectorSearchService:
             results = [{
                 'asset_id': str(row.id),
                 'model_number': row.model_number,
+                'display_name': row.display_name,
+                'source_relative_path': row.source_relative_path,
                 'relative_path': row.source_relative_path,
+                'version': row.version,
                 'preview_url': f'/api/image-assets/{row.id}/preview',
                 # 夹上界：实测向量 L2 范数 1.000282，同图余弦相似度会达到 1.00056
                 'similarity': min(1.0, max(0.0, 1.0 - float(row.distance))),

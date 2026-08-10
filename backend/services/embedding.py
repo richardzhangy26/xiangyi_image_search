@@ -8,7 +8,9 @@ import io
 import logging
 import os
 import time
+from dataclasses import dataclass
 from http import HTTPStatus
+from typing import Sequence
 
 import dashscope
 import numpy as np
@@ -27,6 +29,14 @@ MAX_BATCH_SIZE = 20
 MAX_IMAGE_MB = 2.5
 
 
+@dataclass(frozen=True)
+class EmbeddingResult:
+    """worker 可独立校验模型身份与向量内容的结果。"""
+
+    model: str
+    vector: Sequence[float]
+
+
 class EmbeddingServiceError(Exception):
     """图片向量提取服务异常。"""
 
@@ -38,6 +48,18 @@ class EmbeddingRateLimitExhaustedError(EmbeddingServiceError):
     账号级限流不会因为把一批拆成多次单张调用就消失，反而会发起更多请求、
     加剧限流。调用方（_embed_chunk）据此区分是否要降级。
     """
+
+
+class EmbeddingNetworkError(EmbeddingServiceError):
+    """SDK/网络层瞬时故障；持久导入队列可据此安排退避重试。"""
+
+
+class EmbeddingServerError(EmbeddingServiceError):
+    """模型服务端 5xx 类瞬时故障；携带结构化状态码，不依赖消息解析。"""
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _to_data_uri(image_path, max_size_mb=MAX_IMAGE_MB):
@@ -120,6 +142,20 @@ class EmbeddingClient:
             [{'image': _normalized_to_data_uri(image_path)}],
             request_id,
         )[0]
+
+    def embed_normalized_image_result(
+        self,
+        image_path,
+        request_id=None,
+    ) -> EmbeddingResult:
+        """返回明确携带当前模型身份的标准化图片向量。"""
+        return EmbeddingResult(
+            model=EMBEDDING_MODEL,
+            vector=self.embed_normalized_image(
+                image_path,
+                request_id=request_id,
+            ),
+        )
 
     def embed_text(self, content, request_id=None):
         """文本 → 1024 维向量。与图片共享同一向量空间。"""
@@ -225,7 +261,7 @@ class EmbeddingClient:
                     api_key=self.api_key,
                 )
             except Exception as exc:  # SDK 层异常（网络等），不重试
-                raise EmbeddingServiceError(f'图片向量提取失败: {exc}') from exc
+                raise EmbeddingNetworkError(f'图片向量提取失败: {exc}') from exc
 
             if resp.status_code == HTTPStatus.OK:
                 embeddings = resp.output['embeddings']
@@ -265,6 +301,12 @@ class EmbeddingClient:
                 )
                 raise EmbeddingRateLimitExhaustedError(
                     f'429重试{self.max_retries}次后仍限流: {message}'
+                )
+
+            if 500 <= resp.status_code < 600:
+                raise EmbeddingServerError(
+                    f'API调用失败({resp.status_code}): {message}',
+                    status_code=resp.status_code,
                 )
 
             logger.error(

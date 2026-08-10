@@ -139,6 +139,8 @@ def test_create_product_uploads_private_image_asset_and_reads_stable_preview(app
         f"/api/image-assets/{images[0]['id']}/preview"
     )
     assert images[0]['source_relative_path'].endswith('/中文 主图.png')
+    assert images[0]['display_name'] == '中文 主图.png'
+    assert images[0]['version'] == 1
     assert images[0]['original_path'] is None
 
     preview = client.get(images[0]['image_path'])
@@ -408,7 +410,9 @@ def test_recreating_product_relinks_existing_upload_without_new_oss_objects(app)
     assert embedding.calls == embedding_calls
 
 
-def test_reuploading_archived_product_image_reactivates_existing_asset(app):
+def test_reuploading_archived_product_image_returns_recycle_bin_without_restore(
+    app,
+):
     storage, embedding = _install_asset_dependencies(app)
     client = app.test_client()
     image = _png_bytes('blue')
@@ -435,15 +439,22 @@ def test_reuploading_archived_product_image_reactivates_existing_asset(app):
     assert reuploaded.status_code == 200
     reuploaded_body = reuploaded.get_json()
     assert reuploaded_body['uploaded_images'] == 0
-    assert reuploaded_body['reused_images'] == 1
-    assert reuploaded_body['skipped_duplicates'] == [str(asset_id)]
-    assert [item['status'] for item in reuploaded_body['image_results']] == [
-        'existing'
-    ]
+    assert reuploaded_body['reused_images'] == 0
+    assert reuploaded_body['recycle_bin_images'] == 1
+    assert reuploaded_body['skipped_duplicates'] == []
+    assert reuploaded_body['image_results'] == [{
+        'asset_id': str(asset_id),
+        'source_relative_path': ImageAsset.query.one().source_relative_path,
+        'status': 'in_recycle_bin',
+        'recovery_action': {
+            'type': 'open_recycle_bin',
+            'asset_id': str(asset_id),
+        },
+    }]
     db.session.expire_all()
     asset = db.session.get(ImageAsset, asset_id)
-    assert asset.status == 'active'
-    assert asset.archived_at is None
+    assert asset.status == 'archived'
+    assert asset.archived_at is not None
     assert asset.model_number == 'REACTIVATE-001'
     assert set(storage.objects) == object_keys
     assert len(storage.uploaded_keys) == upload_count

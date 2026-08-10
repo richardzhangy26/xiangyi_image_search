@@ -56,6 +56,8 @@ def test_image_asset_schema_has_uuid_vector_fields_and_active_hnsw_index(app):
         'source_bucket',
         'source_relative_path',
         'source_revision',
+        'display_name',
+        'version',
         'oss_path',
         'preview_oss_path',
         'content_hash',
@@ -74,6 +76,8 @@ def test_image_asset_schema_has_uuid_vector_fields_and_active_hnsw_index(app):
     }
     assert str(columns['id']['type']).upper() == 'UUID'
     assert columns['model_number']['nullable'] is True
+    assert columns['display_name']['nullable'] is False
+    assert columns['version']['nullable'] is False
     assert str(columns['vector']['type']).lower() == 'vector(1024)'
 
     index_names = {
@@ -152,3 +156,23 @@ def test_image_assets_schema_is_exclusive(app):
     table_names = set(inspect(db.engine).get_table_names(schema=schema_name))
     assert 'image_assets' in table_names
     assert 'product_images' not in table_names
+
+
+def test_asset_activity_schema_has_no_foreign_key_to_image_assets(app):
+    inspector = inspect(db.engine)
+    schema_name = db.session.execute(text('SELECT current_schema()')).scalar_one()
+    columns = {
+        column['name']
+        for column in inspector.get_columns(
+            'asset_activity_records', schema=schema_name
+        )
+    }
+    foreign_keys = inspector.get_foreign_keys(
+        'asset_activity_records', schema=schema_name
+    )
+
+    assert {
+        'id', 'event_type', 'target_type', 'target_id', 'request_id',
+        'source', 'before_state', 'after_state', 'result', 'created_at',
+    } <= columns
+    assert foreign_keys == []

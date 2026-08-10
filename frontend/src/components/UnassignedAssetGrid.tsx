@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import {
+  DeleteOutlined,
   LinkOutlined,
   PlusOutlined,
   ReloadOutlined,
@@ -11,10 +12,16 @@ import {
   Empty,
   Input,
   Pagination,
+  Segmented,
   Spin,
+  Tag,
+  Tooltip,
 } from 'antd';
 import type { ImageAssetManagementItem } from '../types/product';
 import { getImageUrl } from '../services/productApi';
+import { AssetDisplayNameEditor } from './AssetDisplayNameEditor';
+
+export type AssetAssignment = 'unassigned' | 'assigned' | 'all';
 
 export interface UnassignedAssetGridProps {
   assets: ImageAssetManagementItem[];
@@ -24,14 +31,18 @@ export interface UnassignedAssetGridProps {
   loading: boolean;
   error: string | null;
   search: string;
+  assignment: AssetAssignment;
   selectedAssetIds: string[];
   hasProducts: boolean;
   onSearch: (value: string) => void;
+  onAssignmentChange: (value: AssetAssignment) => void;
   onPageChange: (page: number) => void;
   onSelectionChange: (assetIds: string[]) => void;
   onAssign: () => void;
   onCreateProduct: () => void;
+  onArchive: () => void;
   onRetry: () => void;
+  onAssetRenamed: (asset: ImageAssetManagementItem) => void;
 }
 
 const formatBytes = (bytes: number): string => {
@@ -56,52 +67,82 @@ export function UnassignedAssetGrid({
   loading,
   error,
   search,
+  assignment,
   selectedAssetIds,
   hasProducts,
   onSearch,
+  onAssignmentChange,
   onPageChange,
   onSelectionChange,
   onAssign,
   onCreateProduct,
+  onArchive,
   onRetry,
+  onAssetRenamed,
 }: UnassignedAssetGridProps) {
   const [draftSearch, setDraftSearch] = useState(search);
 
   useEffect(() => setDraftSearch(search), [search]);
 
   return (
-    <section className="asset-workbench" aria-label="待归款图片">
+    <section className="asset-workbench" aria-label="图片资产">
       <div className="asset-toolbar">
         <div className="asset-search-wrap">
+          <Segmented
+            value={assignment}
+            options={[
+              { label: '待归款', value: 'unassigned' },
+              { label: '已归款', value: 'assigned' },
+              { label: '全部', value: 'all' },
+            ]}
+            onChange={(value) => onAssignmentChange(value as AssetAssignment)}
+          />
           <Input.Search
-            placeholder="搜索来源路径"
+            placeholder="搜索显示名称或来源路径"
             value={draftSearch}
             allowClear
             onChange={(event) => setDraftSearch(event.target.value)}
             onSearch={(value) => onSearch(value.trim())}
           />
-          <span className="asset-search-hint">按原始目录或文件名查找</span>
+          <span className="asset-search-hint">
+            同时匹配业务显示名称和不可变来源路径
+          </span>
         </div>
 
         <div className="asset-batch-actions">
           <span className="asset-selection-count">
             已选 {selectedAssetIds.length} 张
           </span>
-          <Button
-            type="primary"
-            icon={<LinkOutlined />}
-            aria-label="关联型号"
-            disabled={!hasProducts || selectedAssetIds.length === 0}
-            onClick={onAssign}
+          <Tooltip
+            title={hasProducts ? undefined : '请先添加产品或 CSV 导入真实型号'}
           >
-            关联型号
-          </Button>
+            <span>
+              <Button
+                type="primary"
+                icon={<LinkOutlined />}
+                aria-label="关联型号"
+                disabled={!hasProducts || selectedAssetIds.length === 0}
+                onClick={onAssign}
+              >
+                关联型号
+              </Button>
+            </span>
+          </Tooltip>
           <Button
             icon={<PlusOutlined />}
             aria-label="添加产品"
             onClick={onCreateProduct}
           >
             添加产品
+          </Button>
+          <Button
+            danger
+            icon={<DeleteOutlined />}
+            aria-label="移入回收站"
+            disabled={selectedAssetIds.length === 0}
+            onClick={onArchive}
+          >
+            移入回收站
           </Button>
         </div>
       </div>
@@ -116,7 +157,7 @@ export function UnassignedAssetGrid({
         <Alert
           type="error"
           showIcon
-          message="待归款图片加载失败"
+          message="图片资产加载失败"
           description={error}
           action={(
             <Button icon={<ReloadOutlined />} onClick={onRetry}>
@@ -131,13 +172,14 @@ export function UnassignedAssetGrid({
           <div className="asset-empty">
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description={search ? '没有匹配该路径的图片' : '暂无待归款图片'}
+              description={search ? '没有匹配显示名称或来源路径的图片' : '暂无图片资产'}
             />
           </div>
         ) : (
           <div className="asset-card-grid">
             {assets.map((asset) => {
               const selected = selectedAssetIds.includes(asset.asset_id);
+              const isAssigned = asset.model_number !== null;
               return (
                 <article
                   key={asset.asset_id}
@@ -145,8 +187,9 @@ export function UnassignedAssetGrid({
                 >
                   <div className="asset-card-check">
                     <Checkbox
-                      aria-label={`选择 ${asset.source_relative_path}`}
+                      aria-label={`选择 ${asset.display_name}`}
                       checked={selected}
+                      disabled={isAssigned}
                       onChange={(event) => onSelectionChange(toggleSelection(
                         selectedAssetIds,
                         asset.asset_id,
@@ -157,17 +200,26 @@ export function UnassignedAssetGrid({
                   <div className="asset-preview-frame">
                     <img
                       src={getImageUrl(asset.preview_url)}
-                      alt={asset.source_relative_path}
+                      alt={asset.display_name}
                       loading="lazy"
                     />
                   </div>
                   <div className="asset-card-body">
+                    <AssetDisplayNameEditor
+                      asset={asset}
+                      onRenamed={onAssetRenamed}
+                    />
                     <div
                       className="asset-path"
                       title={asset.source_relative_path}
                     >
                       {asset.source_relative_path}
                     </div>
+                    {isAssigned && (
+                      <Tag bordered={false} color="cyan">
+                        已归款 · {asset.model_number}
+                      </Tag>
+                    )}
                     <div className="asset-meta">
                       <span>{asset.source_width} × {asset.source_height}</span>
                       <span>{formatBytes(asset.source_size)}</span>

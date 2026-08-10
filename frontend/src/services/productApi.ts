@@ -12,13 +12,57 @@ import type {
   VectorIndexEvent,
   ProductFormData,
   ProductImageWriteSummary,
+  ProductImageWriteResult,
+  ImageAssetManagementItem,
   ImageAssetListResponse,
+  ArchivedImageAssetListResponse,
   ImageAssetAssignmentResponse,
   ImageAssetImportResponse,
+  ImageAssetArchiveResponse,
+  ImageAssetRestoreResponse,
+  ImageImportCreateResponse,
+  ImageImportItem,
+  ImageImportListResponse,
+  ImageImportCancelBatchResponse,
 } from '../types/product';
 import { API_BASE_URL } from '../config';
 
 export { API_BASE_URL };
+
+export class ProductImageWriteError extends Error {
+  status: number;
+  errorCode?: string;
+  imageResults: ProductImageWriteResult[];
+
+  constructor(
+    message: string,
+    status: number,
+    errorCode?: string,
+    imageResults: ProductImageWriteResult[] = []
+  ) {
+    super(message);
+    this.name = 'ProductImageWriteError';
+    this.status = status;
+    this.errorCode = errorCode;
+    this.imageResults = imageResults;
+  }
+}
+
+const readProductWriteResponse = async <T>(
+  response: Response,
+  fallbackError: string
+): Promise<T> => {
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new ProductImageWriteError(
+      payload.error || fallbackError,
+      response.status,
+      payload.error_code,
+      Array.isArray(payload.image_results) ? payload.image_results : []
+    );
+  }
+  return payload as T;
+};
 
 /**
  * 获取完整图片 URL
@@ -67,12 +111,13 @@ export const getProducts = async (params?: {
 
 /** 获取待归款图片资产。 */
 export const getImageAssets = async (params: {
+  assignment?: 'unassigned' | 'assigned' | 'all';
   page: number;
   perPage: number;
   search?: string;
 }): Promise<ImageAssetListResponse> => {
   const query = new URLSearchParams({
-    assignment: 'unassigned',
+    assignment: params.assignment || 'unassigned',
     page: String(params.page),
     per_page: String(params.perPage),
   });
@@ -88,6 +133,239 @@ export const getImageAssets = async (params: {
     throw new Error(error.error || '获取待归款图片失败');
   }
   return response.json();
+};
+
+/** 写入私有对象并创建持久导入项；服务端响应不等待 embedding。 */
+export const createImageImports = async (
+  files: File[]
+): Promise<ImageImportCreateResponse> => {
+  const body = new FormData();
+  files.forEach((file) => body.append('images', file));
+  const response = await fetch(`${API_BASE_URL}/api/image-imports`, {
+    method: 'POST',
+    body,
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      typeof payload.error === 'string'
+        ? payload.error
+        : '图片导入排队失败'
+    );
+  }
+  return payload as ImageImportCreateResponse;
+};
+
+/** 获取服务端持久导入项，用于刷新后恢复真实状态。 */
+export const getImageImportItems = async (params: {
+  page: number;
+  perPage: number;
+}): Promise<ImageImportListResponse> => {
+  const query = new URLSearchParams({
+    page: String(params.page),
+    per_page: String(params.perPage),
+  });
+  const response = await fetch(
+    `${API_BASE_URL}/api/image-imports?${query}`,
+    { method: 'GET' }
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      typeof payload.error === 'string'
+        ? payload.error
+        : '获取图片导入任务失败'
+    );
+  }
+  return payload as ImageImportListResponse;
+};
+
+/** 获取一项持久导入状态。 */
+export const getImageImportItem = async (
+  itemId: string
+): Promise<ImageImportItem> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/image-imports/${encodeURIComponent(itemId)}`,
+    { method: 'GET' }
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      typeof payload.error === 'string'
+        ? payload.error
+        : '获取图片导入任务失败'
+    );
+  }
+  return payload as ImageImportItem;
+};
+
+/** 手工重试一个失败或等待重试的持久导入项；幂等，不重新上传。 */
+export const retryImageImportItem = async (
+  itemId: string
+): Promise<ImageImportItem> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/image-imports/${encodeURIComponent(itemId)}/retry`,
+    { method: 'POST' }
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      typeof payload.error === 'string'
+        ? payload.error
+        : '手工重试失败'
+    );
+  }
+  return payload as ImageImportItem;
+};
+
+/** 单项取消一个持久导入项；幂等，已完成项会被服务端拒绝。 */
+export const cancelImageImportItem = async (
+  itemId: string
+): Promise<ImageImportItem> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/image-imports/${encodeURIComponent(itemId)}/cancel`,
+    { method: 'POST' }
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      typeof payload.error === 'string'
+        ? payload.error
+        : '取消图片导入失败'
+    );
+  }
+  return payload as ImageImportItem;
+};
+
+/** 批量取消持久导入项；返回逐项可理解结果。 */
+export const cancelImageImportItems = async (
+  itemIds: string[]
+): Promise<ImageImportCancelBatchResponse> => {
+  const response = await fetch(`${API_BASE_URL}/api/image-imports/cancel`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ item_ids: itemIds }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      typeof payload.error === 'string'
+        ? payload.error
+        : '批量取消图片导入失败'
+    );
+  }
+  return payload as ImageImportCancelBatchResponse;
+};
+
+/** 在保留窗口内恢复已取消的导入项（重新排队）。 */
+export const restoreImageImportItem = async (
+  itemId: string
+): Promise<ImageImportItem> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/image-imports/${encodeURIComponent(itemId)}/restore`,
+    { method: 'POST' }
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      typeof payload.error === 'string'
+        ? payload.error
+        : '恢复图片导入失败'
+    );
+  }
+  return payload as ImageImportItem;
+};
+
+/** 提前放弃已取消或失败的导入项；不可逆，暂存对象将进入清理。 */
+export const abandonImageImportItem = async (
+  itemId: string
+): Promise<ImageImportItem> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/image-imports/${encodeURIComponent(itemId)}/abandon`,
+    { method: 'POST' }
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      typeof payload.error === 'string'
+        ? payload.error
+        : '放弃图片导入失败'
+    );
+  }
+  return payload as ImageImportItem;
+};
+
+/** 获取独立回收站中的图片资产。 */
+export const getArchivedImageAssets = async (params: {
+  page: number;
+  perPage: number;
+  search?: string;
+}): Promise<ArchivedImageAssetListResponse> => {
+  const query = new URLSearchParams({
+    page: String(params.page),
+    per_page: String(params.perPage),
+  });
+  if (params.search) query.set('search', params.search);
+
+  const response = await fetch(
+    `${API_BASE_URL}/api/image-assets/archived?${query}`,
+    { method: 'GET' }
+  );
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({
+      error: '获取回收站图片失败',
+    }));
+    throw new Error(error.error || '获取回收站图片失败');
+  }
+  return response.json();
+};
+
+export class ImageAssetRenameError extends Error {
+  status: number;
+  errorCode?: string;
+  latest?: ImageAssetManagementItem;
+
+  constructor(
+    message: string,
+    status: number,
+    errorCode?: string,
+    latest?: ImageAssetManagementItem
+  ) {
+    super(message);
+    this.name = 'ImageAssetRenameError';
+    this.status = status;
+    this.errorCode = errorCode;
+    this.latest = latest;
+  }
+}
+
+/** 使用读取版本显式修改一项图片资产的显示名称主体。 */
+export const renameImageAsset = async (
+  assetId: string,
+  nameBody: string,
+  expectedVersion: number
+): Promise<ImageAssetManagementItem> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/image-assets/${encodeURIComponent(assetId)}/rename`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name_body: nameBody,
+        expected_version: expectedVersion,
+      }),
+    }
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new ImageAssetRenameError(
+      payload.error || '图片资产改名失败',
+      response.status,
+      payload.error_code,
+      payload.latest
+    );
+  }
+  return payload.asset;
 };
 
 /** 将图片资产事务化关联到一个型号；可选在型号不存在时快速创建产品。 */
@@ -136,6 +414,59 @@ export const importImageAssets = async (
   return response.json();
 };
 
+/** 将未归款图片资产批量移入回收站。 */
+export const archiveImageAssets = async (
+  assetIds: string[]
+): Promise<ImageAssetArchiveResponse> => {
+  const response = await fetch(`${API_BASE_URL}/api/image-assets/archive`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ asset_ids: assetIds }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.error || '图片移入回收站失败');
+  }
+  return payload;
+};
+
+/** 将回收站中的未归款图片资产批量恢复为 active。 */
+export const restoreImageAssets = async (
+  assetIds: string[]
+): Promise<ImageAssetRestoreResponse> => {
+  const response = await fetch(`${API_BASE_URL}/api/image-assets/restore`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ asset_ids: assetIds }),
+  });
+  const payload: unknown = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const errorPayload = payload && typeof payload === 'object'
+      ? payload as { error?: unknown; items?: unknown }
+      : {};
+    const itemErrors = Array.isArray(errorPayload.items)
+      ? errorPayload.items
+        .map((item: unknown) => {
+          if (!item || typeof item !== 'object') return null;
+          const itemError = (item as { error?: unknown }).error;
+          return typeof itemError === 'string' && itemError.trim()
+            ? itemError.trim()
+            : null;
+        })
+        .filter((itemError): itemError is string => itemError !== null)
+      : [];
+    const topLevelError = typeof errorPayload.error === 'string'
+      ? errorPayload.error
+      : null;
+    throw new Error(
+      itemErrors.length > 0
+        ? itemErrors.join('；')
+        : topLevelError || '图片恢复失败'
+    );
+  }
+  return payload as ImageAssetRestoreResponse;
+};
+
 /**
  * 获取单个产品详情
  */
@@ -179,12 +510,9 @@ export const createProduct = async (
     body: formData,
   });
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: '创建产品失败' }));
-    throw new Error(error.error || '创建产品失败');
-  }
-
-  return response.json();
+  return readProductWriteResponse<
+    ProductImageWriteSummary & { message: string; model_number: string }
+  >(response, '创建产品失败');
 };
 
 /**
@@ -209,12 +537,9 @@ export const updateProduct = async (
     body: formData,
   });
 
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: '更新产品失败' }));
-    throw new Error(error.error || '更新产品失败');
-  }
-
-  return response.json();
+  return readProductWriteResponse<
+    ProductImageWriteSummary & { message: string }
+  >(response, '更新产品失败');
 };
 
 /**

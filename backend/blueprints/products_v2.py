@@ -6,7 +6,6 @@ from flask import Blueprint, request, jsonify, current_app, Response, stream_wit
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 import os
-import hashlib
 import tempfile
 import uuid
 import json
@@ -25,8 +24,9 @@ from services.asset_ingest import (
 )
 from services.image_normalizer import ImageNormalizationError
 from services import legacy_product_images
-from services.object_source import InMemoryObjectSource
 from services.object_storage import ObjectStorageError, OssObjectStorage
+from services.upload_source import prepare_multipart_source
+
 products_v2_bp = Blueprint('products_v2', __name__, url_prefix='/api/products')
 
 ALLOWED_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
@@ -86,55 +86,39 @@ def prepare_product_uploads(image_files, model_number):
     失败。来源路径因此必须由商品、内容、文件名和同名出现序号稳定推导；重试同一
     请求会 HEAD 并复用原对象，而不会因随机 UUID 再制造无法关联的 OSS 孤儿。
     """
-    objects = {}
-    content_types = {}
-    relative_paths = []
+    encoded_model_number = quote(str(model_number), safe='')
     # 与输入文件列表等长对齐：被扩展名白名单跳过的文件占 None 槽位，
     # 保证调用方能按原始下标定位每个上传文件的入库结果。
-    aligned_paths = []
-    occurrences = {}
-    encoded_model_number = quote(str(model_number), safe='')
-    for image_file in image_files:
-        if not image_file or not allowed_file(image_file.filename):
-            aligned_paths.append(None)
-            continue
-        filename = (
-            (image_file.filename or '')
-            .replace('\\', '/')
-            .rsplit('/', 1)[-1]
-            .replace('\x00', '')
-            .strip()
-        )
-        if not filename:
-            filename = 'upload.jpg'
-        data = image_file.read()
-        content_hash = hashlib.sha256(data).hexdigest()
-        occurrence_key = (filename, content_hash)
-        occurrence = occurrences.get(occurrence_key, 0) + 1
-        occurrences[occurrence_key] = occurrence
-        relative_path = (
+    allowed_slots = [
+        bool(image_file) and allowed_file(image_file.filename or '')
+        for image_file in image_files
+    ]
+    source, relative_paths = prepare_multipart_source(
+        image_files,
+        source_bucket=PRODUCT_UPLOAD_SOURCE_BUCKET,
+        is_allowed=allowed_file,
+        build_relative_path=lambda filename, content_hash, occurrence: (
             f'models/{encoded_model_number}/{content_hash}/'
             f'{occurrence:04d}/{filename}'
-        )
-        objects[relative_path] = data
-        content_types[relative_path] = image_file.mimetype or 'application/octet-stream'
-        relative_paths.append(relative_path)
-        aligned_paths.append(relative_path)
-    return InMemoryObjectSource(
-        source_bucket=PRODUCT_UPLOAD_SOURCE_BUCKET,
-        objects=objects,
-        content_types=content_types,
-    ), relative_paths, aligned_paths
+        ),
+    )
+    positions = iter(relative_paths)
+    aligned_paths = [
+        next(positions) if allowed else None for allowed in allowed_slots
+    ]
+    return source, relative_paths, aligned_paths
 
 
 def attach_product_upload_result(result, model_number):
-    """把新建或幂等复用的上传资产关联到当前商品。
+    """关联 active 上传结果；回收站命中只返回导航信息。
 
-    删除 Product 会把资产型号置空，图片归档也会保留来源身份。用户随后用同一
-    商品和同一文件重试或重新上传时，统一入库服务会返回 ``existing``；这里负责
-    恢复关联与 active 状态，同时继续复用原 OSS 对象和 embedding。
+    删除 Product 会把资产型号置空，之后的 active 幂等重试可重新关联到调用方
+    显式提交的型号。归档资产保持原生命周期与关联，不在导入路径中自动恢复。
     """
-    if result.status not in {'created', 'existing'} or not result.asset_id:
+    if (
+        result.status not in {'created', 'existing', 'in_recycle_bin'}
+        or not result.asset_id
+    ):
         return None
 
     asset = db.session.get(ImageAsset, result.asset_id)
@@ -143,16 +127,40 @@ def attach_product_upload_result(result, model_number):
             '图片资产写入结果无法回读',
             stage='database',
         )
+    if result.status == 'in_recycle_bin':
+        if asset.status != 'archived':
+            raise AssetIngestConflictError(
+                '图片资产生命周期已变化，请重新上传以获取最新结果',
+                stage='database',
+                kind='version_conflict',
+                asset_id=str(asset.id),
+                source_relative_path=result.source_relative_path,
+            )
+        return {
+            'asset_id': result.asset_id,
+            'source_relative_path': result.source_relative_path,
+            'status': result.status,
+            'recovery_action': result.recovery_action,
+        }
+
+    if asset.status != 'active':
+        raise AssetIngestConflictError(
+            '图片资产生命周期已变化，请重新上传以获取最新结果',
+            stage='database',
+            kind='version_conflict',
+            asset_id=str(asset.id),
+            source_relative_path=result.source_relative_path,
+        )
     if asset.model_number not in {None, model_number}:
         raise AssetIngestConflictError(
             '图片资产已经关联到其他商品',
             stage='database',
-            kind='source_conflict',
+            kind='assignment_conflict',
+            asset_id=str(asset.id),
+            source_relative_path=result.source_relative_path,
         )
 
     asset.model_number = model_number
-    asset.status = 'active'
-    asset.archived_at = None
     return {
         'asset_id': result.asset_id,
         'source_relative_path': result.source_relative_path,
@@ -170,12 +178,37 @@ def summarize_product_upload_results(image_results):
         item for item in image_results
         if item['status'] == 'existing'
     ]
+    recycle_bin = [
+        item for item in image_results
+        if item['status'] == 'in_recycle_bin'
+    ]
     return {
         'uploaded_images': len(created),
         'reused_images': len(reused),
+        'recycle_bin_images': len(recycle_bin),
         'skipped_duplicates': [item['asset_id'] for item in reused],
         'image_results': image_results,
     }
+
+
+def asset_ingest_conflict_response(error):
+    """把来源冲突与存储/版本冲突映射为稳定且脱敏的 409。"""
+    if error.kind == 'source_conflict':
+        item = {
+            'asset_id': error.asset_id,
+            'source_relative_path': error.source_relative_path,
+            'status': 'source_conflict',
+        }
+        return jsonify({
+            'error': '来源冲突：同一来源身份已存在不同内容，未覆盖现有资产',
+            'error_code': 'IMAGE_ASSET_SOURCE_CONFLICT',
+            'image_results': [item],
+        }), 409
+    return error_response(
+        '图片资产发生冲突，未覆盖现有内容',
+        'IMAGE_ASSET_CONFLICT',
+        409,
+    )
 
 
 def image_asset_for_product(asset, image_order=0):
@@ -187,7 +220,9 @@ def image_asset_for_product(asset, image_order=0):
         'model_number': asset.model_number,
         'image_path': preview_url,
         'preview_url': preview_url,
+        'display_name': asset.display_name,
         'source_relative_path': asset.source_relative_path,
+        'version': asset.version,
         'content_hash': asset.content_hash,
         'original_path': None,
         'image_order': image_order,
@@ -447,15 +482,22 @@ def create_product():
             **summarize_product_upload_results(image_results),
         }), 201
 
-    except (IntegrityError, AssetIngestConflictError) as e:
+    except AssetIngestConflictError as e:
         db.session.rollback()
         current_app.logger.warning(
             '创建产品失败（图片资产冲突）: %s',
             type(e).__name__,
         )
+        return asset_ingest_conflict_response(e)
+    except IntegrityError as e:
+        db.session.rollback()
+        current_app.logger.warning(
+            '创建产品失败（数据库冲突）: %s',
+            type(e).__name__,
+        )
         return error_response(
-            '图片资产发生冲突，未覆盖现有内容',
-            'IMAGE_ASSET_CONFLICT',
+            '产品或图片资产发生并发冲突，请重试',
+            'PRODUCT_WRITE_CONFLICT',
             409,
         )
     except ImageNormalizationError:
@@ -609,15 +651,22 @@ def update_product(model_number):
             **summarize_product_upload_results(image_results),
         })
 
-    except (IntegrityError, AssetIngestConflictError) as e:
+    except AssetIngestConflictError as e:
         db.session.rollback()
         current_app.logger.warning(
             '更新产品失败（图片资产冲突）: %s',
             type(e).__name__,
         )
+        return asset_ingest_conflict_response(e)
+    except IntegrityError as e:
+        db.session.rollback()
+        current_app.logger.warning(
+            '更新产品失败（数据库冲突）: %s',
+            type(e).__name__,
+        )
         return error_response(
-            '图片资产发生冲突，未覆盖现有内容',
-            'IMAGE_ASSET_CONFLICT',
+            '产品或图片资产发生并发冲突，请重试',
+            'PRODUCT_WRITE_CONFLICT',
             409,
         )
     except ImageNormalizationError:

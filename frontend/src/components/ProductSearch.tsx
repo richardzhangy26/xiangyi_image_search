@@ -284,7 +284,7 @@ export const ProductSearch: React.FC = () => {
                 <div className="relative overflow-hidden">
                   <img
                     src={getImageUrl(result.preview_url)}
-                    alt={result.model_number || result.relative_path}
+                    alt={result.display_name}
                     className="w-full h-64 object-cover group-hover:scale-105 transition-transform duration-300"
                   />
                   <div className="absolute top-3 right-3">
@@ -295,18 +295,21 @@ export const ProductSearch: React.FC = () => {
                 </div>
                 <div className="p-5">
                   <h4 className="text-lg font-bold text-slate-900 mb-3">
-                    {result.model_number || '未补充型号'}
+                    {result.display_name}
                   </h4>
+                  <p className="text-sm text-slate-500 mb-3">
+                    型号：{result.model_number || '未归款'}
+                  </p>
                   <div className="rounded-lg bg-slate-50 border border-slate-100 p-3">
                     <div className="flex items-start justify-between gap-3">
                       <p className="text-sm text-slate-700 break-all whitespace-normal m-0">
-                        {result.relative_path}
+                        {result.source_relative_path}
                       </p>
                       <button
                         type="button"
-                        onClick={() => copyRelativePath(result.relative_path)}
+                        onClick={() => copyRelativePath(result.source_relative_path)}
                         className="shrink-0 inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-600 hover:border-sky-300 hover:text-sky-700"
-                        aria-label={`复制相对路径 ${result.relative_path}`}
+                        aria-label={`复制相对路径 ${result.source_relative_path}`}
                       >
                         <Copy className="w-3.5 h-3.5" />
                         复制相对路径

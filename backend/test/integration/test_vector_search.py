@@ -181,10 +181,15 @@ def test_result_dict_shape_is_image_asset_contract(app):
     assert set(result) == {
         'asset_id',
         'model_number',
+        'display_name',
+        'source_relative_path',
         'relative_path',
+        'version',
         'preview_url',
         'similarity',
     }
+    assert result['display_name'] == '图片.png'
+    assert result['source_relative_path'] == '中文 目录/图片.png'
     assert result['preview_url'] == (
         f"/api/image-assets/{result['asset_id']}/preview"
     )

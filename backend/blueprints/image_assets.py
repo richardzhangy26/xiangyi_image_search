@@ -7,17 +7,31 @@ import time
 import uuid
 
 from flask import Blueprint, current_app, jsonify, redirect, request
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from blueprints.products_v2 import ALLOWED_EXTENSIONS, asset_ingest_error_response
 from models import ImageAsset, Product, db
 from product_search import EmbeddingServiceError
+from services.asset_display_name import (
+    DisplayNameValidationError,
+    management_asset_dict,
+    rename_image_asset,
+)
+from services.asset_archive import (
+    ArchiveRequestValidationError,
+    archive_unassigned_image_assets,
+)
 from services.asset_ingest import (
     AssetIngestConflictError,
     AssetIngestError,
     ImageAssetIngestService,
+)
+from services.asset_recycle_bin import (
+    RestoreRequestValidationError,
+    list_archived_image_assets,
+    restore_image_assets,
 )
 from services.image_normalizer import ImageNormalizationError
 from services.object_source import InMemoryObjectSource
@@ -47,17 +61,12 @@ MAX_IMPORT_PATH_LENGTH = 512
 
 def _management_asset_dict(asset):
     """返回产品管理页所需的最小安全字段集合。"""
-    return {
-        'asset_id': str(asset.id),
-        'model_number': asset.model_number,
-        'source_relative_path': asset.source_relative_path,
-        'preview_url': f'/api/image-assets/{asset.id}/preview',
-        'source_size': asset.source_size,
-        'source_mime_type': asset.source_mime_type,
-        'source_width': asset.source_width,
-        'source_height': asset.source_height,
-        'created_at': asset.created_at.isoformat() if asset.created_at else None,
-    }
+    return management_asset_dict(asset)
+
+
+def _literal_ilike_pattern(value):
+    escaped = value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+    return f'%{escaped}%'
 
 
 def _request_integer(name, default, minimum, maximum):
@@ -90,7 +99,11 @@ def list_image_assets():
 
     search = (request.args.get('search') or '').strip()
     if search:
-        query = query.filter(ImageAsset.source_relative_path.ilike(f'%{search}%'))
+        pattern = _literal_ilike_pattern(search)
+        query = query.filter(or_(
+            ImageAsset.display_name.ilike(pattern, escape='\\'),
+            ImageAsset.source_relative_path.ilike(pattern, escape='\\'),
+        ))
 
     pagination = query.order_by(
         ImageAsset.created_at.desc(), ImageAsset.id.desc()
@@ -101,6 +114,174 @@ def list_image_assets():
         'page': page,
         'per_page': per_page,
     })
+
+
+@image_assets_bp.get('/archived')
+def list_archived_assets():
+    page = _request_integer('page', 1, 1, 1_000_000)
+    per_page = _request_integer('per_page', 24, 1, 100)
+    if page is None or per_page is None:
+        return jsonify({
+            'error': '回收站列表参数无效',
+            'error_code': 'INVALID_IMAGE_ASSET_ARCHIVED_LIST_PARAMS',
+        }), 400
+
+    request_id = (request.headers.get('X-Request-ID') or str(uuid.uuid4()))[:64]
+    try:
+        result = list_archived_image_assets(
+            db.session,
+            page=page,
+            per_page=per_page,
+            search=(request.args.get('search') or '').strip(),
+        )
+    except Exception as exc:
+        db.session.rollback()
+        logger.error(
+            'image_asset.archived_list.failed request_id=%s error_type=%s',
+            request_id,
+            type(exc).__name__,
+        )
+        return jsonify({
+            'error': '回收站加载失败，请稍后重试',
+            'error_code': 'IMAGE_ASSET_ARCHIVED_LIST_FAILED',
+        }), 500
+
+    return jsonify({
+        'assets': result.assets,
+        'total': result.total,
+        'archived_total': result.archived_total,
+        'page': result.page,
+        'per_page': result.per_page,
+    })
+
+
+@image_assets_bp.post('/<uuid:asset_id>/rename')
+def rename_image_asset_display_name(asset_id):
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({
+            'error': '改名参数无效',
+            'error_code': 'INVALID_IMAGE_ASSET_DISPLAY_NAME',
+        }), 400
+
+    request_id = (request.headers.get('X-Request-ID') or str(uuid.uuid4()))[:64]
+    try:
+        result = rename_image_asset(
+            db.session,
+            asset_id,
+            name_body=payload.get('name_body'),
+            expected_version=payload.get('expected_version'),
+            request_id=request_id,
+        )
+    except DisplayNameValidationError as exc:
+        return jsonify({
+            'error': str(exc),
+            'error_code': 'INVALID_IMAGE_ASSET_DISPLAY_NAME',
+        }), 400
+    except Exception as exc:
+        logger.error(
+            'image_asset.rename.failed asset_id=%s request_id=%s error_type=%s',
+            asset_id,
+            request_id,
+            type(exc).__name__,
+        )
+        return jsonify({
+            'error': '图片资产改名失败，请稍后重试',
+            'error_code': 'IMAGE_ASSET_RENAME_FAILED',
+        }), 500
+
+    if result.status == 'renamed':
+        return jsonify({'asset': result.asset})
+    if result.status == 'not_found':
+        return jsonify({
+            'error': '图片资产不存在',
+            'error_code': result.error_code,
+        }), 404
+    if result.status == 'not_active':
+        return jsonify({
+            'error': '归档图片需先恢复后才能改名',
+            'error_code': result.error_code,
+            'latest': result.asset,
+        }), 409
+    return jsonify({
+        'error': '图片名称已被其他操作更新，请确认最新值后重试',
+        'error_code': result.error_code,
+        'latest': result.asset,
+    }), 409
+
+
+@image_assets_bp.post('/archive')
+def archive_image_assets():
+    """Move a bounded batch of unassigned assets out of discovery results."""
+    payload = request.get_json(silent=True)
+    request_id = (request.headers.get('X-Request-ID') or str(uuid.uuid4()))[:64]
+    try:
+        result = archive_unassigned_image_assets(
+            db.session,
+            payload.get('asset_ids') if isinstance(payload, dict) else None,
+            request_id=request_id,
+        )
+    except ArchiveRequestValidationError as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc), 'error_code': exc.error_code}), 400
+    except Exception as exc:
+        db.session.rollback()
+        logger.error(
+            'image_asset.archive.failed request_id=%s error_type=%s',
+            request_id,
+            type(exc).__name__,
+        )
+        return jsonify({
+            'error': '图片移入回收站失败，请稍后重试',
+            'error_code': 'IMAGE_ASSET_ARCHIVE_FAILED',
+        }), 500
+
+    response = result.to_dict()
+    if result.status == 'succeeded':
+        return jsonify(response), 200
+    response.update({
+        'error': '部分图片资产不符合移入回收站条件，未修改本批数据',
+        'error_code': 'IMAGE_ASSET_ARCHIVE_CONFLICT',
+    })
+    return jsonify(response), 409
+
+
+@image_assets_bp.post('/restore')
+def restore_archived_image_assets():
+    payload = request.get_json(silent=True)
+    request_id = (request.headers.get('X-Request-ID') or str(uuid.uuid4()))[:64]
+    try:
+        result = restore_image_assets(
+            db.session,
+            payload.get('asset_ids') if isinstance(payload, dict) else None,
+            request_id=request_id,
+        )
+    except RestoreRequestValidationError as exc:
+        db.session.rollback()
+        return jsonify({
+            'error': str(exc),
+            'error_code': 'INVALID_IMAGE_ASSET_RESTORE_BATCH',
+        }), 400
+    except Exception as exc:
+        db.session.rollback()
+        logger.error(
+            'image_asset.restore.failed request_id=%s error_type=%s',
+            request_id,
+            type(exc).__name__,
+        )
+        return jsonify({
+            'error': '图片恢复失败，请稍后重试',
+            'error_code': 'IMAGE_ASSET_RESTORE_FAILED',
+        }), 500
+
+    response = result.to_dict()
+    if result.status == 'succeeded':
+        return jsonify(response), 200
+    response.update({
+        'error': '部分图片资产不符合恢复条件，未修改本批数据',
+        'error_code': 'IMAGE_ASSET_RESTORE_CONFLICT',
+    })
+    return jsonify(response), 409
 
 
 def _assignment_error(message, error_code, status):
@@ -414,7 +595,7 @@ def assign_image_assets():
 
     assets = ImageAsset.query.filter(
         ImageAsset.id.in_(asset_ids)
-    ).with_for_update().all()
+    ).order_by(ImageAsset.id).with_for_update().all()
     if len(assets) != len(asset_ids):
         return _assignment_error(
             '图片资产不存在', 'IMAGE_ASSET_NOT_FOUND', 404

@@ -8,6 +8,7 @@ from flask_cors import CORS
 from pathlib import Path
 from models import db
 from blueprints.image_assets import image_assets_bp
+from blueprints.image_imports import image_imports_bp
 from blueprints.products_v2 import products_v2_bp  # 新版本
 from product_search import ImageSearchService
 # 数据库配置（本地 PostgreSQL + pgvector）
@@ -86,6 +87,7 @@ def create_app(config_name='development'):
     # 注册蓝图（使用新版本 products_v2）
     app.register_blueprint(products_v2_bp)
     app.register_blueprint(image_assets_bp)
+    app.register_blueprint(image_imports_bp)
     
     @app.route('/dataset-images/<path:filename>')
     def serve_dataset_image(filename):

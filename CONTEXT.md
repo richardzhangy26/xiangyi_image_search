@@ -63,3 +63,11 @@ _Avoid_: 来源相对路径、OSS 对象名称、源文件名
 **来源冲突（Source Conflict）**:
 同一来源相对路径再次出现、但源图内容与已导入版本不同的状态。来源冲突必须经过明确选择后才能替换现有图片资产或形成新资产。
 _Avoid_: 重复图片、自动更新
+
+**图片导入项（Image Import Item）**:
+一张已经通过图片校验并写入私有对象存储、但尚未保证成为正式图片资产的持久工作项。它只有 queued、embedding、completed、failed 四种状态；只有 embedding 模型、维度和数值全部合规且数据库事务提交成功后，才会关联正式图片资产。
+_Avoid_: 图片资产、内存队列消息、上传线程
+
+**任务领取租约（Import Claim Lease）**:
+独立 worker 在 PostgreSQL 中取得的限时处理所有权，由 claim token、generation、worker 与过期时间共同界定。租约仅用于进程崩溃后的重新领取和多实例并发隔离，不代表业务重试策略。
+_Avoid_: 自动重试、浏览器锁、请求内线程

@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 import pytest
@@ -24,7 +27,11 @@ from services.embedding import (
 )
 from services.image_normalizer import ImageNormalizer
 from services.object_source import SourceLocation, SourceObjectHead
-from services.object_storage import ObjectStorageError, StoredObject
+from services.object_storage import (
+    ObjectStorageConflictError,
+    ObjectStorageError,
+    StoredObject,
+)
 
 
 def _png_bytes(color='red', size=(40, 24)):
@@ -326,6 +333,85 @@ def test_same_source_rerun_revalidates_oss_and_is_idempotent(app):
     assert existing.asset_id == created.asset_id
     assert storage.head_calls == [row.oss_path, row.preview_oss_path]
     assert len(embedding.paths) == 1
+    assert ImageAsset.query.count() == 1
+
+
+def test_archived_same_source_rerun_returns_recycle_bin_without_restoring(app):
+    relative_path = '重跑/回收站.png'
+    source = FakeKodo({relative_path: _png_bytes('cyan')})
+    storage = FakeOss()
+    embedding = FakeEmbedding()
+    service = _service(source, storage, embedding)
+    created = service.ingest_one(relative_path)
+    asset = ImageAsset.query.one()
+    asset.status = 'archived'
+    asset.archived_at = datetime.now()
+    archived_at = asset.archived_at
+    db.session.commit()
+    upload_count = len(storage.put_calls)
+
+    result = service.ingest_one(relative_path)
+
+    assert result.status == 'in_recycle_bin'
+    assert result.asset_id == created.asset_id
+    assert result.recovery_action == {
+        'type': 'open_recycle_bin',
+        'asset_id': created.asset_id,
+    }
+    db.session.expire_all()
+    unchanged = ImageAsset.query.one()
+    assert unchanged.status == 'archived'
+    assert unchanged.archived_at == archived_at
+    assert len(storage.put_calls) == upload_count
+    assert len(embedding.paths) == 1
+
+
+class ConcurrentFakeOss(FakeOss):
+    """对 forbid-overwrite 竞态返回与真实 OSS 相同的冲突类型。"""
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+
+    def put_file(self, key, source_path, *, spec):
+        with self._lock:
+            if key in self.objects:
+                raise ObjectStorageConflictError('concurrent original')
+            return super().put_file(key, source_path, spec=spec)
+
+    def put_bytes(self, key, data, *, spec):
+        with self._lock:
+            if key in self.objects:
+                raise ObjectStorageConflictError('concurrent preview')
+            return super().put_bytes(key, data, spec=spec)
+
+
+def test_concurrent_same_source_retries_converge_to_one_asset(app):
+    relative_path = '并发/同一路径.png'
+    source = FakeKodo({relative_path: _png_bytes('purple')})
+    storage = ConcurrentFakeOss()
+    embedding = FakeEmbedding()
+
+    def ingest_in_independent_session():
+        with app.app_context():
+            try:
+                return _service(source, storage, embedding).ingest_one(
+                    relative_path
+                )
+            finally:
+                db.session.remove()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda _index: ingest_in_independent_session(),
+            range(2),
+        ))
+
+    assert sorted(result.status for result in results) == [
+        'created',
+        'existing',
+    ]
+    assert len({result.asset_id for result in results}) == 1
     assert ImageAsset.query.count() == 1
 
 

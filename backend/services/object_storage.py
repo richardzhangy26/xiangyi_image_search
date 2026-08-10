@@ -87,6 +87,22 @@ class ObjectWriter(Protocol):
         ...
 
 
+class ObjectReader(Protocol):
+    def download_file(
+        self,
+        key: str,
+        target_path: Union[str, Path],
+    ) -> None:
+        ...
+
+
+class ObjectCleaner(Protocol):
+    """引用安全清理所需的私有对象删除能力；仅供受控清理路径使用。"""
+
+    def delete_object(self, key: str) -> str:
+        ...
+
+
 class PrivateObjectSigner(Protocol):
     def sign_download_url(
         self,
@@ -239,6 +255,45 @@ class OssObjectStorage:
             )
         except Exception as exc:
             raise self._safe_upload_error(exc) from None
+
+    def download_file(
+        self,
+        key: str,
+        target_path: Union[str, Path],
+    ) -> None:
+        """把私有对象直接下载到 worker 指定的临时文件。"""
+        try:
+            self._bucket.get_object_to_file(key, str(target_path))
+        except Exception as exc:
+            error = ObjectStorageError(
+                f'OSS 下载失败: {type(exc).__name__}'
+            )
+            error.stage = 'download'
+            status = getattr(exc, 'status', None)
+            if isinstance(status, int):
+                error.status_code = status
+            elif isinstance(status, str) and status.isdigit():
+                error.status_code = int(status)
+            raise error from None
+
+    def delete_object(self, key: str) -> str:
+        """删除私有对象；对象已不存在视为成功（幂等）。
+
+        返回 'deleted' 或 'already_gone'；其他失败抛 ObjectStorageError。
+        仅供受控清理路径调用，绝不用于迁移或覆盖语义。
+        """
+        try:
+            self._bucket.delete_object(key)
+            return 'deleted'
+        except Exception as exc:
+            status = getattr(exc, 'status', None)
+            if status in (404, '404') or type(exc).__name__ == 'NoSuchKey':
+                return 'already_gone'
+            error = ObjectStorageError(
+                f'OSS 对象删除失败: {type(exc).__name__}'
+            )
+            error.stage = 'delete'
+            raise error from None
 
     def sign_download_url(
         self,

@@ -38,7 +38,11 @@ product_images 是**未修改的退休兼容表**，不属于新库 schema、应
 - backend/services/asset_ingest.py - 来源图片到 OSS、embedding 和 PostgreSQL 的纵向入库服务。
 - backend/services/vector_search.py - pgvector 检索服务。
 - backend/services/kodo_source.py - Kodo S3 只读对象来源。
+- backend/services/purge_object_backup.py - 永久清除前的完整引用规划、不可覆盖对象备份与 final manifest。
+- backend/services/purge_object_restore.py - 对象副本复验和仅隔离 Bucket 恢复。
+- backend/services/purge_object_storage.py - 正式源 Head/Get-only 与隔离目标 write-once 的角色专用 OSS Adapter。
 - backend/scripts/migrate_kodo_to_oss.py - 受控 Kodo → 私有 OSS 迁移入口。
+- backend/scripts/manage_purge_object_backups.py - 只提供既有对象副本复验与隔离恢复；不提供创建或删除命令。
 - backend/scripts/audit_legacy_product_images.py - 独立、只读的退休兼容表审计入口。
 - backend/blueprints/products_v2.py - Product CRUD、CSV 导入和产品图片资产入库（/api/products）。
 - backend/blueprints/image_assets.py - 图片资产列表、归款和私有预览 302（/api/image-assets）。
@@ -119,6 +123,13 @@ docker exec fashion-crm-db pg_dump -U postgres image_search > backup_$(date +%Y%
 
 数据库备份覆盖商品、image_assets 元数据和向量。OSS 原图、预览及 Kodo 只读备份由对象存储侧的私有备份/版本策略负责；不要在应用脚本中删除、覆盖或公开它们。恢复时先恢复 PostgreSQL，再核对 OSS 对象和 image_assets 的来源绑定。
 
+永久清除对象备份使用同一 `purge_batch_id` 绑定 PostgreSQL 恢复点，先写不可变 `plan.json`，逐项 HEAD/下载校验后写 payload，最后才写 `manifest.json`。当前没有 PostgreSQL 引用快照生产 Adapter，也没有对象备份创建 CLI；真实永久清除 gate 保持关闭。既有清单只能显式复验或恢复到独立隔离 Bucket：
+
+~~~
+python scripts/manage_purge_object_backups.py verify-copies --manifest <object-manifest>
+python scripts/manage_purge_object_backups.py restore-isolated --manifest <object-manifest> --restore-run-id <id> --acknowledge-isolated
+~~~
+
 ## 本地开发
 
 ~~~
@@ -144,6 +155,8 @@ backend/.env（由 .env.example 复制）中的必填项：
 - QINIU_ACCESS_KEY、QINIU_SECRET_KEY、QINIU_BUCKET_NAME、QINIU_REGION - **Kodo 只读迁移来源**，仅供 migrate_kodo_to_oss 的 preflight/迁移读取，绝不生成公开 URL。
 
 可选项：DATABASE_URL、QINIU_S3_BUCKET_NAME、OSS_IMAGE_BASE_PREFIX、OSS_SIGNED_URL_TTL_SECONDS、IMAGE_PREVIEW_MAX_EDGE、IMAGE_PREVIEW_MAX_MB、IMAGE_MAX_PIXELS、IMAGE_NORMALIZATION_VERSION、SEARCH_OVERSAMPLE、LOG_LEVEL。Docker Compose 会把容器内的数据库地址覆盖为 db:5432。
+
+独立 ops 环境 `backend/.env.backup` 还使用 `BACKUP_OSS_*`、`PURGE_SOURCE_OSS_*` 与 `PURGE_RESTORE_OSS_*`。它们不得注入 Flask/Gunicorn 或 Docker 日常应用服务：正式源角色仅 Head/Get，备份角色仅 Put-if-absent/Head/Get，隔离角色仅隔离前缀 Put-if-absent/Head/Get，三类 ops 凭证均不能与应用 `OSS_*` 复用。`PURGE_RESTORE_ISOLATED` 默认必须为 `0`。
 
 ## 数据库结构
 
@@ -204,6 +217,8 @@ python -m pytest test/ --ignore=test/integration -v
 - 不执行 DROP、DELETE、覆盖上传或云对象清理来“迁移”旧数据；所有收缩动作必须另行授权并可回滚。
 - 图片正式来源始终是私有 OSS，Kodo 只读备份；预览始终经过 /api/image-assets/<asset_id>/preview 的短时签名 302。
 - 不在应用启动、普通部署或健康检查中隐式运行兼容审计或迁移。
+- 永久清除对象 final manifest 只是 `backup_only_no_delete` 备份证据，不是删除授权；正式删除前仍须在锁或写入 fence 内重新验证全部引用来源和正式对象身份。
+- 不为对象备份、隔离恢复或备份 Bucket 暴露 Delete；partial/orphan、正式对象和隔离对象都不得由本仓库自动清理。
 - Legacy TypeScript 组件（如 OrderManagement）未路由且可能有类型错误，除非重新启用，否则不要顺手修复。
 - 如果 Docker 报告历史容器名称冲突，只处理明确冲突的容器；不要删除数据库卷。
 - 完成稳定功能后，仅在改变架构事实、入口或操作约束时更新最近作用域的 AGENTS.md；记录当前事实，不记录实现过程。

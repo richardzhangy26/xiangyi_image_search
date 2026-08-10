@@ -1,0 +1,141 @@
+{
+  "schema_version": 1,
+  "mode": "pilot-reconciliation",
+  "source": {
+    "bucket": "xiangxipackage",
+    "prefix": "",
+    "provider": "qiniu-kodo",
+    "s3_bucket": "xiangxipackage",
+    "s3_region": "cn-east-1"
+  },
+  "pilot_report_status": "ok",
+  "selection_count": 10,
+  "database_asset_count": 10,
+  "oss_target": {
+    "bucket_name": "xiangyipackage",
+    "location": "oss-cn-shanghai",
+    "acl": "private",
+    "prefix": "image-search"
+  },
+  "preview_limits": {
+    "max_edge": 2048,
+    "max_bytes": 2621440
+  },
+  "entries": [
+    {
+      "source_relative_path": "2025.4.18海报照片/加拍照片/DSC01146 拷贝.jpg",
+      "source_hash_matches_oss_original": true,
+      "database_asset_present": true,
+      "model_number_is_null": true,
+      "source_path_preserved": true,
+      "temporary_path_persisted": false,
+      "preview_valid": true
+    },
+    {
+      "source_relative_path": "2025.4.18海报照片/圆角1920x800.png",
+      "source_hash_matches_oss_original": true,
+      "database_asset_present": true,
+      "model_number_is_null": true,
+      "source_path_preserved": true,
+      "temporary_path_persisted": false,
+      "preview_valid": true,
+      "small_source_not_enlarged": true
+    },
+    {
+      "source_relative_path": "手机挂绳/A13/处理后/1.png",
+      "source_hash_matches_oss_original": true,
+      "database_asset_present": true,
+      "model_number_is_null": true,
+      "source_path_preserved": true,
+      "temporary_path_persisted": false,
+      "preview_valid": true
+    },
+    {
+      "source_relative_path": "处理过的/F23/5.png",
+      "source_hash_matches_oss_original": true,
+      "database_asset_present": true,
+      "model_number_is_null": true,
+      "source_path_preserved": true,
+      "temporary_path_persisted": false,
+      "preview_valid": true,
+      "small_source_not_enlarged": true
+    },
+    {
+      "source_relative_path": "处理过的/F23/6.png",
+      "source_hash_matches_oss_original": true,
+      "database_asset_present": true,
+      "model_number_is_null": true,
+      "source_path_preserved": true,
+      "temporary_path_persisted": false,
+      "preview_valid": true,
+      "small_source_not_enlarged": true
+    },
+    {
+      "source_relative_path": "2025.4.18海报照片/加拍照片/DSC00013.jpg",
+      "source_hash_matches_oss_original": true,
+      "database_asset_present": true,
+      "model_number_is_null": true,
+      "source_path_preserved": true,
+      "temporary_path_persisted": false,
+      "preview_valid": true
+    },
+    {
+      "source_relative_path": "2025.4.18海报照片/包1排版2-1 拷贝.png",
+      "source_hash_matches_oss_original": true,
+      "database_asset_present": true,
+      "model_number_is_null": true,
+      "source_path_preserved": true,
+      "temporary_path_persisted": false,
+      "preview_valid": true,
+      "small_source_not_enlarged": true
+    },
+    {
+      "source_relative_path": "E01-E53-2025.653x6张=318张-/E-01/E-2025.6 (10).jpg",
+      "source_hash_matches_oss_original": true,
+      "database_asset_present": true,
+      "model_number_is_null": true,
+      "source_path_preserved": true,
+      "temporary_path_persisted": false,
+      "preview_valid": true
+    },
+    {
+      "source_relative_path": "手机挂绳/A19/修改后/1.png",
+      "source_hash_matches_oss_original": true,
+      "database_asset_present": true,
+      "model_number_is_null": true,
+      "source_path_preserved": true,
+      "temporary_path_persisted": false,
+      "preview_valid": true
+    },
+    {
+      "source_relative_path": "2025.4.18海报照片/手机挂绳/DSC01104.jpg",
+      "source_hash_matches_oss_original": true,
+      "database_asset_present": true,
+      "model_number_is_null": true,
+      "source_path_preserved": true,
+      "temporary_path_persisted": false,
+      "preview_valid": true
+    }
+  ],
+  "duplicate_content_reuse": [
+    {
+      "source_paths": [
+        "处理过的/F23/5.png",
+        "处理过的/F23/6.png"
+      ],
+      "asset_count": 2,
+      "preview_key_count": 1,
+      "vector_count": 1
+    }
+  ],
+  "summary": {
+    "original_hash_matches": 10,
+    "assets_present": 10,
+    "unassigned_assets": 10,
+    "source_paths_preserved": 10,
+    "valid_previews": 10,
+    "unique_preview_objects": 9,
+    "small_sources_not_enlarged": 4
+  },
+  "status": "ok"
+}

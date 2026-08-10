@@ -1,9 +1,11 @@
 """私有图片资产预览接口。"""
 
+import time
 import uuid
 
 from app import create_app
 from models import ImageAsset, db
+from services.object_storage import SignedDownloadUrl
 
 
 class FakeStorage:
@@ -11,15 +13,18 @@ class FakeStorage:
         self.fail = fail
         self.signed = []
 
-    def sign_download_url(self, key, expires_seconds):
+    def sign_download_url(self, key, expires_seconds, *, cache_control=None):
         if self.fail:
             raise RuntimeError(
                 'secret=do-not-log&Signature=do-not-log-signature'
             )
-        self.signed.append((key, expires_seconds))
-        return (
-            f'https://private.example/{key}'
-            '?Expires=123&Signature=short-lived'
+        self.signed.append((key, expires_seconds, cache_control))
+        return SignedDownloadUrl(
+            url=(
+                f'https://private.example/{key}'
+                '?Expires=123&Signature=short-lived'
+            ),
+            expires_at=int(time.time()) + expires_seconds,
         )
 
 
@@ -71,7 +76,13 @@ def test_private_preview_redirect_is_signed_on_demand(caplog):
     assert response.headers['Location'].endswith(
         '?Expires=123&Signature=short-lived'
     )
-    assert storage.signed == [(preview_key, 73)]
+    assert storage.signed == [
+        (preview_key, 73, 'private, max-age=73'),
+    ]
+    cache_header = response.headers['Cache-Control']
+    assert cache_header.startswith('private, max-age=')
+    max_age = int(cache_header.rsplit('=', 1)[1])
+    assert 0 <= max_age <= 73
     with app.app_context():
         persisted = db.session.get(ImageAsset, asset_id)
         assert persisted.preview_oss_path == preview_key

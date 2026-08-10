@@ -1,0 +1,265 @@
+{
+  "compatibility_aliases_used": [],
+  "elapsed_seconds": 12.817,
+  "generated_at": "2026-08-02T10:28:05.196612+08:00",
+  "image_objects": 2419,
+  "items": [
+    {
+      "content_hash": "5e9d500f890167cf4672af548658e03e6b2dfc89344534184c4bba217c4c2498",
+      "coverage_tags": [
+        "chinese_space_path",
+        "nested_path",
+        "jpeg"
+      ],
+      "error": null,
+      "error_stage": null,
+      "image_format": "JPEG",
+      "source_height": 3499,
+      "source_relative_path": "2025.4.18海报照片/加拍照片/DSC01146 拷贝.jpg",
+      "source_size": 11366009,
+      "source_width": 5249,
+      "stages": {},
+      "status": "verified"
+    },
+    {
+      "content_hash": "d67a10b97afa7bd1a441780648a8153aa26d9b851ee46d16fac5f38a7bc2d00a",
+      "coverage_tags": [
+        "png",
+        "small_source"
+      ],
+      "error": null,
+      "error_stage": null,
+      "image_format": "PNG",
+      "source_height": 801,
+      "source_relative_path": "2025.4.18海报照片/圆角1920x800.png",
+      "source_size": 25815,
+      "source_width": 1921,
+      "stages": {},
+      "status": "verified"
+    },
+    {
+      "content_hash": "615c8e58f028c40156ec60824a3daeb9dbdca304775829a2214c7244b9b53220",
+      "coverage_tags": [
+        "nested_path",
+        "png",
+        "over_20_mib"
+      ],
+      "error": null,
+      "error_stage": null,
+      "image_format": "PNG",
+      "source_height": 9449,
+      "source_relative_path": "手机挂绳/A13/处理后/1.png",
+      "source_size": 37946073,
+      "source_width": 9449,
+      "stages": {},
+      "status": "verified"
+    },
+    {
+      "content_hash": "329f38b0918b56860d5e4c3ad93502dd952c4081a75ee055f6425b8c5de53d30",
+      "coverage_tags": [
+        "nested_path",
+        "png",
+        "small_source",
+        "duplicate_content"
+      ],
+      "error": null,
+      "error_stage": null,
+      "image_format": "PNG",
+      "source_height": 800,
+      "source_relative_path": "处理过的/F23/5.png",
+      "source_size": 979291,
+      "source_width": 800,
+      "stages": {},
+      "status": "verified"
+    },
+    {
+      "content_hash": "329f38b0918b56860d5e4c3ad93502dd952c4081a75ee055f6425b8c5de53d30",
+      "coverage_tags": [
+        "nested_path",
+        "png",
+        "small_source",
+        "duplicate_content"
+      ],
+      "error": null,
+      "error_stage": null,
+      "image_format": "PNG",
+      "source_height": 800,
+      "source_relative_path": "处理过的/F23/6.png",
+      "source_size": 979291,
+      "source_width": 800,
+      "stages": {},
+      "status": "verified"
+    },
+    {
+      "content_hash": "9a64f9cae0e02594001544617fcd903a1172ee085fa5cdda2690fcc50f8ca9e8",
+      "coverage_tags": [
+        "nested_path",
+        "jpeg"
+      ],
+      "error": null,
+      "error_stage": null,
+      "image_format": "JPEG",
+      "source_height": 3101,
+      "source_relative_path": "2025.4.18海报照片/加拍照片/DSC00013.jpg",
+      "source_size": 7135994,
+      "source_width": 4868,
+      "stages": {},
+      "status": "verified"
+    },
+    {
+      "content_hash": "65eb7a9e56f61e339cbb61fb4707f028ede0ac4c83f1bce5c081b4845cce60b6",
+      "coverage_tags": [
+        "chinese_space_path",
+        "png",
+        "small_source"
+      ],
+      "error": null,
+      "error_stage": null,
+      "image_format": "PNG",
+      "source_height": 800,
+      "source_relative_path": "2025.4.18海报照片/包1排版2-1 拷贝.png",
+      "source_size": 1433457,
+      "source_width": 1920,
+      "stages": {},
+      "status": "verified"
+    },
+    {
+      "content_hash": "2f72b60c37a691c2d8713cfbaad44a6793c27c0038a989112f4768f28dc14c22",
+      "coverage_tags": [
+        "chinese_space_path",
+        "nested_path",
+        "jpeg"
+      ],
+      "error": null,
+      "error_stage": null,
+      "image_format": "JPEG",
+      "source_height": 4000,
+      "source_relative_path": "E01-E53-2025.653x6张=318张-/E-01/E-2025.6 (10).jpg",
+      "source_size": 506482,
+      "source_width": 6000,
+      "stages": {},
+      "status": "verified"
+    },
+    {
+      "content_hash": "44689699b50f1e95e3f21a2e1fc89e88848c78b310d8e4844169f5ec137c8dc5",
+      "coverage_tags": [
+        "nested_path",
+        "png",
+        "over_20_mib"
+      ],
+      "error": null,
+      "error_stage": null,
+      "image_format": "PNG",
+      "source_height": 9449,
+      "source_relative_path": "手机挂绳/A19/修改后/1.png",
+      "source_size": 31624854,
+      "source_width": 9449,
+      "stages": {},
+      "status": "verified"
+    },
+    {
+      "content_hash": "c3572bb823b006e7580336109e0b595b6065291cfb53c0f6ccf2f1b065e6bcee",
+      "coverage_tags": [
+        "nested_path",
+        "jpeg"
+      ],
+      "error": null,
+      "error_stage": null,
+      "image_format": "JPEG",
+      "source_height": 2195,
+      "source_relative_path": "2025.4.18海报照片/手机挂绳/DSC01104.jpg",
+      "source_size": 3990954,
+      "source_width": 3294,
+      "stages": {},
+      "status": "verified"
+    }
+  ],
+  "mode": "verify-selection",
+  "non_image_objects": 1,
+  "options": {
+    "batch_size": 20,
+    "limit": null,
+    "pilot": null,
+    "selection_count": 10,
+    "selection_manifest": true
+  },
+  "read_only": true,
+  "retry": {
+    "enabled": false,
+    "matched": 0,
+    "missing": [],
+    "requested": 0
+  },
+  "schema_version": 1,
+  "source": {
+    "bucket": "xiangxipackage",
+    "prefix": "",
+    "provider": "qiniu-kodo",
+    "s3_bucket": "xiangxipackage",
+    "s3_region": "cn-east-1"
+  },
+  "status": "completed_with_issues",
+  "summary": {
+    "outcomes": {
+      "verified": 10
+    },
+    "scan": {
+      "bytes": 6443942398,
+      "images": 2419,
+      "non_images": 1,
+      "objects": 2420
+    },
+    "selection": {
+      "bytes": 95988220,
+      "images": 10
+    },
+    "stages": {
+      "database": {
+        "conflict": 0,
+        "failed": 0,
+        "new": 0,
+        "reused": 0
+      },
+      "download": {
+        "conflict": 0,
+        "failed": 0,
+        "new": 0,
+        "reused": 0
+      },
+      "embedding": {
+        "conflict": 0,
+        "failed": 0,
+        "new": 0,
+        "reused": 0
+      },
+      "original": {
+        "conflict": 0,
+        "failed": 0,
+        "new": 0,
+        "reused": 0
+      },
+      "preview": {
+        "conflict": 0,
+        "failed": 0,
+        "new": 0,
+        "reused": 0
+      }
+    }
+  },
+  "total_bytes": 6443942398,
+  "total_objects": 2420,
+  "verification": {
+    "covered": [
+      "chinese_space_path",
+      "duplicate_content",
+      "jpeg",
+      "nested_path",
+      "over_20_mib",
+      "png",
+      "small_source"
+    ],
+    "missing": [
+      "webp"
+    ]
+  }
+}

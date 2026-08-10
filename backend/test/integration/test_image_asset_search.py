@@ -2,12 +2,14 @@
 
 import io
 import os
+import time
 
 import numpy as np
 from PIL import Image
 
 from models import ImageAsset, db
 from services.embedding import EmbeddingServiceError
+from services.object_storage import SignedDownloadUrl
 from services.vector_search import VectorSearchService
 
 
@@ -73,9 +75,12 @@ class FakeSigner:
         self.signed = []
         self.write_calls = []
 
-    def sign_download_url(self, key, expires_seconds):
+    def sign_download_url(self, key, expires_seconds, *, cache_control=None):
         self.signed.append((key, expires_seconds))
-        return f'https://private.example/{key}?signature=fake'
+        return SignedDownloadUrl(
+            url=f'https://private.example/{key}?signature=fake',
+            expires_at=int(time.time()) + expires_seconds,
+        )
 
     def head_object(self, key):
         self.write_calls.append(('head', key))

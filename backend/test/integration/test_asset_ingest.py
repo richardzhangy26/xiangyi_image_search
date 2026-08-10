@@ -114,7 +114,7 @@ class FakeOss:
         )
         self.put_calls.append(key)
 
-    def sign_download_url(self, key, expires_seconds):
+    def sign_download_url(self, key, expires_seconds, *, cache_control=None):
         raise AssertionError('入库流程不应生成签名 URL')
 
 

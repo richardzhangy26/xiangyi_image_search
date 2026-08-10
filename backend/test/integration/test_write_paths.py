@@ -2,15 +2,20 @@
 import io
 import hashlib
 import json
+import time
 from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image
 
-from models import ImageAsset, db
+from models import ImageAsset, Product, db
 from services.embedding import EmbeddingServiceError
 from services.legacy_product_images import LegacyProductImagesAudit
-from services.object_storage import ObjectStorageError, StoredObject
+from services.object_storage import (
+    ObjectStorageError,
+    SignedDownloadUrl,
+    StoredObject,
+)
 
 
 def _png_bytes(color):
@@ -51,8 +56,11 @@ class FakeAssetStorage:
     def put_bytes(self, key, data, *, spec):
         self._put(key, data, spec)
 
-    def sign_download_url(self, key, expires_seconds):
-        return f'https://private.example/{key}?expires={expires_seconds}'
+    def sign_download_url(self, key, expires_seconds, *, cache_control=None):
+        return SignedDownloadUrl(
+            url=f'https://private.example/{key}?expires={expires_seconds}',
+            expires_at=int(time.time()) + expires_seconds,
+        )
 
     def _put(self, key, data, spec):
         self.uploaded_keys.append(key)
@@ -110,6 +118,28 @@ def _product_payload(model_number):
         'alibaba_product_url': 'https://example.com/x',
         'category': '相机肩带',
     })
+
+
+def test_create_product_requires_only_model_number(app):
+    client = app.test_client()
+
+    response = client.post('/api/products', data={
+        'product': json.dumps({'model_number': 'MIN-001'}),
+    }, content_type='multipart/form-data')
+
+    assert response.status_code == 201
+    assert response.get_json()['model_number'] == 'MIN-001'
+    db.session.expire_all()
+    product = db.session.get(Product, 'MIN-001')
+    assert product is not None
+    assert product.photographer_file == ''
+    assert product.alibaba_product_url == ''
+    assert product.category == ''
+
+    missing_model = client.post('/api/products', data={
+        'product': json.dumps({'photographer_file': 'p'}),
+    }, content_type='multipart/form-data')
+    assert missing_model.status_code == 400
 
 
 def test_create_product_uploads_private_image_asset_and_reads_stable_preview(app):
@@ -656,3 +686,181 @@ def test_batch_delete_failure_returns_stable_error_without_leaking_details(
     assert 'secret batch delete failure' not in response.get_data(as_text=True)
     assert 'secret batch delete failure' not in caplog.text
     assert 'error_type=RuntimeError' in caplog.text
+
+
+def _upload_product_with_colors(client, model_number, colors):
+    files = [
+        (io.BytesIO(_png_bytes(color)), f'{color}.png') for color in colors
+    ]
+    return client.post('/api/products', data={
+        'product': _product_payload(model_number),
+        'images': files,
+    }, content_type='multipart/form-data')
+
+
+def _image_names(images):
+    return [
+        image['source_relative_path'].rsplit('/', 1)[-1] for image in images
+    ]
+
+
+def test_create_product_persists_upload_order_with_first_as_primary(app):
+    _install_asset_dependencies(app)
+    client = app.test_client()
+    created = _upload_product_with_colors(client, 'ORDER-001', ['red', 'green', 'blue'])
+    assert created.status_code == 201
+
+    images = client.get('/api/products/ORDER-001').get_json()['images']
+    assert _image_names(images) == ['red.png', 'green.png', 'blue.png']
+    assert [image['image_order'] for image in images] == [0, 1, 2]
+    assert [image['is_primary'] for image in images] == [True, False, False]
+    sort_orders = {
+        asset.source_relative_path.rsplit('/', 1)[-1]: asset.sort_order
+        for asset in ImageAsset.query.all()
+    }
+    assert sort_orders == {'red.png': 0, 'green.png': 1, 'blue.png': 2}
+
+
+def test_update_product_applies_explicit_image_order(app):
+    _install_asset_dependencies(app)
+    client = app.test_client()
+    assert _upload_product_with_colors(
+        client, 'ORDER-002', ['red', 'green', 'blue']
+    ).status_code == 201
+    before = client.get('/api/products/ORDER-002').get_json()['images']
+    reordered = [before[2]['asset_id'], before[0]['asset_id'], before[1]['asset_id']]
+
+    response = client.put('/api/products/ORDER-002', data={
+        'product': json.dumps({'image_order': reordered}),
+    }, content_type='multipart/form-data')
+
+    assert response.status_code == 200
+    after = client.get('/api/products/ORDER-002').get_json()['images']
+    assert [image['asset_id'] for image in after] == reordered
+    assert _image_names(after) == ['blue.png', 'red.png', 'green.png']
+    assert [image['is_primary'] for image in after] == [True, False, False]
+
+
+def test_update_product_image_order_places_new_upload_at_placeholder(app):
+    _install_asset_dependencies(app)
+    client = app.test_client()
+    assert _upload_product_with_colors(
+        client, 'ORDER-003', ['red', 'blue']
+    ).status_code == 201
+    before = client.get('/api/products/ORDER-003').get_json()['images']
+
+    response = client.put('/api/products/ORDER-003', data={
+        'product': json.dumps({'image_order': [
+            before[0]['asset_id'], 'new:0', before[1]['asset_id'],
+        ]}),
+        'images': [(io.BytesIO(_png_bytes('green')), 'green.png')],
+    }, content_type='multipart/form-data')
+
+    assert response.status_code == 200
+    after = client.get('/api/products/ORDER-003').get_json()['images']
+    assert _image_names(after) == ['red.png', 'green.png', 'blue.png']
+
+
+def test_update_product_appends_new_uploads_without_image_order(app):
+    _install_asset_dependencies(app)
+    client = app.test_client()
+    assert _upload_product_with_colors(
+        client, 'ORDER-004', ['red', 'green']
+    ).status_code == 201
+
+    response = client.put('/api/products/ORDER-004', data={
+        'product': json.dumps({'photographer_file': 'changed'}),
+        'images': [(io.BytesIO(_png_bytes('blue')), 'blue.png')],
+    }, content_type='multipart/form-data')
+
+    assert response.status_code == 200
+    after = client.get('/api/products/ORDER-004').get_json()['images']
+    assert _image_names(after) == ['red.png', 'green.png', 'blue.png']
+
+
+def test_update_product_rejects_invalid_image_order(app):
+    _install_asset_dependencies(app)
+    client = app.test_client()
+    assert _upload_product_with_colors(client, 'ORDER-005', ['red']).status_code == 201
+
+    for bad_payload in ('not-a-list', [123]):
+        response = client.put('/api/products/ORDER-005', data={
+            'product': json.dumps({'image_order': bad_payload}),
+        }, content_type='multipart/form-data')
+        assert response.status_code == 400
+        assert response.get_json()['error_code'] == 'INVALID_IMAGE_ORDER'
+    images = client.get('/api/products/ORDER-005').get_json()['images']
+    assert _image_names(images) == ['red.png']
+
+
+def test_update_product_image_order_skips_unknown_and_foreign_assets(app):
+    _install_asset_dependencies(app)
+    client = app.test_client()
+    assert _upload_product_with_colors(
+        client, 'ORDER-006', ['red', 'green']
+    ).status_code == 201
+    assert _upload_product_with_colors(
+        client, 'ORDER-007', ['blue']
+    ).status_code == 201
+    own = client.get('/api/products/ORDER-006').get_json()['images']
+    foreign = client.get('/api/products/ORDER-007').get_json()['images'][0]
+
+    response = client.put('/api/products/ORDER-006', data={
+        'product': json.dumps({'image_order': [
+            own[1]['asset_id'],
+            '00000000-0000-0000-0000-000000000000',
+            foreign['asset_id'],
+        ]}),
+    }, content_type='multipart/form-data')
+
+    assert response.status_code == 200
+    after = client.get('/api/products/ORDER-006').get_json()['images']
+    assert _image_names(after) == ['green.png', 'red.png']
+    assert _image_names(
+        client.get('/api/products/ORDER-007').get_json()['images']
+    ) == ['blue.png']
+
+
+def test_assign_appends_assets_after_existing_images(app):
+    _install_asset_dependencies(app)
+    client = app.test_client()
+    assert _upload_product_with_colors(client, 'ASSIGN-001', ['red']).status_code == 201
+    primary_id = client.get('/api/products/ASSIGN-001').get_json()['images'][0]['asset_id']
+    assert _upload_product_with_colors(
+        client, 'ASSIGN-TMP', ['green', 'blue']
+    ).status_code == 201
+    tmp_images = client.get('/api/products/ASSIGN-TMP').get_json()['images']
+    tmp_ids = [image['asset_id'] for image in tmp_images]
+    assert client.delete('/api/products/ASSIGN-TMP').status_code == 200
+
+    response = client.post('/api/image-assets/assign', json={
+        'asset_ids': tmp_ids,
+        'model_number': 'ASSIGN-001',
+    })
+
+    assert response.status_code == 200
+    images = client.get('/api/products/ASSIGN-001').get_json()['images']
+    assert [image['asset_id'] for image in images] == [primary_id] + tmp_ids
+    assert [image['is_primary'] for image in images] == [True, False, False]
+
+
+def test_update_product_image_order_placeholder_stays_aligned_with_skipped_uploads(app):
+    """被扩展名白名单静默跳过的上传不占据 new:<index> 槽位。"""
+    _install_asset_dependencies(app)
+    client = app.test_client()
+    assert _upload_product_with_colors(client, 'ORDER-008', ['red']).status_code == 201
+    before = client.get('/api/products/ORDER-008').get_json()['images']
+
+    response = client.put('/api/products/ORDER-008', data={
+        'product': json.dumps({'image_order': [
+            'new:1', before[0]['asset_id'],
+        ]}),
+        'images': [
+            (io.BytesIO(b'not a real image'), 'photo.heic'),
+            (io.BytesIO(_png_bytes('green')), 'green.png'),
+        ],
+    }, content_type='multipart/form-data')
+
+    assert response.status_code == 200
+    after = client.get('/api/products/ORDER-008').get_json()['images']
+    assert _image_names(after) == ['green.png', 'red.png']

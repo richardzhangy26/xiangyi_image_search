@@ -34,7 +34,12 @@ import {
   FileImageOutlined,
 } from '@ant-design/icons';
 import type { UploadFile } from 'antd/es/upload/interface';
+import { DndContext, PointerSensor, closestCenter, useSensor, useSensors } from '@dnd-kit/core';
+import type { DragEndEvent } from '@dnd-kit/core';
+import { SortableContext, rectSortingStrategy, useSortable } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import type {
+  ImageAssetAssignmentResponse,
   ImageAssetManagementItem,
   Product,
   ProductFormData,
@@ -55,9 +60,55 @@ import {
   getImageAssets,
 } from '../services/productApi';
 import { UnassignedAssetGrid } from './UnassignedAssetGrid';
+import { buildImageOrderPayload, moveByUid } from './productImageOrder';
+import { ImportImagesModal } from './ImportImagesModal';
 
 const ASSET_PAGE_SIZE = 24;
 type ManagementView = 'assets' | 'products';
+
+interface SortableUploadItemProps {
+  file: UploadFile;
+  isPrimary: boolean;
+  children: React.ReactNode;
+}
+
+/** 可拖拽的图片卡片：首张标记为主图，拖拽改变图片顺序。 */
+const SortableUploadItem: React.FC<SortableUploadItemProps> = ({
+  file,
+  isPrimary,
+  children,
+}) => {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: file.uid });
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{
+        transform: CSS.Translate.toString(transform),
+        transition,
+        position: 'relative',
+        zIndex: isDragging ? 20 : undefined,
+        cursor: 'grab',
+      }}
+      {...attributes}
+      {...listeners}
+    >
+      {isPrimary && (
+        <span className="absolute top-1 left-1 z-10 px-1.5 py-0.5 rounded text-xs font-medium bg-teal-600/90 text-white shadow-sm pointer-events-none">
+          主图
+        </span>
+      )}
+      {children}
+    </div>
+  );
+};
 
 /** CSV 必填字段说明（用于导入弹窗展示） */
 const CSV_REQUIRED_FIELDS = [
@@ -73,6 +124,20 @@ export const ProductUpload: React.FC = () => {
   const [isModalVisible, setIsModalVisible] = useState(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [form] = Form.useForm();
+  const imageSensors = useSensors(
+    // 8px 激活阈值：避免点击预览/删除按钮被误判为拖拽
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } })
+  );
+  const watchedImages: UploadFile[] = Form.useWatch('images', form) || [];
+
+  const handleImageDragEnd = ({ active, over }: DragEndEvent) => {
+    if (!over || active.id === over.id) return;
+    const current =
+      (form.getFieldValue('images') as UploadFile[] | undefined) || [];
+    form.setFieldsValue({
+      images: moveByUid(current, String(active.id), String(over.id)),
+    });
+  };
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
   const [batchDeleteLoading, setBatchDeleteLoading] = useState(false);
   const [activeView, setActiveView] = useState<ManagementView>('assets');
@@ -84,8 +149,11 @@ export const ProductUpload: React.FC = () => {
   const [assetError, setAssetError] = useState<string | null>(null);
   const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
   const [assignModalOpen, setAssignModalOpen] = useState(false);
+  const [createAssignModalOpen, setCreateAssignModalOpen] = useState(false);
   const [targetModelNumber, setTargetModelNumber] = useState<string>();
+  const [newModelNumber, setNewModelNumber] = useState('');
   const [assigning, setAssigning] = useState(false);
+  const [importModalOpen, setImportModalOpen] = useState(false);
 
   // CSV 导入相关
   const [csvModalVisible, setCsvModalVisible] = useState(false);
@@ -138,6 +206,27 @@ export const ProductUpload: React.FC = () => {
     }
   };
 
+  const finishAssignment = async (
+    result: ImageAssetAssignmentResponse,
+    modelNumber: string
+  ) => {
+    const total = result.assigned_count + result.reused_count;
+    message.success(
+      result.product_created
+        ? `已创建产品 ${modelNumber} 并关联 ${total} 张图片`
+        : `已将 ${total} 张图片关联到 ${modelNumber}`
+    );
+    setAssignModalOpen(false);
+    setCreateAssignModalOpen(false);
+    setTargetModelNumber(undefined);
+    setNewModelNumber('');
+    setSelectedAssetIds([]);
+    await Promise.all([
+      fetchAssets(assetPage, assetSearch),
+      fetchProducts(),
+    ]);
+  };
+
   const handleAssignAssets = async () => {
     if (!targetModelNumber || selectedAssetIds.length === 0) return;
     setAssigning(true);
@@ -146,18 +235,39 @@ export const ProductUpload: React.FC = () => {
         selectedAssetIds,
         targetModelNumber
       );
-      message.success(
-        `已将 ${result.assigned_count + result.reused_count} 张图片关联到 ${targetModelNumber}`
-      );
-      setAssignModalOpen(false);
-      setTargetModelNumber(undefined);
-      setSelectedAssetIds([]);
-      await Promise.all([
-        fetchAssets(assetPage, assetSearch),
-        fetchProducts(),
-      ]);
+      await finishAssignment(result, targetModelNumber);
     } catch (error) {
       message.error(error instanceof Error ? error.message : '关联型号失败');
+    } finally {
+      setAssigning(false);
+    }
+  };
+
+  const handleCreateAndAssign = async () => {
+    const modelNumber = newModelNumber.trim();
+    if (!modelNumber) return;
+    if (modelNumber.length > 100) {
+      message.error('型号长度不能超过 100 个字符');
+      return;
+    }
+    setAssigning(true);
+    try {
+      if (selectedAssetIds.length > 0) {
+        const result = await assignImageAssets(selectedAssetIds, modelNumber, {
+          createIfMissing: true,
+        });
+        await finishAssignment(result, modelNumber);
+      } else {
+        await createProduct({ model_number: modelNumber }, []);
+        message.success(`已创建产品 ${modelNumber}`);
+        setCreateAssignModalOpen(false);
+        setNewModelNumber('');
+        await fetchProducts();
+      }
+    } catch (error) {
+      message.error(
+        error instanceof Error ? error.message : '新建产品并关联失败'
+      );
     } finally {
       setAssigning(false);
     }
@@ -171,27 +281,27 @@ export const ProductUpload: React.FC = () => {
     form.validateFields().then(async (values) => {
       setLoading(true);
       try {
-        // 处理图片文件
-        const imageFiles: File[] = [];
-        values.images?.forEach((file: UploadFile) => {
-          if (file.originFileObj) {
-            imageFiles.push(file.originFileObj);
-          }
-        });
+        // 处理图片文件与排序负载（既有资产用 asset_id，新文件用 new:<index> 占位）
+        const fileList = (values.images as UploadFile[] | undefined) || [];
+        const { imageFiles, imageOrder } = buildImageOrderPayload(fileList);
 
         const { images, ...productData } = values;
 
         if (editingProduct) {
           const retainedAssetIds = new Set(
-            (images as UploadFile[] | undefined)?.map((file) => file.uid) || []
+            fileList.map((file) => file.uid)
           );
           const removedAssetIds =
             editingProduct.images
               ?.filter((image) => !retainedAssetIds.has(image.asset_id))
               .map((image) => image.asset_id) || [];
 
-          // 先保存字段和新图片；只有保存成功后才归档被移除的既有资产。
-          await updateProduct(editingProduct.model_number, productData, imageFiles);
+          // 先保存字段、图片顺序和新图片；只有保存成功后才归档被移除的既有资产。
+          await updateProduct(
+            editingProduct.model_number,
+            { ...productData, image_order: imageOrder },
+            imageFiles
+          );
           const archiveResults = await Promise.allSettled(
             removedAssetIds.map((assetId) =>
               deleteProductImage(editingProduct.model_number, assetId)
@@ -575,6 +685,21 @@ export const ProductUpload: React.FC = () => {
         />
       </div>
 
+      {/* 待归款视图导入入口：单图/文件夹/剪贴板导入，不录入产品资料 */}
+      {activeView === 'assets' && (
+        <div className="animate-rise mb-4 flex items-center justify-between">
+          <span className="text-xs text-slate-400">
+            导入的图片进入待归款列表并可参与以图搜款，不会录入产品资料
+          </span>
+          <Button
+            icon={<UploadOutlined />}
+            onClick={() => setImportModalOpen(true)}
+          >
+            导入图片
+          </Button>
+        </div>
+      )}
+
       {/* 批量选择上下文操作条：仅选中时浮现 */}
       {activeView === 'products' && selectedRowKeys.length > 0 && (
         <div className="animate-rise flex items-center justify-between mb-4 px-4 py-2.5 rounded-xl bg-teal-50/80 border border-teal-100">
@@ -629,7 +754,7 @@ export const ProductUpload: React.FC = () => {
             error={assetError}
             search={assetSearch}
             selectedAssetIds={selectedAssetIds}
-            canAssign={products.length > 0}
+            hasProducts={products.length > 0}
             onSearch={(value) => {
               setAssetSearch(value);
               setAssetPage(1);
@@ -643,6 +768,7 @@ export const ProductUpload: React.FC = () => {
             }}
             onSelectionChange={setSelectedAssetIds}
             onAssign={() => setAssignModalOpen(true)}
+            onCreateProduct={() => setCreateAssignModalOpen(true)}
             onRetry={() => void fetchAssets(assetPage, assetSearch)}
           />
         ) : (
@@ -704,6 +830,35 @@ export const ProductUpload: React.FC = () => {
         />
       </Modal>
 
+      <Modal
+        title={selectedAssetIds.length > 0
+          ? `新建产品并关联 ${selectedAssetIds.length} 张图片`
+          : '添加产品'}
+        open={createAssignModalOpen}
+        okText={selectedAssetIds.length > 0 ? '创建并关联' : '创建'}
+        cancelText="取消"
+        confirmLoading={assigning}
+        okButtonProps={{ disabled: !newModelNumber.trim() }}
+        onOk={handleCreateAndAssign}
+        onCancel={() => {
+          setCreateAssignModalOpen(false);
+          setNewModelNumber('');
+        }}
+      >
+        <p className="text-sm text-slate-500 mt-0 mb-3">
+          {selectedAssetIds.length > 0
+            ? '只需填写新型号，系统会创建产品并一次性关联本批图片；其余资料可稍后在产品视图中补全。'
+            : '只需填写新型号即可创建产品；其余资料可稍后在产品视图中补全，图片也可稍后关联。'}
+        </p>
+        <Input
+          value={newModelNumber}
+          placeholder="输入新产品型号"
+          maxLength={100}
+          aria-label="新产品型号"
+          onChange={(event) => setNewModelNumber(event.target.value)}
+        />
+      </Modal>
+
       {/* 添加/编辑产品弹窗 */}
       <Modal
         title={editingProduct ? '编辑产品' : '添加产品'}
@@ -731,7 +886,6 @@ export const ProductUpload: React.FC = () => {
             <Form.Item
               name="photographer_file"
               label="摄影师文件"
-              rules={[{ required: true, message: '请输入摄影师文件' }]}
             >
               <Input placeholder="如: photographer_001" />
             </Form.Item>
@@ -739,7 +893,6 @@ export const ProductUpload: React.FC = () => {
             <Form.Item
               name="alibaba_product_url"
               label="阿里产品链接"
-              rules={[{ required: true, message: '请输入阿里产品链接' }]}
             >
               <Input placeholder="https://detail.1688.com/offer/..." />
             </Form.Item>
@@ -747,7 +900,6 @@ export const ProductUpload: React.FC = () => {
             <Form.Item
               name="category"
               label="分类"
-              rules={[{ required: true, message: '请输入分类' }]}
             >
               <Input placeholder="如: 相机肩带" />
             </Form.Item>
@@ -828,6 +980,7 @@ export const ProductUpload: React.FC = () => {
           <Form.Item
             name="images"
             label="产品图片"
+            extra="拖拽调整顺序，第一张为主图"
             valuePropName="fileList"
             getValueFromEvent={(e) => {
               if (Array.isArray(e)) {
@@ -836,17 +989,36 @@ export const ProductUpload: React.FC = () => {
               return e?.fileList;
             }}
           >
-            <Upload
-              listType="picture-card"
-              multiple
-              beforeUpload={() => false}
-              accept="image/*"
+            <DndContext
+              sensors={imageSensors}
+              collisionDetection={closestCenter}
+              onDragEnd={handleImageDragEnd}
             >
-              <div>
-                <PlusOutlined />
-                <div style={{ marginTop: 8 }}>上传图片</div>
-              </div>
-            </Upload>
+              <SortableContext
+                items={watchedImages.map((file) => file.uid)}
+                strategy={rectSortingStrategy}
+              >
+                <Upload
+                  listType="picture-card"
+                  multiple
+                  beforeUpload={() => false}
+                  accept=".png,.jpg,.jpeg,.gif,.webp"
+                  itemRender={(originNode, file, fileList) => (
+                    <SortableUploadItem
+                      file={file}
+                      isPrimary={fileList[0]?.uid === file.uid}
+                    >
+                      {originNode}
+                    </SortableUploadItem>
+                  )}
+                >
+                  <div>
+                    <PlusOutlined />
+                    <div style={{ marginTop: 8 }}>上传图片</div>
+                  </div>
+                </Upload>
+              </SortableContext>
+            </DndContext>
           </Form.Item>
         </Form>
       </Modal>
@@ -919,6 +1091,16 @@ export const ProductUpload: React.FC = () => {
           </div>
         </div>
       </Modal>
+
+      <ImportImagesModal
+        open={importModalOpen}
+        onClose={() => setImportModalOpen(false)}
+        onFinished={() => {
+          setAssetPage(1);
+          setSelectedAssetIds([]);
+          void fetchAssets(1, assetSearch);
+        }}
+      />
     </div>
   );
 };

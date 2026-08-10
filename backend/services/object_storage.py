@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Optional, Protocol, Union
@@ -45,6 +46,14 @@ class ObjectSpec:
 
 
 @dataclass(frozen=True)
+class SignedDownloadUrl:
+    """带过期时刻的签名下载地址；同一对象在同一时间窗口内 URL 稳定。"""
+
+    url: str
+    expires_at: int  # epoch 秒
+
+
+@dataclass(frozen=True)
 class ObjectStorageTargetInspection:
     """写入前只读获取的 OSS 目标身份、ACL 与前缀样本。"""
 
@@ -79,7 +88,13 @@ class ObjectWriter(Protocol):
 
 
 class PrivateObjectSigner(Protocol):
-    def sign_download_url(self, key: str, expires_seconds: int) -> str:
+    def sign_download_url(
+        self,
+        key: str,
+        expires_seconds: int,
+        *,
+        cache_control: Optional[str] = None,
+    ) -> SignedDownloadUrl:
         ...
 
 
@@ -225,20 +240,40 @@ class OssObjectStorage:
         except Exception as exc:
             raise self._safe_upload_error(exc) from None
 
-    def sign_download_url(self, key: str, expires_seconds: int) -> str:
+    def sign_download_url(
+        self,
+        key: str,
+        expires_seconds: int,
+        *,
+        cache_control: Optional[str] = None,
+    ) -> SignedDownloadUrl:
         if expires_seconds <= 0:
             raise ObjectStorageConfigError('OSS 签名有效期必须大于 0')
+        params = (
+            {'response-cache-control': cache_control}
+            if cache_control
+            else None
+        )
+        # 过期时刻对齐到 expires_seconds 长度的固定时间窗口终点，而不是
+        # “调用时刻 + TTL”：同一对象在同一窗口内生成的签名 URL 完全一致，
+        # 浏览器刷新时可按 URL 命中缓存，避免重复消耗 OSS 出口流量。
+        # oss2 内部以 int(time.time()) + expires 计算过期时刻，签名计算与
+        # 取值之间跨秒时 URL 可能差 1 秒；调用方需用缓存余量吸收该误差。
+        now = int(time.time())
+        expires_at = (now // expires_seconds + 1) * expires_seconds
         try:
-            return self._bucket.sign_url(
+            url = self._bucket.sign_url(
                 'GET',
                 key,
-                expires_seconds,
+                expires_at - now,
                 slash_safe=True,
+                params=params,
             )
         except Exception as exc:
             raise ObjectStorageError(
                 f'OSS 签名失败: {type(exc).__name__}'
             ) from None
+        return SignedDownloadUrl(url=url, expires_at=expires_at)
 
     @staticmethod
     def _upload_headers(spec: ObjectSpec) -> dict[str, str]:

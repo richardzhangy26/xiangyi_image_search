@@ -89,10 +89,14 @@ def prepare_product_uploads(image_files, model_number):
     objects = {}
     content_types = {}
     relative_paths = []
+    # 与输入文件列表等长对齐：被扩展名白名单跳过的文件占 None 槽位，
+    # 保证调用方能按原始下标定位每个上传文件的入库结果。
+    aligned_paths = []
     occurrences = {}
     encoded_model_number = quote(str(model_number), safe='')
     for image_file in image_files:
         if not image_file or not allowed_file(image_file.filename):
+            aligned_paths.append(None)
             continue
         filename = (
             (image_file.filename or '')
@@ -115,11 +119,12 @@ def prepare_product_uploads(image_files, model_number):
         objects[relative_path] = data
         content_types[relative_path] = image_file.mimetype or 'application/octet-stream'
         relative_paths.append(relative_path)
+        aligned_paths.append(relative_path)
     return InMemoryObjectSource(
         source_bucket=PRODUCT_UPLOAD_SOURCE_BUCKET,
         objects=objects,
         content_types=content_types,
-    ), relative_paths
+    ), relative_paths, aligned_paths
 
 
 def attach_product_upload_result(result, model_number):
@@ -191,6 +196,39 @@ def image_asset_for_product(asset, image_order=0):
     }
 
 
+def apply_product_image_order(model_number, ordered_asset_ids):
+    """按给定顺序重写商品活动资产的 sort_order（0 起连续）。
+
+    未出现在列表中的本商品资产按当前顺序追加到队尾；列表中不存在、
+    不属于本商品或重复的条目会被跳过。
+    """
+    assets = ImageAsset.query.filter(
+        ImageAsset.model_number == model_number,
+        ImageAsset.status == 'active',
+    ).order_by(
+        ImageAsset.sort_order,
+        ImageAsset.created_at,
+        ImageAsset.id,
+    ).all()
+    assets_by_id = {str(asset.id): asset for asset in assets}
+    position = 0
+    seen = set()
+    for asset_id in ordered_asset_ids:
+        if asset_id in seen:
+            continue
+        asset = assets_by_id.get(asset_id)
+        if asset is None:
+            continue
+        asset.sort_order = position
+        seen.add(asset_id)
+        position += 1
+    for asset in assets:
+        if str(asset.id) in seen:
+            continue
+        asset.sort_order = position
+        position += 1
+
+
 def products_with_active_images(products):
     """批量拼装商品与活动资产，避免产品列表出现逐行图片查询。"""
     if not products:
@@ -203,6 +241,7 @@ def products_with_active_images(products):
         ImageAsset.status == 'active',
     ).order_by(
         ImageAsset.model_number,
+        ImageAsset.sort_order,
         ImageAsset.created_at,
         ImageAsset.id,
     ).all()
@@ -347,11 +386,10 @@ def create_product():
 
         product_data = json.loads(product_data_str)
 
-        # 验证必填字段
-        required_fields = ['model_number', 'photographer_file', 'alibaba_product_url', 'category']
-        for field in required_fields:
-            if not product_data.get(field):
-                return jsonify({'error': f'缺少必填字段: {field}'}), 400
+        # 创建产品时仅型号必填；其余 NOT NULL 字段缺省时以空字符串占位，
+        # 可稍后在产品编辑页补全。
+        if not product_data.get('model_number'):
+            return jsonify({'error': '缺少必填字段: model_number'}), 400
 
         model_number = product_data['model_number']
 
@@ -361,20 +399,28 @@ def create_product():
 
         # 创建产品对象（单事务：此处不提交）
         product = Product.from_dict(product_data)
+        for field in ('photographer_file', 'alibaba_product_url', 'category'):
+            if getattr(product, field) is None:
+                setattr(product, field, '')
         db.session.add(product)
 
-        source, relative_paths = prepare_product_uploads(
+        source, relative_paths, aligned_paths = prepare_product_uploads(
             request.files.getlist('images'),
             model_number,
         )
         image_results = []
+        # 与 multipart images 顺序对齐；被跳过或未入库的槽位为 None
+        ingested_asset_ids = []
         request_id = uuid.uuid4().hex
 
         if relative_paths:
             ingest_service = get_asset_ingest_service(source)
-            for relative_path in relative_paths:
+            for aligned_path in aligned_paths:
+                if aligned_path is None:
+                    ingested_asset_ids.append(None)
+                    continue
                 result = ingest_service.ingest_one(
-                    relative_path,
+                    aligned_path,
                     model_number=model_number,
                     request_id=request_id,
                     commit=False,
@@ -385,6 +431,13 @@ def create_product():
                 )
                 if image_result:
                     image_results.append(image_result)
+                    ingested_asset_ids.append(str(result.asset_id))
+                else:
+                    ingested_asset_ids.append(None)
+
+        ordered_new_ids = [asset_id for asset_id in ingested_asset_ids if asset_id]
+        if ordered_new_ids:
+            apply_product_image_order(model_number, ordered_new_ids)
 
         db.session.commit()
 
@@ -464,27 +517,53 @@ def update_product(model_number):
             return jsonify({'error': '产品不存在'}), 404
 
         # 获取更新数据
+        image_order_raw = None
         product_data_str = request.form.get('product')
         if product_data_str:
             product_data = json.loads(product_data_str)
+            image_order_raw = product_data.get('image_order')
 
             # 更新字段（排除主键）
             for key, value in product_data.items():
                 if key != 'model_number' and hasattr(product, key):
                     setattr(product, key, value)
 
-        source, relative_paths = prepare_product_uploads(
+        if image_order_raw is not None and (
+            not isinstance(image_order_raw, list)
+            or any(not isinstance(entry, str) for entry in image_order_raw)
+        ):
+            db.session.rollback()
+            return error_response('图片排序参数无效', 'INVALID_IMAGE_ORDER', 400)
+
+        existing_ordered_ids = [
+            str(asset.id)
+            for asset in ImageAsset.query.filter(
+                ImageAsset.model_number == model_number,
+                ImageAsset.status == 'active',
+            ).order_by(
+                ImageAsset.sort_order,
+                ImageAsset.created_at,
+                ImageAsset.id,
+            ).all()
+        ]
+
+        source, relative_paths, aligned_paths = prepare_product_uploads(
             request.files.getlist('images'),
             model_number,
         )
         image_results = []
+        # 与 multipart images 顺序对齐；被跳过或未入库的槽位为 None
+        ingested_asset_ids = []
         request_id = uuid.uuid4().hex
 
         if relative_paths:
             ingest_service = get_asset_ingest_service(source)
-            for relative_path in relative_paths:
+            for aligned_path in aligned_paths:
+                if aligned_path is None:
+                    ingested_asset_ids.append(None)
+                    continue
                 result = ingest_service.ingest_one(
-                    relative_path,
+                    aligned_path,
                     model_number=model_number,
                     request_id=request_id,
                     commit=False,
@@ -495,6 +574,33 @@ def update_product(model_number):
                 )
                 if image_result:
                     image_results.append(image_result)
+                    ingested_asset_ids.append(str(result.asset_id))
+                else:
+                    ingested_asset_ids.append(None)
+
+        if image_order_raw is not None:
+            resolved_order = []
+            for entry in image_order_raw:
+                if entry.startswith('new:'):
+                    index_text = entry[4:]
+                    if index_text.isdigit():
+                        index = int(index_text)
+                        if index < len(ingested_asset_ids):
+                            asset_id = ingested_asset_ids[index]
+                            if asset_id:
+                                resolved_order.append(asset_id)
+                    continue
+                resolved_order.append(entry)
+            apply_product_image_order(model_number, resolved_order)
+        else:
+            ordered_new_ids = [
+                asset_id for asset_id in ingested_asset_ids if asset_id
+            ]
+            if ordered_new_ids:
+                apply_product_image_order(
+                    model_number,
+                    existing_ordered_ids + ordered_new_ids,
+                )
 
         db.session.commit()
 

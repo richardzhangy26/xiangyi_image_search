@@ -14,6 +14,7 @@ import type {
   ProductImageWriteSummary,
   ImageAssetListResponse,
   ImageAssetAssignmentResponse,
+  ImageAssetImportResponse,
 } from '../types/product';
 import { API_BASE_URL } from '../config';
 
@@ -89,19 +90,48 @@ export const getImageAssets = async (params: {
   return response.json();
 };
 
-/** 将图片资产事务化关联到一个已有型号。 */
+/** 将图片资产事务化关联到一个型号；可选在型号不存在时快速创建产品。 */
 export const assignImageAssets = async (
   assetIds: string[],
-  modelNumber: string
+  modelNumber: string,
+  options: { createIfMissing?: boolean } = {}
 ): Promise<ImageAssetAssignmentResponse> => {
   const response = await fetch(`${API_BASE_URL}/api/image-assets/assign`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ asset_ids: assetIds, model_number: modelNumber }),
+    body: JSON.stringify({
+      asset_ids: assetIds,
+      model_number: modelNumber,
+      create_if_missing: options.createIfMissing ?? false,
+    }),
   });
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: '关联型号失败' }));
     throw new Error(error.error || '关联型号失败');
+  }
+  return response.json();
+};
+
+/** 把本地图片批量导入为待归款图片资产（不创建产品记录）。 */
+export const importImageAssets = async (
+  files: File[],
+  relativePaths: string[],
+  prefix: string
+): Promise<ImageAssetImportResponse> => {
+  const formData = new FormData();
+  files.forEach((file) => formData.append('images', file));
+  formData.append('relative_paths', JSON.stringify(relativePaths));
+  formData.append('prefix', prefix);
+
+  const response = await fetch(`${API_BASE_URL}/api/image-assets/import`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({
+      error: '图片导入失败',
+    }));
+    throw new Error(error.error || '图片导入失败');
   }
   return response.json();
 };
@@ -162,7 +192,7 @@ export const createProduct = async (
  */
 export const updateProduct = async (
   modelNumber: string,
-  productData: Partial<ProductFormData>,
+  productData: Partial<ProductFormData> & { image_order?: string[] },
   newImages?: File[]
 ): Promise<ProductImageWriteSummary & { message: string }> => {
   const formData = new FormData();

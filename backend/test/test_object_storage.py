@@ -1,5 +1,6 @@
 """私有 OSS 适配器的安全契约。"""
 
+import time
 from types import SimpleNamespace
 
 from services.object_storage import ObjectSpec, OssObjectStorage
@@ -45,8 +46,10 @@ class FakeBucket:
 
     def sign_url(self, method, key, expires, headers=None, params=None,
                  slash_safe=False):
-        self.calls.append(('sign', method, key, expires, slash_safe))
-        return 'https://private.example/signed'
+        self.calls.append(('sign', method, key, expires, slash_safe, params))
+        # 与 oss2 一致：过期时刻 = int(time.time()) + expires
+        expiration = int(time.time()) + expires
+        return f'https://private.example/{key}?Expires={expiration}'
 
 
 def test_head_returns_size_content_type_and_normalized_metadata():
@@ -118,13 +121,49 @@ def test_uploads_forbid_overwrite_and_attach_metadata(tmp_path):
     )
 
 
-def test_private_signing_does_not_change_bucket_acl():
+def test_private_signing_does_not_change_bucket_acl(monkeypatch):
     bucket = FakeBucket()
+    monkeypatch.setattr(time, 'time', lambda: 1_000_000.0)
 
     signed = OssObjectStorage(bucket).sign_download_url(
         'preview/key.jpg',
         600,
     )
 
-    assert signed == 'https://private.example/signed'
-    assert bucket.calls == [('sign', 'GET', 'preview/key.jpg', 600, True)]
+    assert signed.url == 'https://private.example/preview/key.jpg?Expires=1000200'
+    assert signed.expires_at == 1_000_200
+    assert bucket.calls == [
+        ('sign', 'GET', 'preview/key.jpg', 200, True, None),
+    ]
+
+
+def test_signed_url_is_stable_within_aligned_time_window(monkeypatch):
+    bucket = FakeBucket()
+    storage = OssObjectStorage(bucket)
+    monkeypatch.setattr(time, 'time', lambda: 1_000_000.0)
+    first = storage.sign_download_url('preview/key.jpg', 600)
+    monkeypatch.setattr(time, 'time', lambda: 1_000_100.0)
+    second = storage.sign_download_url('preview/key.jpg', 600)
+
+    assert first.url == second.url
+    assert first.expires_at == second.expires_at == 1_000_200
+
+    monkeypatch.setattr(time, 'time', lambda: 1_000_200.0)
+    third = storage.sign_download_url('preview/key.jpg', 600)
+    assert third.url != first.url
+    assert third.expires_at == 1_000_800
+
+
+def test_signed_url_injects_response_cache_control(monkeypatch):
+    bucket = FakeBucket()
+    monkeypatch.setattr(time, 'time', lambda: 1_000_000.0)
+
+    OssObjectStorage(bucket).sign_download_url(
+        'preview/key.jpg',
+        600,
+        cache_control='private, max-age=600',
+    )
+
+    assert bucket.calls[0][-1] == {
+        'response-cache-control': 'private, max-age=600',
+    }

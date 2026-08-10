@@ -1,11 +1,26 @@
 """独立图片资产 API。"""
 
+import hashlib
+import json
 import logging
+import time
 import uuid
 
 from flask import Blueprint, current_app, jsonify, redirect, request
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
+from werkzeug.exceptions import RequestEntityTooLarge
 
+from blueprints.products_v2 import ALLOWED_EXTENSIONS, asset_ingest_error_response
 from models import ImageAsset, Product, db
+from product_search import EmbeddingServiceError
+from services.asset_ingest import (
+    AssetIngestConflictError,
+    AssetIngestError,
+    ImageAssetIngestService,
+)
+from services.image_normalizer import ImageNormalizationError
+from services.object_source import InMemoryObjectSource
 from services.object_storage import ObjectStorageError, OssObjectStorage
 
 logger = logging.getLogger(__name__)
@@ -18,6 +33,16 @@ image_assets_bp = Blueprint(
 
 MANAGEMENT_ASSIGNMENTS = frozenset({'unassigned', 'assigned', 'all'})
 MAX_ASSIGNMENT_BATCH = 100
+MAX_MODEL_NUMBER_LENGTH = 100
+
+# 本地导入（单图/文件夹/剪贴板）以独立来源身份进入待归款列表，
+# 不创建产品记录；正式原图与预览仍由统一入库服务写入私有 OSS。
+IMPORT_SOURCE_PROVIDER = 'local-import'
+IMPORT_SOURCE_BUCKET = 'user-imports'
+DEFAULT_IMPORT_PREFIX = '手动导入'
+MAX_IMPORT_BATCH = 20
+MAX_IMPORT_PREFIX_LENGTH = 100
+MAX_IMPORT_PATH_LENGTH = 512
 
 
 def _management_asset_dict(asset):
@@ -83,16 +108,270 @@ def _assignment_error(message, error_code, status):
     return jsonify({'error': message, 'error_code': error_code}), status
 
 
+def _import_error(message, error_code, status):
+    return jsonify({'error': message, 'error_code': error_code}), status
+
+
+def _clean_import_path(raw, max_length):
+    """清洗用户提供的导入路径段；拒绝穿越、绝对路径与非法字符。"""
+    if not isinstance(raw, str):
+        return None
+    value = raw.replace('\x00', '').replace('\\', '/').strip()
+    if not value or value.startswith('/') or len(value) > max_length:
+        return None
+    segments = []
+    for segment in value.split('/'):
+        segment = segment.strip()
+        if not segment or segment == '.':
+            continue
+        if segment == '..':
+            return None
+        segments.append(segment)
+    if not segments:
+        return None
+    return '/'.join(segments)
+
+
+def _allowed_import_filename(path):
+    name = path.rsplit('/', 1)[-1]
+    return (
+        '.' in name
+        and name.rsplit('.', 1)[-1].lower()
+        in {suffix.lstrip('.') for suffix in ALLOWED_EXTENSIONS}
+    )
+
+
+def _import_ingest_service(source):
+    """构造本地导入专用的入库服务；测试替身注入点与产品上传一致。"""
+    storage = current_app.config.get('IMAGE_ASSET_STORAGE')
+    if storage is None:
+        storage = OssObjectStorage.from_env()
+    return ImageAssetIngestService(
+        source=source,
+        storage=storage,
+        embedding_client=current_app.config.get('IMAGE_INGEST_EMBEDDING'),
+        normalizer=current_app.config.get('IMAGE_ASSET_NORMALIZER'),
+        source_provider=IMPORT_SOURCE_PROVIDER,
+    )
+
+
+def _import_item_error(result):
+    """把入库单项失败转换为脱敏的用户可见原因。"""
+    if result.status == 'source_conflict':
+        return '名字重复：同一路径已存在不同内容的图片'
+    if result.error_stage == 'preview':
+        return '图片已损坏或无法安全解码'
+    if result.error_stage == 'embedding':
+        return '图片识别服务暂不可用，请稍后重试该图片'
+    return '导入失败，请稍后重试该图片'
+
+
+@image_assets_bp.post('/import')
+def import_unassigned_assets():
+    """把本地图片批量导入为未归款资产，不创建产品记录。"""
+    files = request.files.getlist('images')
+    if not 1 <= len(files) <= MAX_IMPORT_BATCH:
+        return _import_error(
+            f'一次最多导入 {MAX_IMPORT_BATCH} 张图片',
+            'INVALID_IMAGE_ASSET_IMPORT',
+            400,
+        )
+
+    try:
+        relative_paths = json.loads(request.form.get('relative_paths') or '[]')
+    except (TypeError, ValueError):
+        return _import_error(
+            '导入参数无效', 'INVALID_IMAGE_ASSET_IMPORT', 400
+        )
+    if (
+        not isinstance(relative_paths, list)
+        or len(relative_paths) != len(files)
+        or any(not isinstance(item, str) for item in relative_paths)
+    ):
+        return _import_error(
+            '导入参数无效', 'INVALID_IMAGE_ASSET_IMPORT', 400
+        )
+
+    prefix = _clean_import_path(
+        request.form.get('prefix') or DEFAULT_IMPORT_PREFIX,
+        MAX_IMPORT_PREFIX_LENGTH,
+    )
+    if prefix is None:
+        return _import_error(
+            '导入命名前缀无效', 'INVALID_IMAGE_ASSET_IMPORT', 400
+        )
+
+    cleaned_paths = []
+    for raw_path in relative_paths:
+        cleaned = _clean_import_path(raw_path, MAX_IMPORT_PATH_LENGTH)
+        if (
+            cleaned is None
+            or len(f'{prefix}/{cleaned}') > MAX_IMPORT_PATH_LENGTH
+            or not _allowed_import_filename(cleaned)
+        ):
+            return _import_error(
+                '导入路径无效：只支持 png/jpg/jpeg/gif/webp 图片的相对路径',
+                'INVALID_IMAGE_ASSET_IMPORT',
+                400,
+            )
+        cleaned_paths.append(f'{prefix}/{cleaned}')
+    if len(set(cleaned_paths)) != len(cleaned_paths):
+        return _import_error(
+            '本批导入路径存在重复，请修改后重试',
+            'INVALID_IMAGE_ASSET_IMPORT',
+            400,
+        )
+
+    try:
+        objects = {}
+        content_types = {}
+        content_hashes = []
+        for image_file, final_path in zip(files, cleaned_paths):
+            data = image_file.read()
+            objects[final_path] = data
+            content_types[final_path] = (
+                image_file.mimetype or 'application/octet-stream'
+            )
+            content_hashes.append(hashlib.sha256(data).hexdigest())
+
+        # 内容重复预检：命中已有活跃资产或批内自重复时跳过并提示。
+        existing_hashes = {
+            row[0] for row in ImageAsset.query.filter(
+                ImageAsset.status == 'active',
+                ImageAsset.content_hash.in_(set(content_hashes)),
+            ).with_entities(ImageAsset.content_hash)
+        }
+        items = [None] * len(files)
+        ingest_paths = []
+        seen_hashes = set()
+        for index, (final_path, content_hash) in enumerate(
+            zip(cleaned_paths, content_hashes)
+        ):
+            if content_hash in existing_hashes or content_hash in seen_hashes:
+                items[index] = {
+                    'relative_path': final_path,
+                    'status': 'skipped_duplicate_content',
+                    'asset_id': None,
+                    'error': '内容重复：系统中已存在相同内容的图片',
+                }
+                del objects[final_path]
+                del content_types[final_path]
+                continue
+            seen_hashes.add(content_hash)
+            ingest_paths.append(final_path)
+
+        if ingest_paths:
+            source = InMemoryObjectSource(
+                source_bucket=IMPORT_SOURCE_BUCKET,
+                objects=objects,
+                content_types=content_types,
+            )
+            results = _import_ingest_service(source).ingest_many(
+                ingest_paths,
+                model_number=None,
+                request_id=uuid.uuid4().hex,
+            )
+            result_by_path = {
+                result.source_relative_path: result for result in results
+            }
+            for index, final_path in enumerate(cleaned_paths):
+                if items[index] is not None:
+                    continue
+                result = result_by_path[final_path]
+                if result.status in {'created', 'existing'}:
+                    items[index] = {
+                        'relative_path': final_path,
+                        'status': result.status,
+                        'asset_id': result.asset_id,
+                        'error': None,
+                    }
+                else:
+                    items[index] = {
+                        'relative_path': final_path,
+                        'status': (
+                            'source_conflict'
+                            if result.status == 'source_conflict'
+                            else 'failed'
+                        ),
+                        'asset_id': None,
+                        'error': _import_item_error(result),
+                    }
+
+        counts = {
+            'created_count': 0,
+            'existing_count': 0,
+            'skipped_count': 0,
+            'failed_count': 0,
+        }
+        for item in items:
+            if item['status'] == 'created':
+                counts['created_count'] += 1
+            elif item['status'] == 'existing':
+                counts['existing_count'] += 1
+            elif item['status'] == 'skipped_duplicate_content':
+                counts['skipped_count'] += 1
+            else:
+                counts['failed_count'] += 1
+        return jsonify({'items': items, **counts})
+
+    except AssetIngestConflictError:
+        db.session.rollback()
+        logger.warning('本地导入失败（图片资产冲突）')
+        return _import_error(
+            '图片资产发生冲突，未覆盖现有内容', 'IMAGE_ASSET_CONFLICT', 409
+        )
+    except ImageNormalizationError:
+        db.session.rollback()
+        return _import_error(
+            '上传图片已损坏或无法安全解码', 'INVALID_IMAGE', 400
+        )
+    except EmbeddingServiceError:
+        db.session.rollback()
+        logger.error('本地导入失败（向量服务）')
+        return _import_error(
+            '图片识别服务暂不可用，请稍后重试',
+            'EMBEDDING_SERVICE_ERROR',
+            503,
+        )
+    except ObjectStorageError:
+        db.session.rollback()
+        logger.error('本地导入失败（对象存储）')
+        return _import_error(
+            '图片存储服务暂不可用，请稍后重试',
+            'OBJECT_STORAGE_ERROR',
+            503,
+        )
+    except AssetIngestError as exc:
+        db.session.rollback()
+        logger.error(
+            '本地导入失败（图片资产） stage=%s error_type=%s',
+            exc.stage,
+            type(exc).__name__,
+        )
+        return asset_ingest_error_response(exc)
+    except RequestEntityTooLarge:
+        db.session.rollback()
+        return _import_error('上传图片过大', 'IMAGE_TOO_LARGE', 413)
+    except Exception:
+        db.session.rollback()
+        logger.exception('本地导入失败')
+        return _import_error(
+            '图片导入失败', 'IMAGE_ASSET_IMPORT_FAILED', 500
+        )
+
+
 @image_assets_bp.post('/assign')
 def assign_image_assets():
     payload = request.get_json(silent=True) or {}
     raw_ids = payload.get('asset_ids')
     model_number = payload.get('model_number')
+    create_if_missing = payload.get('create_if_missing', False)
     if (
         not isinstance(raw_ids, list)
         or not 1 <= len(raw_ids) <= MAX_ASSIGNMENT_BATCH
         or not isinstance(model_number, str)
         or not model_number.strip()
+        or not isinstance(create_if_missing, bool)
         or any(not isinstance(value, str) for value in raw_ids)
         or len(set(raw_ids)) != len(raw_ids)
     ):
@@ -112,10 +391,26 @@ def assign_image_assets():
         )
 
     model_number = model_number.strip()
-    if db.session.get(Product, model_number) is None:
+    if len(model_number) > MAX_MODEL_NUMBER_LENGTH:
         return _assignment_error(
-            '目标型号不存在，请刷新产品列表', 'PRODUCT_NOT_FOUND', 404
+            '关联参数无效', 'INVALID_IMAGE_ASSET_ASSIGNMENT', 400
         )
+
+    # 锁定产品行使同一型号的归款串行化，避免并发追加产生并列 sort_order。
+    product_created = False
+    if db.session.get(Product, model_number, with_for_update=True) is None:
+        if not create_if_missing:
+            return _assignment_error(
+                '目标型号不存在，请刷新产品列表', 'PRODUCT_NOT_FOUND', 404
+            )
+        # 快速创建只保留型号；NOT NULL 字段用空字符串占位，稍后在产品视图补全。
+        db.session.add(Product(
+            model_number=model_number,
+            photographer_file='',
+            alibaba_product_url='',
+            category='',
+        ))
+        product_created = True
 
     assets = ImageAsset.query.filter(
         ImageAsset.id.in_(asset_ids)
@@ -135,19 +430,36 @@ def assign_image_assets():
             409,
         )
 
+    next_order = db.session.query(
+        func.coalesce(func.max(ImageAsset.sort_order), -1)
+    ).filter(
+        ImageAsset.model_number == model_number,
+        ImageAsset.status == 'active',
+    ).scalar() + 1
+
+    assets_by_id = {asset.id: asset for asset in assets}
     assigned_count = 0
     reused_count = 0
-    for asset in assets:
+    for requested_id in asset_ids:
+        asset = assets_by_id[requested_id]
         if asset.model_number == model_number:
             reused_count += 1
         else:
             asset.model_number = model_number
+            asset.sort_order = next_order
+            next_order += 1
             assigned_count += 1
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        return _assignment_error(
+            '型号已存在，请刷新产品列表', 'PRODUCT_ALREADY_EXISTS', 409
+        )
     return jsonify({
         'model_number': model_number,
         'assigned_count': assigned_count,
         'reused_count': reused_count,
+        'product_created': product_created,
     })
 
 
@@ -175,10 +487,12 @@ def private_preview(asset_id):
                 'error_code': 'PREVIEW_SIGNING_ERROR',
             }), 503
 
+    ttl_seconds = current_app.config['OSS_SIGNED_URL_TTL_SECONDS']
     try:
-        signed_url = storage.sign_download_url(
+        signed = storage.sign_download_url(
             asset.preview_oss_path,
-            current_app.config['OSS_SIGNED_URL_TTL_SECONDS'],
+            ttl_seconds,
+            cache_control=f'private, max-age={ttl_seconds}',
         )
     except Exception as exc:  # 外部边界错误统一脱敏
         logger.error(
@@ -191,4 +505,12 @@ def private_preview(asset_id):
             'error_code': 'PREVIEW_SIGNING_ERROR',
         }), 503
 
-    return redirect(signed_url, code=302)
+    # 签名 URL 在 TTL 时间窗口内保持稳定，允许浏览器同时缓存 302 跳转与
+    # OSS 响应；缓存时长取窗口剩余时间并预留 30 秒余量，保证缓存期内
+    # 签名始终有效，窗口内刷新页面不再消耗 OSS 出口流量。
+    remaining = max(signed.expires_at - int(time.time()) - 30, 0)
+    response = redirect(signed.url, code=302)
+    response.headers['Cache-Control'] = (
+        f'private, max-age={min(remaining, ttl_seconds)}'
+    )
+    return response

@@ -1,0 +1,274 @@
+{
+  "compatibility_aliases_used": [],
+  "elapsed_seconds": 15.171,
+  "generated_at": "2026-08-02T10:46:47.281749+08:00",
+  "image_objects": 2419,
+  "items": [
+    {
+      "asset_id": "51eb4519-6b2b-4f1f-833b-b344e5547d96",
+      "content_hash": "5e9d500f890167cf4672af548658e03e6b2dfc89344534184c4bba217c4c2498",
+      "error": null,
+      "error_stage": null,
+      "oss_path": "image-search/xiangxipackage/2025.4.18海报照片/加拍照片/DSC01146 拷贝.jpg",
+      "preview_oss_path": "image-search/previews/preview-v1/5e/5e9d500f890167cf4672af548658e03e6b2dfc89344534184c4bba217c4c2498.jpg",
+      "source_relative_path": "2025.4.18海报照片/加拍照片/DSC01146 拷贝.jpg",
+      "source_size": 11366009,
+      "stages": {
+        "database": "reused",
+        "download": "new",
+        "embedding": "reused",
+        "original": "reused",
+        "preview": "reused"
+      },
+      "status": "existing"
+    },
+    {
+      "asset_id": "0062f3d5-e407-475e-86ae-f3345df3ac3f",
+      "content_hash": "d67a10b97afa7bd1a441780648a8153aa26d9b851ee46d16fac5f38a7bc2d00a",
+      "error": null,
+      "error_stage": null,
+      "oss_path": "image-search/xiangxipackage/2025.4.18海报照片/圆角1920x800.png",
+      "preview_oss_path": "image-search/previews/preview-v1/d6/d67a10b97afa7bd1a441780648a8153aa26d9b851ee46d16fac5f38a7bc2d00a.jpg",
+      "source_relative_path": "2025.4.18海报照片/圆角1920x800.png",
+      "source_size": 25815,
+      "stages": {
+        "database": "reused",
+        "download": "new",
+        "embedding": "reused",
+        "original": "reused",
+        "preview": "reused"
+      },
+      "status": "existing"
+    },
+    {
+      "asset_id": "7c765266-dac0-4a9b-9d81-68baeee29a9d",
+      "content_hash": "615c8e58f028c40156ec60824a3daeb9dbdca304775829a2214c7244b9b53220",
+      "error": null,
+      "error_stage": null,
+      "oss_path": "image-search/xiangxipackage/手机挂绳/A13/处理后/1.png",
+      "preview_oss_path": "image-search/previews/preview-v1/61/615c8e58f028c40156ec60824a3daeb9dbdca304775829a2214c7244b9b53220.jpg",
+      "source_relative_path": "手机挂绳/A13/处理后/1.png",
+      "source_size": 37946073,
+      "stages": {
+        "database": "reused",
+        "download": "new",
+        "embedding": "reused",
+        "original": "reused",
+        "preview": "reused"
+      },
+      "status": "existing"
+    },
+    {
+      "asset_id": "8c6532ea-2bf7-4b0b-95f7-1284305cb74f",
+      "content_hash": "329f38b0918b56860d5e4c3ad93502dd952c4081a75ee055f6425b8c5de53d30",
+      "error": null,
+      "error_stage": null,
+      "oss_path": "image-search/xiangxipackage/处理过的/F23/5.png",
+      "preview_oss_path": "image-search/previews/preview-v1/32/329f38b0918b56860d5e4c3ad93502dd952c4081a75ee055f6425b8c5de53d30.jpg",
+      "source_relative_path": "处理过的/F23/5.png",
+      "source_size": 979291,
+      "stages": {
+        "database": "reused",
+        "download": "new",
+        "embedding": "reused",
+        "original": "reused",
+        "preview": "reused"
+      },
+      "status": "existing"
+    },
+    {
+      "asset_id": "c4158c56-726d-4bc9-9e1f-7fd16f1291fa",
+      "content_hash": "329f38b0918b56860d5e4c3ad93502dd952c4081a75ee055f6425b8c5de53d30",
+      "error": null,
+      "error_stage": null,
+      "oss_path": "image-search/xiangxipackage/处理过的/F23/6.png",
+      "preview_oss_path": "image-search/previews/preview-v1/32/329f38b0918b56860d5e4c3ad93502dd952c4081a75ee055f6425b8c5de53d30.jpg",
+      "source_relative_path": "处理过的/F23/6.png",
+      "source_size": 979291,
+      "stages": {
+        "database": "reused",
+        "download": "new",
+        "embedding": "reused",
+        "original": "reused",
+        "preview": "reused"
+      },
+      "status": "existing"
+    },
+    {
+      "asset_id": "f9aff5e9-e36a-4217-a9d3-aeff0c884441",
+      "content_hash": "9a64f9cae0e02594001544617fcd903a1172ee085fa5cdda2690fcc50f8ca9e8",
+      "error": null,
+      "error_stage": null,
+      "oss_path": "image-search/xiangxipackage/2025.4.18海报照片/加拍照片/DSC00013.jpg",
+      "preview_oss_path": "image-search/previews/preview-v1/9a/9a64f9cae0e02594001544617fcd903a1172ee085fa5cdda2690fcc50f8ca9e8.jpg",
+      "source_relative_path": "2025.4.18海报照片/加拍照片/DSC00013.jpg",
+      "source_size": 7135994,
+      "stages": {
+        "database": "reused",
+        "download": "new",
+        "embedding": "reused",
+        "original": "reused",
+        "preview": "reused"
+      },
+      "status": "existing"
+    },
+    {
+      "asset_id": "6beea1bd-c703-43f1-874c-6a38285359d0",
+      "content_hash": "65eb7a9e56f61e339cbb61fb4707f028ede0ac4c83f1bce5c081b4845cce60b6",
+      "error": null,
+      "error_stage": null,
+      "oss_path": "image-search/xiangxipackage/2025.4.18海报照片/包1排版2-1 拷贝.png",
+      "preview_oss_path": "image-search/previews/preview-v1/65/65eb7a9e56f61e339cbb61fb4707f028ede0ac4c83f1bce5c081b4845cce60b6.jpg",
+      "source_relative_path": "2025.4.18海报照片/包1排版2-1 拷贝.png",
+      "source_size": 1433457,
+      "stages": {
+        "database": "reused",
+        "download": "new",
+        "embedding": "reused",
+        "original": "reused",
+        "preview": "reused"
+      },
+      "status": "existing"
+    },
+    {
+      "asset_id": "03c3b258-f44d-49d1-b06b-7d7895db2c81",
+      "content_hash": "2f72b60c37a691c2d8713cfbaad44a6793c27c0038a989112f4768f28dc14c22",
+      "error": null,
+      "error_stage": null,
+      "oss_path": "image-search/xiangxipackage/E01-E53-2025.653x6张=318张-/E-01/E-2025.6 (10).jpg",
+      "preview_oss_path": "image-search/previews/preview-v1/2f/2f72b60c37a691c2d8713cfbaad44a6793c27c0038a989112f4768f28dc14c22.jpg",
+      "source_relative_path": "E01-E53-2025.653x6张=318张-/E-01/E-2025.6 (10).jpg",
+      "source_size": 506482,
+      "stages": {
+        "database": "reused",
+        "download": "new",
+        "embedding": "reused",
+        "original": "reused",
+        "preview": "reused"
+      },
+      "status": "existing"
+    },
+    {
+      "asset_id": "9f3f9db2-df68-48cf-9a13-ac50b85631b1",
+      "content_hash": "44689699b50f1e95e3f21a2e1fc89e88848c78b310d8e4844169f5ec137c8dc5",
+      "error": null,
+      "error_stage": null,
+      "oss_path": "image-search/xiangxipackage/手机挂绳/A19/修改后/1.png",
+      "preview_oss_path": "image-search/previews/preview-v1/44/44689699b50f1e95e3f21a2e1fc89e88848c78b310d8e4844169f5ec137c8dc5.jpg",
+      "source_relative_path": "手机挂绳/A19/修改后/1.png",
+      "source_size": 31624854,
+      "stages": {
+        "database": "reused",
+        "download": "new",
+        "embedding": "reused",
+        "original": "reused",
+        "preview": "reused"
+      },
+      "status": "existing"
+    },
+    {
+      "asset_id": "2a3abed8-570c-4be0-99fb-c97c7ae04983",
+      "content_hash": "c3572bb823b006e7580336109e0b595b6065291cfb53c0f6ccf2f1b065e6bcee",
+      "error": null,
+      "error_stage": null,
+      "oss_path": "image-search/xiangxipackage/2025.4.18海报照片/手机挂绳/DSC01104.jpg",
+      "preview_oss_path": "image-search/previews/preview-v1/c3/c3572bb823b006e7580336109e0b595b6065291cfb53c0f6ccf2f1b065e6bcee.jpg",
+      "source_relative_path": "2025.4.18海报照片/手机挂绳/DSC01104.jpg",
+      "source_size": 3990954,
+      "stages": {
+        "database": "reused",
+        "download": "new",
+        "embedding": "reused",
+        "original": "reused",
+        "preview": "reused"
+      },
+      "status": "existing"
+    }
+  ],
+  "mode": "pilot",
+  "non_image_objects": 1,
+  "options": {
+    "batch_size": 20,
+    "limit": null,
+    "pilot": 10,
+    "selection_count": 10,
+    "selection_manifest": true
+  },
+  "read_only": false,
+  "retry": {
+    "enabled": false,
+    "matched": 0,
+    "missing": [],
+    "requested": 0
+  },
+  "schema_version": 1,
+  "source": {
+    "bucket": "xiangxipackage",
+    "prefix": "",
+    "provider": "qiniu-kodo",
+    "s3_bucket": "xiangxipackage",
+    "s3_region": "cn-east-1"
+  },
+  "status": "ok",
+  "summary": {
+    "outcomes": {
+      "existing": 10
+    },
+    "scan": {
+      "bytes": 6443942398,
+      "images": 2419,
+      "non_images": 1,
+      "objects": 2420
+    },
+    "selection": {
+      "bytes": 95988220,
+      "images": 10
+    },
+    "stages": {
+      "database": {
+        "conflict": 0,
+        "failed": 0,
+        "new": 0,
+        "reused": 10
+      },
+      "download": {
+        "conflict": 0,
+        "failed": 0,
+        "new": 10,
+        "reused": 0
+      },
+      "embedding": {
+        "conflict": 0,
+        "failed": 0,
+        "new": 0,
+        "reused": 10
+      },
+      "original": {
+        "conflict": 0,
+        "failed": 0,
+        "new": 0,
+        "reused": 10
+      },
+      "preview": {
+        "conflict": 0,
+        "failed": 0,
+        "new": 0,
+        "reused": 10
+      }
+    }
+  },
+  "total_bytes": 6443942398,
+  "total_objects": 2420,
+  "verification": {
+    "covered": [
+      "chinese_space_path",
+      "duplicate_content",
+      "jpeg",
+      "nested_path",
+      "over_20_mib",
+      "png",
+      "small_source"
+    ],
+    "missing": []
+  }
+}

@@ -109,6 +109,30 @@ export interface ImageAssetAssignmentResponse {
   model_number: string;
   assigned_count: number;
   reused_count: number;
+  product_created: boolean;
+}
+
+/** 本地导入（单图/文件夹/剪贴板）单项结果。 */
+export type ImageAssetImportItemStatus =
+  | 'created'
+  | 'existing'
+  | 'skipped_duplicate_content'
+  | 'source_conflict'
+  | 'failed';
+
+export interface ImageAssetImportItem {
+  relative_path: string;
+  status: ImageAssetImportItemStatus;
+  asset_id: string | null;
+  error: string | null;
+}
+
+export interface ImageAssetImportResponse {
+  items: ImageAssetImportItem[];
+  created_count: number;
+  existing_count: number;
+  skipped_count: number;
+  failed_count: number;
 }
 
 /** 图片资产级搜索结果；商品型号允许尚未补充。 */
@@ -165,9 +189,9 @@ export type VectorIndexEvent =
  */
 export interface ProductFormData {
   model_number: string;
-  photographer_file: string;
-  alibaba_product_url: string;
-  category: string;
+  photographer_file?: string;
+  alibaba_product_url?: string;
+  category?: string;
   spec_cn_reference?: string;
   spec_cn?: string;
   spec_en?: string;

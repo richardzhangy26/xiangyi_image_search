@@ -63,8 +63,10 @@ def create_app(config_name='development'):
     # 基础配置
     app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    # 签名 URL 过期时刻按该值长度的时间窗口对齐；窗口同时决定浏览器对
+    # 302 跳转和 OSS 响应的私有缓存时长。
     app.config['OSS_SIGNED_URL_TTL_SECONDS'] = int(
-        os.getenv('OSS_SIGNED_URL_TTL_SECONDS', '600')
+        os.getenv('OSS_SIGNED_URL_TTL_SECONDS', '3600')
     )
     app.config['DATASET_ROOT'] = os.getenv(
         'DATASET_ROOT',

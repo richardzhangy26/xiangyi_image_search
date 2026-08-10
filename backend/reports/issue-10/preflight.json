@@ -1,0 +1,33 @@
+{
+  "compatibility_aliases_used": [],
+  "elapsed_seconds": 0.787,
+  "endpoint_url": "https://s3.cn-east-1.qiniucs.com",
+  "generated_at": "2026-08-02T10:26:15.964802+08:00",
+  "image_objects": 2419,
+  "mode": "preflight",
+  "prefix": "",
+  "read_only": true,
+  "s3_bucket": "xiangxipackage",
+  "s3_region": "cn-east-1",
+  "sample": {
+    "content_type": "image/png",
+    "downloaded_size": 25815,
+    "etag": "\"64c839f8c3d50802c04fbf2d6844ff57\"",
+    "head_size": 25815,
+    "height": 801,
+    "image_format": "PNG",
+    "key": "2025.4.18海报照片/圆角1920x800.png",
+    "listed_size": 25815,
+    "width": 1921
+  },
+  "source": {
+    "bucket": "xiangxipackage",
+    "prefix": "",
+    "provider": "qiniu-kodo",
+    "s3_bucket": "xiangxipackage"
+  },
+  "source_bucket": "xiangxipackage",
+  "status": "ok",
+  "total_bytes": 6443942398,
+  "total_objects": 2420
+}

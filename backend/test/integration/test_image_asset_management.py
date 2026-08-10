@@ -119,6 +119,7 @@ def test_assigns_multiple_unassigned_assets_in_one_transaction(app):
     assert response.status_code == 200
     assert response.get_json() == {
         'model_number': 'CS-001', 'assigned_count': 2, 'reused_count': 0,
+        'product_created': False,
     }
     db.session.expire_all()
     assert db.session.get(ImageAsset, first.id).model_number == 'CS-001'
@@ -196,3 +197,91 @@ def test_assignment_rejects_invalid_or_duplicate_asset_ids(app):
     assert client.post('/api/image-assets/assign', json={
         'asset_ids': ['not-a-uuid'], 'model_number': 'CS-001',
     }).status_code == 400
+    assert client.post('/api/image-assets/assign', json={
+        'asset_ids': [asset_id], 'model_number': 'CS-001',
+        'create_if_missing': 'yes',
+    }).status_code == 400
+
+
+def test_create_if_missing_creates_product_and_assigns_in_one_transaction(app):
+    first = _asset('待归款/新建一.png')
+    second = _asset('待归款/新建二.png')
+    db.session.add_all([first, second])
+    db.session.commit()
+
+    response = app.test_client().post('/api/image-assets/assign', json={
+        'asset_ids': [str(first.id), str(second.id)],
+        'model_number': 'NEW-001',
+        'create_if_missing': True,
+    })
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        'model_number': 'NEW-001', 'assigned_count': 2, 'reused_count': 0,
+        'product_created': True,
+    }
+    db.session.expire_all()
+    product = db.session.get(Product, 'NEW-001')
+    assert product is not None
+    assert product.photographer_file == ''
+    assert product.alibaba_product_url == ''
+    assert product.category == ''
+    assert db.session.get(ImageAsset, first.id).model_number == 'NEW-001'
+    assert db.session.get(ImageAsset, second.id).model_number == 'NEW-001'
+
+
+def test_missing_product_still_rejected_without_create_if_missing(app):
+    asset = _asset('待归款/保持未归款.png')
+    db.session.add(asset)
+    db.session.commit()
+
+    response = app.test_client().post('/api/image-assets/assign', json={
+        'asset_ids': [str(asset.id)], 'model_number': 'NEW-002',
+    })
+
+    assert response.status_code == 404
+    assert response.get_json()['error_code'] == 'PRODUCT_NOT_FOUND'
+    db.session.expire_all()
+    assert db.session.get(Product, 'NEW-002') is None
+    assert db.session.get(ImageAsset, asset.id).model_number is None
+
+
+def test_create_if_missing_rejects_oversized_model_number(app):
+    asset = _asset('待归款/超长型号.png')
+    db.session.add(asset)
+    db.session.commit()
+
+    response = app.test_client().post('/api/image-assets/assign', json={
+        'asset_ids': [str(asset.id)],
+        'model_number': 'X' * 101,
+        'create_if_missing': True,
+    })
+
+    assert response.status_code == 400
+    assert response.get_json()['error_code'] == (
+        'INVALID_IMAGE_ASSET_ASSIGNMENT'
+    )
+    assert db.session.get(Product, 'X' * 101) is None
+
+
+def test_create_if_missing_conflict_rolls_back_product_and_batch(app):
+    other_product = _product('CS-002')
+    free_asset = _asset('待归款/新建不回滚.png')
+    conflict = _asset('已归款/新建冲突.png', model_number='CS-002')
+    db.session.add_all([other_product, free_asset, conflict])
+    db.session.commit()
+
+    response = app.test_client().post('/api/image-assets/assign', json={
+        'asset_ids': [str(free_asset.id), str(conflict.id)],
+        'model_number': 'NEW-003',
+        'create_if_missing': True,
+    })
+
+    assert response.status_code == 409
+    assert response.get_json()['error_code'] == (
+        'IMAGE_ASSET_ASSIGNMENT_CONFLICT'
+    )
+    db.session.expire_all()
+    assert db.session.get(Product, 'NEW-003') is None
+    assert db.session.get(ImageAsset, free_asset.id).model_number is None
+    assert db.session.get(ImageAsset, conflict.id).model_number == 'CS-002'

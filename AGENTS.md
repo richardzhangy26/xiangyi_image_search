@@ -25,7 +25,7 @@ This file provides guidance to AI coding agents (Claude Code, Qoder, etc.) when 
 1. scripts.migrate_kodo_to_oss 对 Kodo 做只读 preflight、盘点和经授权的迁移；Kodo 不执行 Put/Delete。
 2. 迁移或产品上传经过 ImageAssetIngestService：在私有 OSS 中无覆盖写入原图和 preview-v1 预览，然后写入 image_assets 及其向量。
 3. VectorSearchService 只检索 image_assets.status = active 的向量。
-4. API 只返回资产 ID 和 /api/image-assets/<asset_id>/preview；该入口生成短时签名 URL 并返回私有 302，不保存或拼接公开 URL。
+4. API 只返回资产 ID 和 /api/image-assets/<asset_id>/preview；该入口生成短时签名 URL 并返回私有 302，不保存或拼接公开 URL。签名过期时刻按 OSS_SIGNED_URL_TTL_SECONDS 长度的时间窗口对齐，同一资产在窗口内 URL 稳定，302 与 OSS 响应均携带私有 Cache-Control，浏览器在窗口内刷新不重复消耗 OSS 出口流量。
 
 product_images 是**未修改的退休兼容表**，不属于新库 schema、应用 ORM 或活动写路径。任何另行授权的兼容迁移前，先运行 python -m scripts.audit_legacy_product_images，根据只读审计结果制作人工迁移清单；本仓库不自动迁移、删除或覆盖它，也不物理清理旧对象。
 
@@ -41,7 +41,7 @@ product_images 是**未修改的退休兼容表**，不属于新库 schema、应
 - backend/scripts/migrate_kodo_to_oss.py - 受控 Kodo → 私有 OSS 迁移入口。
 - backend/scripts/audit_legacy_product_images.py - 独立、只读的退休兼容表审计入口。
 - backend/blueprints/products_v2.py - Product CRUD、CSV 导入和产品图片资产入库（/api/products）。
-- backend/blueprints/image_assets.py - 图片资产列表、归款和私有预览 302（/api/image-assets）。
+- backend/blueprints/image_assets.py - 图片资产列表、归款、本地导入（POST /api/image-assets/import，source_provider=local-import，只写未归款资产）和私有预览 302（/api/image-assets）。
 - backend/models/product.py - Product 商品元数据模型。
 - backend/init_db.py - 创建 pgvector 扩展、模型表和 image_assets HNSW 索引。
 - postgres/init/01_init.sql - Docker 首次启动 SQL；应与模型保持一致。
@@ -84,9 +84,9 @@ SET LOCAL 保证连接归还连接池时不污染后续请求；服务在成功�
 
 - React 18 + TypeScript + Vite；Ant Design 5 和 Tailwind CSS。
 - ProductSearch（以图搜款）和 ProductUpload（产品管理）是当前路由组件。
-- ProductUpload 默认展示待归款图片，支持按来源路径搜索、分页、多选并关联既有型号；不自动推断或创建型号，也不提供解绑、跨型号改绑。
+- ProductUpload 默认展示待归款图片，支持按来源路径搜索、分页、多选并关联既有型号；资产工作台提供独立的“添加产品”按钮（仅型号快速创建，选中图片时一并关联），创建产品仅型号必填（其余字段空占位、可后续补全），不自动推断型号，也不提供解绑、跨型号改绑。
 - 前端通过 /api/ 访问后端；Nginx 只代理 API，不提供本地图片静态源。
-- 图片卡片使用私有预览入口，浏览器跟随 302 获取短时签名地址。
+- 图片卡片使用私有预览入口，浏览器跟随 302 获取短时签名地址；签名 URL 按时间窗口对齐且响应带私有缓存头，窗口内刷新直接命中浏览器缓存。
 
 ## Docker 部署
 
@@ -163,9 +163,12 @@ backend/.env（由 .env.example 复制）中的必填项：
 | oss_path / preview_oss_path | 私有 OSS 原图和规范化预览对象键 |
 | content_hash / source_size / source_mime_type / source_width / source_height | 原图内容和尺寸元数据 |
 | vector / embedding_model / embedding_dimension | 1024 维 pgvector 及模型绑定 |
+| sort_order | 商品内图片展示顺序；0 即主图，未归款资产无意义（默认 0） |
 | normalization_version / status | 规范化版本；active 或 archived |
 
 索引包括内容哈希、型号、状态和只针对 active 资产的 HNSW cosine 索引。退休兼容表保持原样，不由新库初始化或应用写路径创建；如需兼容迁移，先单独执行只读审计并取得授权。
+
+产品图片接口按 (sort_order, created_at, id) 升序返回，is_primary 由排序后首位派生；新上传与归款图片追加队尾，编辑弹窗拖拽排序随 PUT /api/products/<model> 的 image_order 单事务保存。存量数据库通过 python -m scripts.migrate_image_asset_sort_order（幂等）补列并回填，不在应用启动时隐式执行。
 
 ## 产品与迁移操作
 
@@ -192,32 +195,84 @@ python -m scripts.audit_legacy_product_images
 
 ~~~
 cd backend
-python -m pytest test/ -v
+python -m pytest test/ \
+  --ignore=test/test.py \
+  --ignore=test/test_pgvector.py \
+  --ignore=test/benchmark_search.py -v
 python -m pytest test/integration/ -v
-python -m pytest test/ --ignore=test/integration -v
+python -m pytest test/ \
+  --ignore=test/integration \
+  --ignore=test/test.py \
+  --ignore=test/test_pgvector.py \
+  --ignore=test/benchmark_search.py -v
 ~~~
 
-集成测试使用 DB_HOST:DB_PORT（默认 localhost:5433）上的独立 image_search_test 数据库；连接不可用时会自动 skip。test/test_pgvector.py 和 test/benchmark_search.py 是手工基准脚本，不是 pytest 用例。
+集成测试使用 DB_HOST:DB_PORT（默认 localhost:5433）上的独立 image_search_test 数据库；连接不可用时会自动 skip。
+
+- test/test.py 是真实 OSS 连通性脚本，会列举对象并上传、下载、删除 test_oss_connection.txt；代理不得自动运行，只有用户明确授权且确认隔离 bucket 后才能执行。
+- test/test_pgvector.py 和 test/benchmark_search.py 是手工基准脚本，不是 pytest 用例；代理不得把它们纳入默认测试或验证命令。
+- 子代理只运行主线程明确批准的定向测试命令，不得自行把定向测试扩成全量测试、真实云写入或数据库基准操作。
 
 ## 重要约束
 
 - 不执行 DROP、DELETE、覆盖上传或云对象清理来“迁移”旧数据；所有收缩动作必须另行授权并可回滚。
-- 图片正式来源始终是私有 OSS，Kodo 只读备份；预览始终经过 /api/image-assets/<asset_id>/preview 的短时签名 302。
+- 图片正式来源始终是私有 OSS，Kodo 只读备份；预览始终经过 /api/image-assets/<asset_id>/preview 的短时签名 302，不在代码中拼接公开对象地址。
 - 不在应用启动、普通部署或健康检查中隐式运行兼容审计或迁移。
 - Legacy TypeScript 组件（如 OrderManagement）未路由且可能有类型错误，除非重新启用，否则不要顺手修复。
 - 如果 Docker 报告历史容器名称冲突，只处理明确冲突的容器；不要删除数据库卷。
 - 完成稳定功能后，仅在改变架构事实、入口或操作约束时更新最近作用域的 AGENTS.md；记录当前事实，不记录实现过程。
 
-## Agent skills
+## Agent 工作流与模型路由
 
-### Issue tracker
+### 工作流事实源
 
-Issues are tracked in GitHub Issues (richardzhangy26/xiangyi_image_search) via the gh CLI. See docs/agents/issue-tracker.md.
+- Issues 和 PRD 使用 GitHub Issues（richardzhangy26/xiangyi_image_search），通过 gh CLI 操作；见 docs/agents/issue-tracker.md。
+- 默认 triage 标签为 needs-triage / needs-info / ready-for-agent / ready-for-human / wontfix；见 docs/agents/triage-labels.md。
+- 长期领域事实以根目录 CONTEXT.md 和 docs/adr/ 为准；见 docs/agents/domain.md。GitHub Issue 记录交付范围，Superpowers plan 只是单张高风险 Ticket 的短期执行配方。
 
-### Triage labels
+### Codex 技能调用
 
-Default triage vocabulary: needs-triage / needs-info / ready-for-agent / ready-for-human / wontfix. See docs/agents/triage-labels.md.
+- 在 Codex 中使用 `$skill-name` 显式调用技能，或通过 `/skills` 选择；不要把 Matt 文档中的通用 `/skill` 写法误当成 Codex 命令。
+- `$ask-matt` 必须由用户显式调用，并且只负责在 Matt skills 内选路，不负责选择 Matt 与 Superpowers 两条总工作流。
+- 对功能、修复或重构，在写代码前确定 `lane=matt` 或 `lane=superpowers`；纯解释、只读调查和代码审查不需要强行指定 lane。
 
-### Domain docs
+### Lane 选择
 
-Single-context: one CONTEXT.md + docs/adr/ at the repo root. See docs/agents/domain.md.
+- 默认使用 `lane=matt`：普通前端功能、常规 Flask CRUD、CSV 校验、文档、小型 Bug，以及不改变存储、事务或 schema 语义的改动。
+- 以下情况使用 `lane=superpowers`：schema、事务、并发、OSS/Kodo、pgvector、embedding 模型或维度、权限、legacy 数据、数据迁移、恢复点、真实外部写入，或跨多个边界且失败代价高的改动。
+- Matt 可以先产出整体 spec 和 tickets；其中某张高风险 Ticket 只能在 Ticket 边界进入 Superpowers。执行中若范围升级为高风险，立即停止，重新确认 lane 和授权，不得在同一执行上下文中悄悄换流程。
+- 一张 Ticket 只能有一个 lane、一个 TDD 流程、一个诊断流程和一个主 review 流程；不得叠加两套完整工作流。
+
+### Matt lane
+
+- 不确定该用哪个 Matt skill 时，由用户显式调用 `$ask-matt`。
+- 一般主线为 `$grill-with-docs` → 必要时 `$prototype` → 多会话任务 `$to-spec` → `$to-tickets` → 每张 Ticket 在新任务中 `$implement` → `$code-review`。
+- 能在当前上下文完成的小改可直接 `$implement`；困难 Bug 使用 `$diagnosing-bugs`；外部资料调查使用 `$research`。
+- 从需求访谈到 `$to-tickets` 保持同一上下文；每张 `$implement` Ticket 使用新的 Codex 任务。Matt lane 不再调用 Superpowers 的 brainstorming、writing-plans 或 subagent-driven-development。
+
+### Superpowers lane
+
+- 主线为 `$brainstorming` → `$writing-plans` → `$using-git-worktrees` → `$subagent-driven-development`（或 `$executing-plans`）→ `$verification-before-completion` → `$finishing-a-development-branch`。
+- 已有 Matt spec 或 Ticket 时，将它作为 Superpowers 的输入并只确认该 Ticket 的设计，不重新访谈、拆分或实现整个上游功能。
+- 写计划前必须由 `architect` 审查架构边界、不变量、失败模式、回滚与测试接缝；实现完成后必须由 `risk_reviewer` 对完整 diff 做独立审查。
+- Superpowers lane 不再调用 Matt 的 `$to-spec`、`$to-tickets`、`$implement` 或 `$code-review`。`$verification-before-completion` 可作为两条 lane 共用的完成门，但不是第二套 review。
+
+### 模型分工
+
+| 角色 | 模型 | 使用范围 |
+| --- | --- | --- |
+| 主线程 | Terra Medium | 普通分析、Matt 工作流、计划落盘、常规实现与协调 |
+| `explorer` | Luna Medium，只读 | 代码搜索、调用链、测试定位和证据收集 |
+| `luna_worker` | Luna Medium | 验收条件完整、范围不超过 1–2 个文件的机械修改和预批准命令 |
+| Terra worker / 普通 reviewer | Terra | 多文件集成、Matt prose Ticket 实现、普通 `/review` 与 `$code-review` |
+| `architect` | Sol XHigh，只读 | 高风险设计与实施计划审查，不直接修改文件 |
+| `risk_reviewer` | Sol High，只读 | 安全、事务、迁移和高风险完整 diff 的最终独立审查 |
+
+- 便宜模型对同一验收目标连续失败两次，或任务需要自行补齐设计判断时，立即升级到 Terra；涉及数据安全、不可逆操作或跨边界契约冲突时升级到 `architect`，不得无限重试。
+- 默认最多并行三个子代理。优先并行只读探索、独立 review 和报告整理；写入范围重叠或任务存在依赖时禁止并行实现。
+
+### 共享授权门
+
+- 模型或 lane 选择不构成迁移、部署、删除、真实 OSS/Kodo 写入、数据库收缩、创建或修改 GitHub Issues、commit、push 或 PR 的授权。
+- 技能内置的发布、提交或合并步骤不得覆盖用户授权边界；执行外部或 Git 操作前确认用户是否明确要求。
+- 所有代理必须保护现有未提交改动，只修改被授权的文件；需要扩大范围时先报告原因和最小必要范围。

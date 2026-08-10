@@ -1,5 +1,9 @@
 import { useEffect, useState } from 'react';
-import { LinkOutlined, ReloadOutlined } from '@ant-design/icons';
+import {
+  LinkOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+} from '@ant-design/icons';
 import {
   Alert,
   Button,
@@ -8,7 +12,6 @@ import {
   Input,
   Pagination,
   Spin,
-  Tooltip,
 } from 'antd';
 import type { ImageAssetManagementItem } from '../types/product';
 import { getImageUrl } from '../services/productApi';
@@ -22,11 +25,12 @@ export interface UnassignedAssetGridProps {
   error: string | null;
   search: string;
   selectedAssetIds: string[];
-  canAssign: boolean;
+  hasProducts: boolean;
   onSearch: (value: string) => void;
   onPageChange: (page: number) => void;
   onSelectionChange: (assetIds: string[]) => void;
   onAssign: () => void;
+  onCreateProduct: () => void;
   onRetry: () => void;
 }
 
@@ -53,11 +57,12 @@ export function UnassignedAssetGrid({
   error,
   search,
   selectedAssetIds,
-  canAssign,
+  hasProducts,
   onSearch,
   onPageChange,
   onSelectionChange,
   onAssign,
+  onCreateProduct,
   onRetry,
 }: UnassignedAssetGridProps) {
   const [draftSearch, setDraftSearch] = useState(search);
@@ -82,27 +87,28 @@ export function UnassignedAssetGrid({
           <span className="asset-selection-count">
             已选 {selectedAssetIds.length} 张
           </span>
-          <Tooltip
-            title={canAssign ? undefined : '请先在产品视图中添加或导入真实型号'}
+          <Button
+            type="primary"
+            icon={<LinkOutlined />}
+            aria-label="关联型号"
+            disabled={!hasProducts || selectedAssetIds.length === 0}
+            onClick={onAssign}
           >
-            <span>
-              <Button
-                type="primary"
-                icon={<LinkOutlined />}
-                aria-label="关联型号"
-                disabled={selectedAssetIds.length === 0 || !canAssign}
-                onClick={onAssign}
-              >
-                关联型号
-              </Button>
-            </span>
-          </Tooltip>
+            关联型号
+          </Button>
+          <Button
+            icon={<PlusOutlined />}
+            aria-label="添加产品"
+            onClick={onCreateProduct}
+          >
+            添加产品
+          </Button>
         </div>
       </div>
 
-      {!canAssign && (
+      {!hasProducts && (
         <div className="asset-guidance">
-          当前还没有产品型号。你仍可浏览全部图片；需要归款时，请先切换到“产品资料”添加或 CSV 导入真实型号。
+          当前还没有产品型号。可直接点“添加产品”快速建型号（选中图片时会一并关联）；也可以切换到“产品资料”添加或 CSV 导入。
         </div>
       )}
 

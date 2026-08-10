@@ -40,6 +40,12 @@ class ImageAsset(db.Model):
     embedding_dimension = db.Column(db.SmallInteger, nullable=False)
     normalization_version = db.Column(db.String(32), nullable=False)
 
+    sort_order = db.Column(
+        db.Integer,
+        nullable=False,
+        default=0,
+        comment='商品内图片展示顺序；0 即主图，未归款资产无意义',
+    )
     status = db.Column(db.String(20), nullable=False, default='active')
     archived_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
@@ -108,6 +114,7 @@ class ImageAsset(db.Model):
             'embedding_dimension': self.embedding_dimension,
             'normalization_version': self.normalization_version,
             'status': self.status,
+            'sort_order': self.sort_order,
             'archived_at': self.archived_at.isoformat() if self.archived_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,

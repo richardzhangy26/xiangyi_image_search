@@ -37,12 +37,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# 创建非 root 用户运行应用
+# 创建非 root 用户运行应用（uploads/data 被 .dockerignore 排除，需显式 chown 给 appuser）
 RUN useradd -m -s /bin/bash -u 1000 appuser && \
     mkdir -p /app/data/product_search/images \
              /app/data/product_search/db \
              /app/data/product_search/index \
-             /app/uploads
+             /app/uploads && \
+    chown -R appuser:appuser /app/data /app/uploads
 
 # 复制应用代码并直接赋予正确的所有权，避免额外 chown
 COPY --chown=appuser:appuser . /app

@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS image_assets (
     embedding_model       VARCHAR(128) NOT NULL,
     embedding_dimension   SMALLINT NOT NULL,
     normalization_version VARCHAR(32) NOT NULL,
+    sort_order            INTEGER NOT NULL DEFAULT 0,
     status                VARCHAR(20) NOT NULL DEFAULT 'active',
     archived_at           TIMESTAMP,
     created_at            TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -82,6 +83,7 @@ CREATE TABLE IF NOT EXISTS image_assets (
 );
 
 COMMENT ON TABLE image_assets IS '独立图片资产：可无商品型号，源图与预览存放于私有 OSS';
+COMMENT ON COLUMN image_assets.sort_order IS '商品内图片展示顺序；0 即主图，未归款资产无意义';
 
 -- 4) 索引
 CREATE INDEX IF NOT EXISTS idx_image_assets_content_hash

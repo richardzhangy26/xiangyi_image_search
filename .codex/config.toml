@@ -1,0 +1,25 @@
+# Default to the everyday workhorse for normal project work.
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+
+# Plan mode stays economical for ordinary work. High-risk planning is delegated
+# to the project-scoped architect agent, which is pinned to Sol.
+plan_mode_reasoning_effort = "xhigh"
+
+# Keep routine /review runs on Terra. Use risk_reviewer for high-risk changes.
+review_model = "gpt-5.6-terra"
+
+[agents]
+max_threads = 3
+
+[agents.explorer]
+description = "只读探索代码库、定位入口和调用链；用于搜索、盘点和证据收集。"
+config_file = "agents/explorer.toml"
+
+[agents.architect]
+description = "处理架构、跨模块契约、数据安全和高风险实施计划。"
+config_file = "agents/architect.toml"
+
+[agents.risk_reviewer]
+description = "独立审查高风险变更，检查正确性、安全、数据损失和回滚能力。"
+config_file = "agents/risk-reviewer.toml"

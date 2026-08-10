@@ -23,11 +23,12 @@ const baseProps = {
   error: null,
   search: '',
   selectedAssetIds: [] as string[],
-  canAssign: false,
+  hasProducts: false,
   onSearch: vi.fn(),
   onPageChange: vi.fn(),
   onSelectionChange: vi.fn(),
   onAssign: vi.fn(),
+  onCreateProduct: vi.fn(),
   onRetry: vi.fn(),
 };
 
@@ -43,7 +44,7 @@ describe('UnassignedAssetGrid', () => {
     );
   });
 
-  it('selects a card and disables assignment when no product exists', () => {
+  it('disables assign without products and selects a card', () => {
     const onSelectionChange = vi.fn();
     render(
       <UnassignedAssetGrid
@@ -55,6 +56,49 @@ describe('UnassignedAssetGrid', () => {
     fireEvent.click(screen.getByRole('checkbox'));
     expect(onSelectionChange).toHaveBeenCalledWith(['asset-1']);
     expect(screen.getByRole('button', { name: '关联型号' })).toBeDisabled();
+  });
+
+  it('keeps assign disabled without products even when assets selected', () => {
+    render(
+      <UnassignedAssetGrid
+        {...baseProps}
+        selectedAssetIds={['asset-1']}
+      />
+    );
+
+    expect(screen.getByRole('button', { name: '关联型号' })).toBeDisabled();
+  });
+
+  it('enables assign when products exist and assets are selected', () => {
+    const onAssign = vi.fn();
+    render(
+      <UnassignedAssetGrid
+        {...baseProps}
+        hasProducts
+        selectedAssetIds={['asset-1']}
+        onAssign={onAssign}
+      />
+    );
+
+    const button = screen.getByRole('button', { name: '关联型号' });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    expect(onAssign).toHaveBeenCalledTimes(1);
+  });
+
+  it('always offers quick product creation', () => {
+    const onCreateProduct = vi.fn();
+    render(
+      <UnassignedAssetGrid
+        {...baseProps}
+        onCreateProduct={onCreateProduct}
+      />
+    );
+
+    const button = screen.getByRole('button', { name: '添加产品' });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    expect(onCreateProduct).toHaveBeenCalledTimes(1);
   });
 
   it('submits path search and page changes', () => {

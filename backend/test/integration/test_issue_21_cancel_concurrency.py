@@ -3,48 +3,25 @@
 只使用 fake OSS / fake embedding，但要求本地隔离 PostgreSQL（image_search_test）。
 三个竞争窗口：取消 vs 领取、embedding 调用返回晚于取消、结果返回后资产提交前取消。
 
-本 Ticket 未获真实 PostgreSQL 执行授权，因此当前验收不得收集或运行本文件；
-默认单元/静态门禁也不包含 test/integration 目录。
+多会话由 conftest 的 ``pg_session_factory`` 夹具提供：每个测试独占临时 schema，
+所有连接自动携带对应 search_path，绝不触碰 public。
 """
 
 from __future__ import annotations
 
 import hashlib
-import os
-import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime
 
-import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
 
-from models import ImageAsset, ImageImportItem, db
-from services.embedding import EMBEDDING_DIMENSION, EMBEDDING_MODEL, EmbeddingResult
+from models import ImageAsset, ImageImportItem
+from services.embedding import EMBEDDING_DIMENSION, EMBEDDING_MODEL
 from services.image_import_worker import (
-    ImageImportWorker,
-    SqlAlchemyImageImportRepository,
     claim_next_import_item,
     complete_import_item,
     sweep_cancelled_imports,
 )
-
-
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = os.getenv('DB_PORT', '5433')
-TEST_DB = os.getenv('TEST_DB_NAME', 'image_search_test')
-DATABASE_URL = f'postgresql://{os.getenv("DB_USER", "postgres")}:' \
-               f'{os.getenv("DB_PASSWORD", "postgres")}@{DB_HOST}:{DB_PORT}/{TEST_DB}'
-
-
-def _engine_or_skip():
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-    try:
-        with engine.connect() as connection:
-            connection.execute(text('SELECT 1'))
-    except Exception:
-        pytest.skip('隔离 PostgreSQL 不可用，跳过真实并发场景')
-    return engine
 
 
 def _task(path, request_id):
@@ -63,9 +40,8 @@ def _task(path, request_id):
     )
 
 
-def test_cancel_intent_prevents_claim_under_concurrent_workers():
-    engine = _engine_or_skip()
-    Session = sessionmaker(bind=engine)
+def test_cancel_intent_prevents_claim_under_concurrent_workers(pg_session_factory):
+    Session = pg_session_factory
     session = Session()
     item = _task('imports/win-a/0001/a.png', 'request-win-a')
     session.add(item)
@@ -95,9 +71,8 @@ def test_cancel_intent_prevents_claim_under_concurrent_workers():
     session.rollback()
 
 
-def test_late_embedding_result_after_cancel_creates_no_asset():
-    engine = _engine_or_skip()
-    Session = sessionmaker(bind=engine)
+def test_late_embedding_result_after_cancel_creates_no_asset(pg_session_factory):
+    Session = pg_session_factory
     session = Session()
     item = _task('imports/win-b/0001/b.png', 'request-win-b')
     session.add(item)
@@ -127,9 +102,10 @@ def test_late_embedding_result_after_cancel_creates_no_asset():
     session.rollback()
 
 
-def test_cancel_during_promotion_is_serialized_and_rejected_after_commit():
-    engine = _engine_or_skip()
-    Session = sessionmaker(bind=engine)
+def test_cancel_during_promotion_is_serialized_and_rejected_after_commit(
+    pg_session_factory,
+):
+    Session = pg_session_factory
     session = Session()
     item = _task('imports/win-c/0001/c.png', 'request-win-c')
     session.add(item)
@@ -147,12 +123,12 @@ def test_cancel_during_promotion_is_serialized_and_rejected_after_commit():
     target = cancel_session.query(ImageImportItem).get(item_id)
     assert target.status == 'completed'
     assert target.asset_id is not None
+    cancel_session.rollback()
     session.rollback()
 
 
-def test_concurrent_claim_and_cancel_do_not_double_process():
-    engine = _engine_or_skip()
-    Session = sessionmaker(bind=engine)
+def test_concurrent_claim_and_cancel_do_not_double_process(pg_session_factory):
+    Session = pg_session_factory
     setup = Session()
     item = _task('imports/win-d/0001/d.png', 'request-win-d')
     setup.add(item)

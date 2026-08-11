@@ -139,3 +139,47 @@ def app(_test_database, tmp_path):
                 connection.commit()
             finally:
                 connection.close()
+
+
+@pytest.fixture()
+def pg_session_factory(_test_database):
+    """真实并发场景用的多会话工厂：独立临时 schema，连接自动携带 search_path。
+
+    与 ``app`` 夹具的单连接技巧不同，取消/领取竞争测试需要多个会话同时持有
+    各自的连接，因此 search_path 通过 connect 事件落到每条新连接上。
+    """
+    from sqlalchemy import event
+    from sqlalchemy.orm import sessionmaker
+
+    from models import db
+
+    schema_name = _temporary_schema_name()
+    quoted_schema = f'"{schema_name}"'
+    engine = sqlalchemy.create_engine(_test_database, pool_pre_ping=True)
+
+    @event.listens_for(engine, 'connect')
+    def _set_search_path(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f'SET search_path TO {quoted_schema}, public')
+        cursor.close()
+
+    with engine.connect() as setup_connection:
+        setup_connection.execute(text('CREATE EXTENSION IF NOT EXISTS vector'))
+        setup_connection.execute(text(f'CREATE SCHEMA {quoted_schema}'))
+        setup_connection.commit()
+        db.metadata.create_all(
+            bind=setup_connection.execution_options(
+                schema_translate_map={None: schema_name}
+            )
+        )
+        setup_connection.commit()
+
+    try:
+        yield sessionmaker(bind=engine)
+    finally:
+        with engine.connect() as cleanup_connection:
+            cleanup_connection.execute(
+                text(f'DROP SCHEMA {quoted_schema} CASCADE')
+            )
+            cleanup_connection.commit()
+        engine.dispose()

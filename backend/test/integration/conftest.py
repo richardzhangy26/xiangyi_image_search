@@ -2,6 +2,10 @@
 
 必须在任何 `import app` 之前设置 DATABASE_URL —— app.py 在模块导入时读取该变量，
 且 Flask-SQLAlchemy 3.1 在 init_app() 阶段就创建了 engine。
+
+凭证来源与 app.py 一致：本机 DB_* 放在 backend/.env，由 load_dotenv() 读取
+（不覆盖已导出的 shell 变量）。必须先加载 .env 再构造 DSN，否则 DB_PASSWORD
+为空，整套集成会在连库时报 fe_sendauth: no password supplied。
 """
 import os
 import re
@@ -11,10 +15,14 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy
+from dotenv import load_dotenv
 from sqlalchemy import text
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BACKEND_DIR))
+
+# 与 app.py 同一凭证来源；必须在 _dsn()/DATABASE_URL 之前生效
+load_dotenv(BACKEND_DIR / '.env')
 
 TEST_DB_NAME = 'image_search_test'
 _SCHEMA_NAME_RE = re.compile(r'^[a-z0-9_]+$')

@@ -131,23 +131,32 @@ export interface ImageAssetAssignmentResponse {
 export type ImageAssetImportItemStatus =
   | 'created'
   | 'existing'
-  | 'skipped_duplicate_content'
   | 'source_conflict'
+  | 'in_recycle_bin'
   | 'failed';
+
+export interface ImageAssetImportRecoveryAction {
+  type: 'open_recycle_bin';
+  asset_id: string;
+}
 
 export interface ImageAssetImportItem {
   relative_path: string;
   status: ImageAssetImportItemStatus;
   asset_id: string | null;
   error: string | null;
+  recovery_action: ImageAssetImportRecoveryAction | null;
 }
 
 export interface ImageAssetImportResponse {
   items: ImageAssetImportItem[];
   created_count: number;
   existing_count: number;
-  skipped_count: number;
+  conflict_count: number;
+  recycle_bin_count: number;
   failed_count: number;
+  /** @deprecated Kept for response compatibility; always zero. */
+  skipped_count: number;
 }
 
 export interface ImageAssetArchiveItemResult {

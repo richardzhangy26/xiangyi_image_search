@@ -1,6 +1,5 @@
 """独立图片资产 API。"""
 
-import hashlib
 import json
 import logging
 import time
@@ -24,7 +23,6 @@ from services.asset_archive import (
     archive_unassigned_image_assets,
 )
 from services.asset_ingest import (
-    AssetIngestConflictError,
     AssetIngestError,
     ImageAssetIngestService,
 )
@@ -339,7 +337,7 @@ def _import_ingest_service(source):
 def _import_item_error(result):
     """把入库单项失败转换为脱敏的用户可见原因。"""
     if result.status == 'source_conflict':
-        return '名字重复：同一路径已存在不同内容的图片'
+        return '来源冲突：同一路径已存在不同内容的图片'
     if result.error_stage == 'preview':
         return '图片已损坏或无法安全解码'
     if result.error_stage == 'embedding':
@@ -347,10 +345,67 @@ def _import_item_error(result):
     return '导入失败，请稍后重试该图片'
 
 
+_IMPORT_ITEM_STATUSES = frozenset({
+    'created',
+    'existing',
+    'source_conflict',
+    'in_recycle_bin',
+    'failed',
+})
+
+
+def _import_result_item(result):
+    status = (
+        result.status
+        if result.status in _IMPORT_ITEM_STATUSES
+        else 'failed'
+    )
+    return {
+        'relative_path': result.source_relative_path,
+        'status': status,
+        'asset_id': result.asset_id,
+        'error': (
+            _import_item_error(result)
+            if status in {'source_conflict', 'failed'}
+            else None
+        ),
+        'recovery_action': (
+            result.recovery_action
+            if status == 'in_recycle_bin'
+            else None
+        ),
+    }
+
+
+def _import_result_counts(items):
+    counts = {
+        'created_count': 0,
+        'existing_count': 0,
+        'conflict_count': 0,
+        'recycle_bin_count': 0,
+        'failed_count': 0,
+        'skipped_count': 0,
+    }
+    count_key_by_status = {
+        'created': 'created_count',
+        'existing': 'existing_count',
+        'source_conflict': 'conflict_count',
+        'in_recycle_bin': 'recycle_bin_count',
+        'failed': 'failed_count',
+    }
+    for item in items:
+        counts[count_key_by_status[item['status']]] += 1
+    return counts
+
+
 @image_assets_bp.post('/import')
 def import_unassigned_assets():
     """把本地图片批量导入为未归款资产，不创建产品记录。"""
-    files = request.files.getlist('images')
+    try:
+        files = request.files.getlist('images')
+    except RequestEntityTooLarge:
+        db.session.rollback()
+        return _import_error('上传图片过大', 'IMAGE_TOO_LARGE', 413)
     if not 1 <= len(files) <= MAX_IMPORT_BATCH:
         return _import_error(
             f'一次最多导入 {MAX_IMPORT_BATCH} 张图片',
@@ -406,101 +461,28 @@ def import_unassigned_assets():
     try:
         objects = {}
         content_types = {}
-        content_hashes = []
         for image_file, final_path in zip(files, cleaned_paths):
-            data = image_file.read()
-            objects[final_path] = data
+            objects[final_path] = image_file.read()
             content_types[final_path] = (
                 image_file.mimetype or 'application/octet-stream'
             )
-            content_hashes.append(hashlib.sha256(data).hexdigest())
-
-        # 内容重复预检：命中已有活跃资产或批内自重复时跳过并提示。
-        existing_hashes = {
-            row[0] for row in ImageAsset.query.filter(
-                ImageAsset.status == 'active',
-                ImageAsset.content_hash.in_(set(content_hashes)),
-            ).with_entities(ImageAsset.content_hash)
-        }
-        items = [None] * len(files)
-        ingest_paths = []
-        seen_hashes = set()
-        for index, (final_path, content_hash) in enumerate(
-            zip(cleaned_paths, content_hashes)
-        ):
-            if content_hash in existing_hashes or content_hash in seen_hashes:
-                items[index] = {
-                    'relative_path': final_path,
-                    'status': 'skipped_duplicate_content',
-                    'asset_id': None,
-                    'error': '内容重复：系统中已存在相同内容的图片',
-                }
-                del objects[final_path]
-                del content_types[final_path]
-                continue
-            seen_hashes.add(content_hash)
-            ingest_paths.append(final_path)
-
-        if ingest_paths:
-            source = InMemoryObjectSource(
-                source_bucket=IMPORT_SOURCE_BUCKET,
-                objects=objects,
-                content_types=content_types,
-            )
-            results = _import_ingest_service(source).ingest_many(
-                ingest_paths,
-                model_number=None,
-                request_id=uuid.uuid4().hex,
-            )
-            result_by_path = {
-                result.source_relative_path: result for result in results
-            }
-            for index, final_path in enumerate(cleaned_paths):
-                if items[index] is not None:
-                    continue
-                result = result_by_path[final_path]
-                if result.status in {'created', 'existing'}:
-                    items[index] = {
-                        'relative_path': final_path,
-                        'status': result.status,
-                        'asset_id': result.asset_id,
-                        'error': None,
-                    }
-                else:
-                    items[index] = {
-                        'relative_path': final_path,
-                        'status': (
-                            'source_conflict'
-                            if result.status == 'source_conflict'
-                            else 'failed'
-                        ),
-                        'asset_id': None,
-                        'error': _import_item_error(result),
-                    }
-
-        counts = {
-            'created_count': 0,
-            'existing_count': 0,
-            'skipped_count': 0,
-            'failed_count': 0,
-        }
-        for item in items:
-            if item['status'] == 'created':
-                counts['created_count'] += 1
-            elif item['status'] == 'existing':
-                counts['existing_count'] += 1
-            elif item['status'] == 'skipped_duplicate_content':
-                counts['skipped_count'] += 1
-            else:
-                counts['failed_count'] += 1
-        return jsonify({'items': items, **counts})
-
-    except AssetIngestConflictError:
-        db.session.rollback()
-        logger.warning('本地导入失败（图片资产冲突）')
-        return _import_error(
-            '图片资产发生冲突，未覆盖现有内容', 'IMAGE_ASSET_CONFLICT', 409
+        source = InMemoryObjectSource(
+            source_bucket=IMPORT_SOURCE_BUCKET,
+            objects=objects,
+            content_types=content_types,
         )
+        results = _import_ingest_service(source).ingest_many(
+            cleaned_paths,
+            model_number=None,
+            request_id=uuid.uuid4().hex,
+        )
+        if len(results) != len(cleaned_paths):
+            raise AssetIngestError(
+                '批量导入结果数量与请求不一致',
+                stage='ingest',
+            )
+        items = [_import_result_item(result) for result in results]
+        return jsonify({'items': items, **_import_result_counts(items)})
     except ImageNormalizationError:
         db.session.rollback()
         return _import_error(
@@ -530,9 +512,6 @@ def import_unassigned_assets():
             type(exc).__name__,
         )
         return asset_ingest_error_response(exc)
-    except RequestEntityTooLarge:
-        db.session.rollback()
-        return _import_error('上传图片过大', 'IMAGE_TOO_LARGE', 413)
     except Exception:
         db.session.rollback()
         logger.exception('本地导入失败')

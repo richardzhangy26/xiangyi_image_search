@@ -21,7 +21,10 @@ import {
   SnippetsOutlined,
 } from '@ant-design/icons';
 import type { ImageAssetImportItem } from '../types/product';
-import { importImageAssets } from '../services/productApi';
+import {
+  ImageAssetImportRequestError,
+  importImageAssets,
+} from '../services/productApi';
 import {
   candidatesFromClipboard,
   candidatesFromDataTransfer,
@@ -38,10 +41,15 @@ interface ImportRow extends ImportCandidate {
   previewUrl: string;
 }
 
+interface ImportChunkWithRows extends ImportChunk {
+  rowIds: string[];
+}
+
 interface ImportImagesModalProps {
   open: boolean;
   onClose: () => void;
   onFinished: () => void;
+  onOpenRecycleBin: () => void;
 }
 
 type ImportPhase = 'edit' | 'upload' | 'done';
@@ -63,9 +71,9 @@ const STATUS_LABELS: Record<ImageAssetImportItem['status'], {
   color: string;
 }> = {
   created: { text: '导入成功', color: 'green' },
-  existing: { text: '已存在（复用）', color: 'blue' },
-  skipped_duplicate_content: { text: '跳过（内容重复）', color: 'orange' },
-  source_conflict: { text: '名字重复', color: 'red' },
+  existing: { text: '已存在（幂等）', color: 'blue' },
+  source_conflict: { text: '来源冲突', color: 'red' },
+  in_recycle_bin: { text: '在回收站', color: 'orange' },
   failed: { text: '失败', color: 'red' },
 };
 
@@ -73,13 +81,16 @@ export const ImportImagesModal: React.FC<ImportImagesModalProps> = ({
   open,
   onClose,
   onFinished,
+  onOpenRecycleBin,
 }) => {
   const [rows, setRows] = useState<ImportRow[]>([]);
   const [prefix, setPrefix] = useState('手动导入');
   const [phase, setPhase] = useState<ImportPhase>('edit');
   const [chunkProgress, setChunkProgress] = useState({ current: 0, total: 0 });
-  const [results, setResults] = useState<ImageAssetImportItem[]>([]);
-  const [failedChunks, setFailedChunks] = useState<ImportChunk[]>([]);
+  const [resultsByRowId, setResultsByRowId] = useState<
+    Record<string, ImageAssetImportItem>
+  >({});
+  const [failedChunks, setFailedChunks] = useState<ImportChunkWithRows[]>([]);
   const [skippedNonImage, setSkippedNonImage] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
@@ -154,7 +165,7 @@ export const ImportImagesModal: React.FC<ImportImagesModalProps> = ({
     setRows([]);
     setPrefix('手动导入');
     setPhase('edit');
-    setResults([]);
+    setResultsByRowId({});
     setFailedChunks([]);
     setSkippedNonImage(0);
     setChunkProgress({ current: 0, total: 0 });
@@ -208,17 +219,9 @@ export const ImportImagesModal: React.FC<ImportImagesModalProps> = ({
     && duplicateFullPaths.size === 0
     && invalidRows.size === 0;
 
-  const runChunks = async (
-    chunks: ImportChunk[],
-    previousResults: ImageAssetImportItem[]
-  ) => {
-    const aggregated = previousResults.filter(
-      (item) => item.status !== 'failed'
-        || !chunks.some((chunk) => chunk.paths.some(
-          (path) => `${prefix.trim()}/${path}` === item.relative_path
-        ))
-    );
-    const failed: ImportChunk[] = [];
+  const runChunks = async (chunks: ImportChunkWithRows[]) => {
+    const aggregated = { ...resultsByRowId };
+    const failed: ImportChunkWithRows[] = [];
     for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index];
       setChunkProgress({ current: index + 1, total: chunks.length });
@@ -228,47 +231,97 @@ export const ImportImagesModal: React.FC<ImportImagesModalProps> = ({
           chunk.paths,
           prefix.trim()
         );
-        aggregated.push(...response.items);
+        if (response.items.length !== chunk.paths.length) {
+          chunk.rowIds.forEach((rowId, itemIndex) => {
+            aggregated[rowId] = {
+              relative_path: `${prefix.trim()}/${chunk.paths[itemIndex]}`,
+              status: 'failed',
+              asset_id: null,
+              error: '导入结果数量与请求不一致',
+              recovery_action: null,
+            };
+          });
+          continue;
+        }
+        const failedItemChunk: ImportChunkWithRows = {
+          files: [], paths: [], rowIds: [],
+        };
+        response.items.forEach((item, itemIndex) => {
+          aggregated[chunk.rowIds[itemIndex]] = item;
+          if (item.status === 'failed') {
+            failedItemChunk.files.push(chunk.files[itemIndex]);
+            failedItemChunk.paths.push(chunk.paths[itemIndex]);
+            failedItemChunk.rowIds.push(chunk.rowIds[itemIndex]);
+          }
+        });
+        if (failedItemChunk.files.length > 0) {
+          failed.push(failedItemChunk);
+        }
       } catch (error) {
-        failed.push(chunk);
+        if (
+          error instanceof ImageAssetImportRequestError
+          && error.retryable
+        ) {
+          failed.push(chunk);
+        }
         const reason = error instanceof Error ? error.message : '导入失败';
-        chunk.paths.forEach((path) => {
-          aggregated.push({
+        chunk.paths.forEach((path, itemIndex) => {
+          aggregated[chunk.rowIds[itemIndex]] = {
             relative_path: `${prefix.trim()}/${path}`,
             status: 'failed',
             asset_id: null,
             error: reason,
-          });
+            recovery_action: null,
+          };
         });
       }
     }
-    setResults(aggregated);
+    setResultsByRowId(aggregated);
     setFailedChunks(failed);
     setPhase('done');
     onFinished();
-    return aggregated;
   };
 
   const startImport = async () => {
     setPhase('upload');
-    const chunks = buildImportChunks(
+    const importChunks = buildImportChunks(
       rows.map((row) => ({ file: row.file, targetPath: row.targetPath.trim() }))
     );
-    await runChunks(chunks, []);
+    let rowOffset = 0;
+    const chunks = importChunks.map((chunk) => {
+      const rowIds = rows
+        .slice(rowOffset, rowOffset + chunk.files.length)
+        .map((row) => row.id);
+      rowOffset += chunk.files.length;
+      return { ...chunk, rowIds };
+    });
+    await runChunks(chunks);
   };
 
   const retryFailed = async () => {
     if (failedChunks.length === 0) return;
     setPhase('upload');
-    await runChunks(failedChunks, results);
+    await runChunks(failedChunks);
   };
 
+  const results = useMemo(() => rows.flatMap((row) => {
+    const result = resultsByRowId[row.id];
+    return result ? [result] : [];
+  }), [rows, resultsByRowId]);
+
   const summary = useMemo(() => {
-    const counts = { created: 0, existing: 0, skipped: 0, failed: 0 };
+    const counts = {
+      created: 0,
+      existing: 0,
+      conflict: 0,
+      recycleBin: 0,
+      failed: 0,
+    };
     results.forEach((item) => {
       if (item.status === 'created') counts.created += 1;
       else if (item.status === 'existing') counts.existing += 1;
-      else if (item.status === 'skipped_duplicate_content') counts.skipped += 1;
+      else if (item.status === 'source_conflict') counts.conflict += 1;
+      else if (item.status === 'in_recycle_bin') counts.recycleBin += 1;
       else counts.failed += 1;
     });
     return counts;
@@ -481,10 +534,13 @@ export const ImportImagesModal: React.FC<ImportImagesModalProps> = ({
             <div className="mb-3 flex flex-wrap items-center gap-2">
               <Tag color="green">成功 {summary.created}</Tag>
               {summary.existing > 0 && (
-                <Tag color="blue">复用 {summary.existing}</Tag>
+                <Tag color="blue">已存在（幂等） {summary.existing}</Tag>
               )}
-              {summary.skipped > 0 && (
-                <Tag color="orange">跳过（内容重复） {summary.skipped}</Tag>
+              {summary.conflict > 0 && (
+                <Tag color="red">来源冲突 {summary.conflict}</Tag>
+              )}
+              {summary.recycleBin > 0 && (
+                <Tag color="orange">在回收站 {summary.recycleBin}</Tag>
               )}
               {summary.failed > 0 && (
                 <Tag color="red">失败 {summary.failed}</Tag>
@@ -525,7 +581,17 @@ export const ImportImagesModal: React.FC<ImportImagesModalProps> = ({
             </div>
             <div className="mt-5 flex justify-end gap-3">
               {failedChunks.length > 0 && (
-                <Button onClick={retryFailed}>重试失败块</Button>
+                <Button onClick={retryFailed}>重试失败项</Button>
+              )}
+              {summary.recycleBin > 0 && (
+                <Button
+                  onClick={() => {
+                    onClose();
+                    onOpenRecycleBin();
+                  }}
+                >
+                  前往回收站
+                </Button>
               )}
               <Button type="primary" onClick={onClose}>完成</Button>
             </div>

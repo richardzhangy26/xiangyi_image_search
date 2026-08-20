@@ -67,3 +67,21 @@ def test_repository_guidance_records_source_identity_and_recycle_bin_semantics()
     assert '同一来源身份但内容不同返回来源冲突' in guidance
     assert '命中归档来源身份时返回回收站结果' in guidance
     assert '不同来源路径即使内容相同也分别创建资产' in guidance
+
+
+def test_synchronous_import_is_one_bounded_append_only_exception():
+    guidance = _source('../AGENTS.md')
+    adr = _source('../docs/adr/0006-asynchronous-embedding-before-asset-creation.md')
+
+    assert '持久异步图片导入任务只由独立 worker 处理' in guidance
+    assert 'POST /api/image-assets/import' in guidance
+    assert '同步兼容入口' in guidance
+    assert 'POST /api/image-assets/import' in adr
+    assert '追加式例外' in adr
+    assert '不得作为新增同步 embedding 入口的先例' in adr
+    assert '每个 HTTP 请求最多接收二十张图片' in adr
+    assert '没有持久导入项、自动重试、取消或恢复导入项能力' in adr
+    assert 'POST /api/image-imports` 仍是默认的可靠异步入口' in adr
+    assert '现存 POST /api/image-assets/import 是每请求最多 20 张、无持久任务/自动重试/取消语义的同步兼容入口；该受限例外不得扩展为新的请求内 embedding 入口。' in guidance
+    assert '向量成功后才创建图片资产' in adr
+    assert '现有手动导入按内容哈希直接跳过不同路径图片的行为必须移除' in adr

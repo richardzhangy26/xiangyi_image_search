@@ -6,6 +6,7 @@ import {
     archiveImageAssets,
     assignImageAssets,
     createImageImports,
+    importImageAssets,
     createProduct,
   getImageImportItem,
   getImageImportItems,
@@ -32,6 +33,153 @@ const recycleBinApi = productApi as typeof productApi & RecycleBinTransportApi;
 afterEach(() => vi.unstubAllGlobals());
 
 describe('image asset management API', () => {
+  it('preserves the complete synchronous source-identity import response', async () => {
+    const response = {
+      items: [{
+        relative_path: '手动导入/a.png',
+        status: 'in_recycle_bin' as const,
+        asset_id: 'archived-18',
+        error: null,
+        recovery_action: {
+          type: 'open_recycle_bin' as const,
+          asset_id: 'archived-18',
+        },
+      }],
+      created_count: 0,
+      existing_count: 0,
+      conflict_count: 0,
+      recycle_bin_count: 1,
+      failed_count: 0,
+      skipped_count: 0,
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => response,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const file = new File(['image'], 'a.png', { type: 'image/png' });
+
+    await expect(importImageAssets([file], ['a.png'], '手动导入'))
+      .resolves.toEqual(response);
+
+    const body = fetchMock.mock.calls[0][1].body as FormData;
+    expect(body.getAll('images')).toEqual([file]);
+    expect(body.get('relative_paths')).toBe(JSON.stringify(['a.png']));
+    expect(body.get('prefix')).toBe('手动导入');
+    expect(response.skipped_count).toBe(0);
+  });
+
+  it.each([400, 413])(
+    'throws a typed synchronous import error for HTTP %s',
+    async (status) => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+        ok: false,
+        status,
+        json: async () => ({
+          error: `导入请求被拒绝 (${status})`,
+          error_code: 'IMAGE_IMPORT_REJECTED',
+        }),
+      }));
+
+      const error = await importImageAssets([
+        new File(['image'], 'a.png', { type: 'image/png' }),
+      ], ['a.png'], '手动导入').catch((caught: unknown) => caught);
+
+      expect(error).toMatchObject({
+        name: 'ImageAssetImportRequestError',
+        status,
+        errorCode: 'IMAGE_IMPORT_REJECTED',
+        retryable: false,
+      });
+      expect(error).toBeInstanceOf(Error);
+    }
+  );
+
+  it('converts a rejected import fetch into a typed network error', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
+
+    const error = await importImageAssets([
+      new File(['image'], 'a.png', { type: 'image/png' }),
+    ], ['a.png'], '手动导入').catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: 'ImageAssetImportRequestError',
+      status: null,
+      errorCode: null,
+      retryable: true,
+    });
+    expect(error).toBeInstanceOf(Error);
+  });
+
+  it('marks a typed 503 import error as retryable', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({
+        error: '图片导入服务暂不可用',
+        error_code: 'UPSTREAM_UNAVAILABLE',
+      }),
+    }));
+
+    const error = await importImageAssets([
+      new File(['image'], 'a.png', { type: 'image/png' }),
+    ], ['a.png'], '手动导入').catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: 'ImageAssetImportRequestError',
+      status: 503,
+      errorCode: 'UPSTREAM_UNAVAILABLE',
+      retryable: true,
+    });
+  });
+
+  it.each([
+    ['TypeError', new TypeError('terminated')],
+    ['AbortError', Object.assign(new Error('request aborted'), { name: 'AbortError' })],
+  ])('treats a successful response body %s as a retryable interruption', async (_, bodyError) => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockRejectedValue(bodyError),
+    }));
+
+    const error = await importImageAssets([
+      new File(['image'], 'a.png', { type: 'image/png' }),
+    ], ['a.png'], '手动导入').catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: 'ImageAssetImportRequestError',
+      status: null,
+      errorCode: null,
+      retryable: true,
+      message: '图片导入响应读取失败，请稍后重试',
+    });
+    expect((error as Error).message).not.toContain(bodyError.message);
+  });
+
+  it('treats invalid JSON in a successful response as terminal', async () => {
+    const parserError = new SyntaxError('Unexpected token at position 0');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockRejectedValue(parserError),
+    }));
+
+    const error = await importImageAssets([
+      new File(['image'], 'a.png', { type: 'image/png' }),
+    ], ['a.png'], '手动导入').catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({
+      name: 'ImageAssetImportRequestError',
+      status: 200,
+      errorCode: null,
+      retryable: false,
+      message: '图片导入响应格式无效',
+    });
+    expect((error as Error).message).not.toContain(parserError.message);
+  });
+
   it('posts standalone image files to the persistent import endpoint', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

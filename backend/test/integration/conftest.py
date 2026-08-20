@@ -11,12 +11,14 @@ import os
 import re
 import secrets
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 import sqlalchemy
 from dotenv import load_dotenv
-from sqlalchemy import text
+from sqlalchemy import event, text
+from sqlalchemy.orm import sessionmaker
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(BACKEND_DIR))
@@ -42,6 +44,48 @@ def _temporary_schema_name():
     if not _SCHEMA_NAME_RE.fullmatch(name):
         raise AssertionError('generated schema name is not safe')
     return name
+
+
+@contextmanager
+def _temporary_schema_engine(database_url):
+    from models import db
+
+    schema_name = _temporary_schema_name()
+    quoted_schema = f'"{schema_name}"'
+    engine = sqlalchemy.create_engine(database_url, pool_pre_ping=True)
+    schema_may_exist = False
+
+    @event.listens_for(engine, 'connect')
+    def _set_search_path(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f'SET search_path TO {quoted_schema}, public')
+        cursor.close()
+
+    try:
+        with engine.connect() as setup_connection:
+            setup_connection.execute(
+                text('CREATE EXTENSION IF NOT EXISTS vector')
+            )
+            setup_connection.execute(text(f'CREATE SCHEMA {quoted_schema}'))
+            schema_may_exist = True
+            setup_connection.commit()
+            db.metadata.create_all(
+                bind=setup_connection.execution_options(
+                    schema_translate_map={None: schema_name}
+                )
+            )
+            setup_connection.commit()
+        yield engine
+    finally:
+        try:
+            if schema_may_exist:
+                with engine.connect() as cleanup_connection:
+                    cleanup_connection.execute(
+                        text(f'DROP SCHEMA IF EXISTS {quoted_schema} CASCADE')
+                    )
+                    cleanup_connection.commit()
+        finally:
+            engine.dispose()
 
 
 # 关键：必须在 import app 之前生效
@@ -156,38 +200,30 @@ def pg_session_factory(_test_database):
     与 ``app`` 夹具的单连接技巧不同，取消/领取竞争测试需要多个会话同时持有
     各自的连接，因此 search_path 通过 connect 事件落到每条新连接上。
     """
-    from sqlalchemy import event
-    from sqlalchemy.orm import sessionmaker
+    with _temporary_schema_engine(_test_database) as engine:
+        yield sessionmaker(bind=engine)
 
+
+@pytest.fixture()
+def concurrent_app(_test_database, tmp_path):
+    from app import create_app
     from models import db
 
-    schema_name = _temporary_schema_name()
-    quoted_schema = f'"{schema_name}"'
-    engine = sqlalchemy.create_engine(_test_database, pool_pre_ping=True)
+    application = create_app()
+    application.config['TESTING'] = True
+    application.config['UPLOAD_FOLDER'] = str(tmp_path / 'uploads-concurrent')
+    os.makedirs(application.config['UPLOAD_FOLDER'], exist_ok=True)
 
-    @event.listens_for(engine, 'connect')
-    def _set_search_path(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute(f'SET search_path TO {quoted_schema}, public')
-        cursor.close()
-
-    with engine.connect() as setup_connection:
-        setup_connection.execute(text('CREATE EXTENSION IF NOT EXISTS vector'))
-        setup_connection.execute(text(f'CREATE SCHEMA {quoted_schema}'))
-        setup_connection.commit()
-        db.metadata.create_all(
-            bind=setup_connection.execution_options(
-                schema_translate_map={None: schema_name}
-            )
-        )
-        setup_connection.commit()
-
-    try:
-        yield sessionmaker(bind=engine)
-    finally:
-        with engine.connect() as cleanup_connection:
-            cleanup_connection.execute(
-                text(f'DROP SCHEMA {quoted_schema} CASCADE')
-            )
-            cleanup_connection.commit()
-        engine.dispose()
+    with _temporary_schema_engine(_test_database) as engine:
+        with application.app_context():
+            db.session.remove()
+            original_engine = db.engines[None]
+            db.engines[None] = engine
+        try:
+            yield application
+        finally:
+            with application.app_context():
+                try:
+                    db.session.remove()
+                finally:
+                    db.engines[None] = original_engine

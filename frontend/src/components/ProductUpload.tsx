@@ -1626,6 +1626,7 @@ export const ProductUpload: React.FC = () => {
       <ImportImagesModal
         open={importModalOpen}
         onClose={() => setImportModalOpen(false)}
+        onOpenRecycleBin={openRecycleBinFromImport}
         onFinished={() => {
           setAssetPage(1);
           setSelectedAssetIds([]);

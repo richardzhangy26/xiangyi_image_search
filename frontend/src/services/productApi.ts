@@ -48,6 +48,21 @@ export class ProductImageWriteError extends Error {
   }
 }
 
+/** 同步本地导入的安全请求错误；仅网络和 5xx 可以由调用方重试。 */
+export class ImageAssetImportRequestError extends Error {
+  status: number | null;
+  errorCode: string | null;
+  retryable: boolean;
+
+  constructor(message: string, status: number | null, errorCode: string | null) {
+    super(message);
+    this.name = 'ImageAssetImportRequestError';
+    this.status = status;
+    this.errorCode = errorCode;
+    this.retryable = status === null || status >= 500;
+  }
+}
+
 const readProductWriteResponse = async <T>(
   response: Response,
   fallbackError: string
@@ -401,17 +416,46 @@ export const importImageAssets = async (
   formData.append('relative_paths', JSON.stringify(relativePaths));
   formData.append('prefix', prefix);
 
-  const response = await fetch(`${API_BASE_URL}/api/image-assets/import`, {
-    method: 'POST',
-    body: formData,
-  });
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({
-      error: '图片导入失败',
-    }));
-    throw new Error(error.error || '图片导入失败');
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/image-assets/import`, {
+      method: 'POST',
+      body: formData,
+    });
+  } catch {
+    throw new ImageAssetImportRequestError(
+      '图片导入请求失败，请稍后重试',
+      null,
+      null
+    );
   }
-  return response.json();
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new ImageAssetImportRequestError(
+      typeof error.error === 'string' ? error.error : '图片导入失败',
+      response.status,
+      typeof error.error_code === 'string' ? error.error_code : null
+    );
+  }
+  try {
+    return await response.json();
+  } catch (error) {
+    if (
+      error instanceof TypeError
+      || (typeof error === 'object' && error !== null && error.name === 'AbortError')
+    ) {
+      throw new ImageAssetImportRequestError(
+        '图片导入响应读取失败，请稍后重试',
+        null,
+        null
+      );
+    }
+    throw new ImageAssetImportRequestError(
+      '图片导入响应格式无效',
+      response.status,
+      null
+    );
+  }
 };
 
 /** 将未归款图片资产批量移入回收站。 */

@@ -423,6 +423,47 @@ describe('ProductUpload unified management view', () => {
     });
   });
 
+  it('wires local-import recycle hits to the archived view without restore', async () => {
+    vi.mocked(api.importImageAssets).mockResolvedValue({
+      items: [{
+        relative_path: '手动导入/a.png', status: 'in_recycle_bin',
+        asset_id: 'archived-local-a', error: null,
+        recovery_action: {
+          type: 'open_recycle_bin', asset_id: 'archived-local-a',
+        },
+      }],
+      created_count: 0, existing_count: 0, conflict_count: 0,
+      recycle_bin_count: 1, failed_count: 0, skipped_count: 0,
+    });
+    const { container } = render(<ProductUpload />);
+    fireEvent.click(await within(container).findByText('本地导入'));
+    const dialog = await screen.findByRole('dialog', {
+      name: '导入图片到待归款',
+    });
+    const fileInput = dialog.querySelector('input[type="file"]');
+    if (!(fileInput instanceof HTMLInputElement)) {
+      throw new Error('local import file input not found');
+    }
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['x'], 'a.png', { type: 'image/png' })] },
+    });
+    fireEvent.click(within(dialog).getByRole('button', {
+      name: '开始导入（1 张）',
+    }));
+    fireEvent.click(await within(dialog).findByRole('button', {
+      name: '前往回收站',
+    }));
+
+    expect(await screen.findByRole('region', { name: '回收站' }))
+      .toBeInTheDocument();
+    expect(recycleBinApi.restoreImageAssets).not.toHaveBeenCalled();
+    expect(recycleBinApi.getArchivedImageAssets).toHaveBeenLastCalledWith({
+      page: 1,
+      perPage: 24,
+      search: '',
+    });
+  });
+
   it('shows a dedicated source-conflict message and keeps the form open', async () => {
     const conflict = Object.assign(
       new Error('来源冲突：同一来源身份已存在不同内容，未覆盖现有资产'),

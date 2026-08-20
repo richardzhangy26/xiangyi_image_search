@@ -5,8 +5,6 @@ from __future__ import annotations
 import hashlib
 import io
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -28,7 +26,6 @@ from services.embedding import (
 from services.image_normalizer import ImageNormalizer
 from services.object_source import SourceLocation, SourceObjectHead
 from services.object_storage import (
-    ObjectStorageConflictError,
     ObjectStorageError,
     StoredObject,
 )
@@ -364,55 +361,6 @@ def test_archived_same_source_rerun_returns_recycle_bin_without_restoring(app):
     assert unchanged.archived_at == archived_at
     assert len(storage.put_calls) == upload_count
     assert len(embedding.paths) == 1
-
-
-class ConcurrentFakeOss(FakeOss):
-    """对 forbid-overwrite 竞态返回与真实 OSS 相同的冲突类型。"""
-
-    def __init__(self):
-        super().__init__()
-        self._lock = threading.Lock()
-
-    def put_file(self, key, source_path, *, spec):
-        with self._lock:
-            if key in self.objects:
-                raise ObjectStorageConflictError('concurrent original')
-            return super().put_file(key, source_path, spec=spec)
-
-    def put_bytes(self, key, data, *, spec):
-        with self._lock:
-            if key in self.objects:
-                raise ObjectStorageConflictError('concurrent preview')
-            return super().put_bytes(key, data, spec=spec)
-
-
-def test_concurrent_same_source_retries_converge_to_one_asset(app):
-    relative_path = '并发/同一路径.png'
-    source = FakeKodo({relative_path: _png_bytes('purple')})
-    storage = ConcurrentFakeOss()
-    embedding = FakeEmbedding()
-
-    def ingest_in_independent_session():
-        with app.app_context():
-            try:
-                return _service(source, storage, embedding).ingest_one(
-                    relative_path
-                )
-            finally:
-                db.session.remove()
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(
-            lambda _index: ingest_in_independent_session(),
-            range(2),
-        ))
-
-    assert sorted(result.status for result in results) == [
-        'created',
-        'existing',
-    ]
-    assert len({result.asset_id for result in results}) == 1
-    assert ImageAsset.query.count() == 1
 
 
 def test_same_source_path_with_changed_content_is_a_source_conflict(app):

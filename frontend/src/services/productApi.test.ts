@@ -534,6 +534,31 @@ describe('image asset management API', () => {
     );
   });
 
+  it('sends the admin bearer token only to purge readiness', async () => {
+    const payload = {
+      purge_available: false,
+      pipeline_available: false,
+      checked_at: '2026-08-22T12:00:00Z',
+      conditions: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true, json: async () => payload,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(productApi.getPurgeReadiness('abc')).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/purge/readiness'),
+      expect.objectContaining({
+        method: 'GET',
+        headers: { Authorization: 'Bearer abc' },
+      })
+    );
+    expect(productApi).not.toHaveProperty('createPurgeBatch');
+    expect(productApi).not.toHaveProperty('cancelPurgeBatch');
+    expect(productApi).not.toHaveProperty('retryPurgeBatch');
+  });
+
   it('surfaces the backend archive error', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
       ok: false,

@@ -4,14 +4,28 @@ import {
   Alert,
   Button,
   Checkbox,
+  Collapse,
   Empty,
   Input,
   Pagination,
   Spin,
   Tag,
 } from 'antd';
-import type { ImageAssetManagementItem } from '../types/product';
-import { getImageUrl } from '../services/productApi';
+import type {
+  ImageAssetManagementItem,
+  PurgeConditionStatus,
+  PurgeReadiness,
+} from '../types/product';
+import { getImageUrl, getPurgeReadiness } from '../services/productApi';
+
+const ADMIN_TOKEN_KEY = 'xiangyi.adminPurgeToken';
+
+const CONDITION_STATUS_LABELS: Record<PurgeConditionStatus, string> = {
+  valid: '有效',
+  failed: '失败',
+  unknown: '未知',
+  expired: '过期',
+};
 
 export interface ArchivedAssetGridProps {
   assets: ImageAssetManagementItem[];
@@ -60,11 +74,85 @@ export function ArchivedAssetGrid({
   onRetry,
 }: ArchivedAssetGridProps) {
   const [draftSearch, setDraftSearch] = useState(search);
+  const [adminOpen, setAdminOpen] = useState(false);
+  const [tokenDraft, setTokenDraft] = useState('');
+  const [readiness, setReadiness] = useState<PurgeReadiness | null>(null);
 
   useEffect(() => setDraftSearch(search), [search]);
 
+  const loadReadiness = async (token: string) => {
+    try {
+      const result = await getPurgeReadiness(token);
+      setReadiness(result);
+    } catch {
+      setReadiness(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!adminOpen) {
+      return;
+    }
+    const stored = sessionStorage.getItem(ADMIN_TOKEN_KEY);
+    if (!stored) {
+      return;
+    }
+    setTokenDraft(stored);
+    void loadReadiness(stored);
+  }, [adminOpen]);
+
+  const saveToken = () => {
+    const token = tokenDraft.trim();
+    if (!token) {
+      return;
+    }
+    sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
+    void loadReadiness(token);
+  };
+
+  const clearToken = () => {
+    sessionStorage.removeItem(ADMIN_TOKEN_KEY);
+    setTokenDraft('');
+    setReadiness(null);
+  };
+
   return (
     <section className="asset-workbench" aria-label="回收站">
+      <Collapse
+        bordered={false}
+        expandIcon={() => null}
+        activeKey={adminOpen ? ['admin'] : []}
+        onChange={(keys) => setAdminOpen(
+          (Array.isArray(keys) ? keys : [keys]).includes('admin')
+        )}
+        items={[{
+          key: 'admin',
+          label: '管理员',
+          children: adminOpen ? (
+            <div>
+              <Input.Password
+                aria-label="管理员令牌"
+                value={tokenDraft}
+                onChange={(event) => setTokenDraft(event.target.value)}
+              />
+              <Button onClick={saveToken}>保存令牌</Button>
+              <Button onClick={clearToken}>清除令牌</Button>
+              {readiness && (
+                <div>
+                  {readiness.conditions.map((condition) => (
+                    <div key={condition.id}>
+                      {`${condition.label}：${CONDITION_STATUS_LABELS[condition.status]}`}
+                    </div>
+                  ))}
+                  {readiness.purge_available
+                    ? '安全门已满足，永久清除流水线尚未开放'
+                    : '未满足安全门，永久清除不可用'}
+                </div>
+              )}
+            </div>
+          ) : null,
+        }]}
+      />
       <div className="asset-toolbar">
         <div className="asset-search-wrap">
           <Input.Search

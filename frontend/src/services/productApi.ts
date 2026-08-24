@@ -24,6 +24,7 @@ import type {
   ImageImportItem,
   ImageImportListResponse,
   ImageImportCancelBatchResponse,
+  PurgeReadiness,
 } from '../types/product';
 import { API_BASE_URL } from '../config';
 
@@ -333,6 +334,38 @@ export const getArchivedImageAssets = async (params: {
     throw new Error(error.error || '获取回收站图片失败');
   }
   return response.json();
+};
+
+export class PurgeReadinessRequestError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'PurgeReadinessRequestError';
+    this.status = status;
+  }
+}
+
+export const getPurgeReadiness = async (
+  token: string
+): Promise<PurgeReadiness> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/admin/purge/readiness`,
+    {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+    }
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new PurgeReadinessRequestError(
+      typeof payload.error === 'string'
+        ? payload.error
+        : '读取永久清除准备状态失败',
+      response.status
+    );
+  }
+  return payload as PurgeReadiness;
 };
 
 export class ImageAssetRenameError extends Error {

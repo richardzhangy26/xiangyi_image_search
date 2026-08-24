@@ -27,6 +27,7 @@ vi.mock('../services/productApi', () => ({
   importImageAssets: vi.fn(),
   buildVectorIndex: vi.fn(() => () => undefined),
   getImageUrl: (path: string) => path,
+  getPurgeReadiness: vi.fn(),
 }));
 
 interface RecycleBinApi {

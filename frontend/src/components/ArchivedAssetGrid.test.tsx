@@ -1,6 +1,40 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ArchivedAssetGrid } from './ArchivedAssetGrid';
+import * as api from '../services/productApi';
+
+vi.mock('../services/productApi', () => ({
+  getImageUrl: (path: string) => path,
+  getPurgeReadiness: vi.fn(),
+}));
+
+const notReadyPayload = {
+  purge_available: false,
+  pipeline_available: false,
+  checked_at: '2026-08-22T12:00:00Z',
+  conditions: [{
+    id: 'daily_postgres_backup',
+    label: '数据库定期备份',
+    status: 'unknown' as const,
+    checked_at: null,
+    expires_at: null,
+    summary: null,
+  }],
+};
+
+const readyPayload = {
+  purge_available: true,
+  pipeline_available: false,
+  checked_at: '2026-08-22T12:00:00Z',
+  conditions: [{
+    id: 'daily_postgres_backup',
+    label: '数据库定期备份',
+    status: 'valid' as const,
+    checked_at: '2026-08-22T04:00:00Z',
+    expires_at: '2026-08-23T05:00:00Z',
+    summary: 'ok',
+  }],
+};
 
 interface ArchivedAsset {
   asset_id: string;
@@ -86,7 +120,76 @@ const baseProps: ArchivedAssetGridProps = {
 };
 
 describe('ArchivedAssetGrid', () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionStorage.clear();
+    vi.mocked(api.getPurgeReadiness).mockReset();
+  });
+
+  it('keeps the admin panel collapsed and hides purge actions by default', () => {
+    render(<ArchivedAssetGrid {...baseProps} />);
+    expect(screen.queryByLabelText('管理员令牌')).not.toBeInTheDocument();
+    expect(screen.queryByText('数据库定期备份')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', {
+      name: /永久清除|彻底删除|清空回收站/,
+    })).not.toBeInTheDocument();
+    expect(api.getPurgeReadiness).not.toHaveBeenCalled();
+  });
+
+  it('does not show conditions when unauthorized after saving a token', async () => {
+    vi.mocked(api.getPurgeReadiness).mockRejectedValue(
+      Object.assign(new Error('需要管理员认证'), { status: 401 })
+    );
+    render(<ArchivedAssetGrid {...baseProps} />);
+    fireEvent.click(screen.getByRole('button', { name: '管理员' }));
+    fireEvent.change(screen.getByLabelText('管理员令牌'), {
+      target: { value: 'bad-token' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存令牌' }));
+    await waitFor(() => expect(api.getPurgeReadiness).toHaveBeenCalledWith('bad-token'));
+    expect(screen.queryByText('数据库定期备份')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /永久清除/ })).not.toBeInTheDocument();
+    expect(screen.queryByText('回收站加载失败')).not.toBeInTheDocument();
+  });
+
+  it('shows read-only conditions when authorized but not ready', async () => {
+    vi.mocked(api.getPurgeReadiness).mockResolvedValue(notReadyPayload);
+    render(<ArchivedAssetGrid {...baseProps} />);
+    fireEvent.click(screen.getByRole('button', { name: '管理员' }));
+    fireEvent.change(screen.getByLabelText('管理员令牌'), {
+      target: { value: 'admin-token' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存令牌' }));
+    expect(await screen.findByText('数据库定期备份：未知')).toBeInTheDocument();
+    expect(screen.getByText(/未满足安全门/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /永久清除/ })).not.toBeInTheDocument();
+  });
+
+  it('shows pipeline-closed copy when the gate is ready', async () => {
+    vi.mocked(api.getPurgeReadiness).mockResolvedValue(readyPayload);
+    render(<ArchivedAssetGrid {...baseProps} />);
+    fireEvent.click(screen.getByRole('button', { name: '管理员' }));
+    fireEvent.change(screen.getByLabelText('管理员令牌'), {
+      target: { value: 'admin-token' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存令牌' }));
+    expect(await screen.findByText('数据库定期备份：有效')).toBeInTheDocument();
+    expect(screen.getByText(
+      '安全门已满足，永久清除流水线尚未开放'
+    )).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /永久清除/ })).not.toBeInTheDocument();
+  });
+
+  it('clears the token and hides conditions', async () => {
+    sessionStorage.setItem('xiangyi.adminPurgeToken', 'old');
+    vi.mocked(api.getPurgeReadiness).mockResolvedValue(notReadyPayload);
+    render(<ArchivedAssetGrid {...baseProps} />);
+    fireEvent.click(screen.getByRole('button', { name: '管理员' }));
+    await screen.findByText('数据库定期备份：未知');
+    fireEvent.click(screen.getByRole('button', { name: '清除令牌' }));
+    expect(sessionStorage.getItem('xiangyi.adminPurgeToken')).toBeNull();
+    expect(screen.queryByText('数据库定期备份：未知')).not.toBeInTheDocument();
+  });
 
   it('shows a private preview and read-only archived asset details', () => {
     render(<ArchivedAssetGrid {...baseProps} />);

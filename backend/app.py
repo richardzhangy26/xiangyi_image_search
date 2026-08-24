@@ -7,10 +7,13 @@ from flask import Flask, send_from_directory, jsonify, abort
 from flask_cors import CORS
 from pathlib import Path
 from models import db
+from blueprints.admin_purge import admin_purge_bp
 from blueprints.image_assets import image_assets_bp
 from blueprints.image_imports import image_imports_bp
 from blueprints.products_v2 import products_v2_bp  # 新版本
 from product_search import ImageSearchService
+from services.admin_auth import AdminAuth
+from services.purge_safety_gate import FileGateEvidenceSource, PurgeSafetyGate
 # 数据库配置（本地 PostgreSQL + pgvector）
 # 优先使用 DATABASE_URL 完整连接串，否则由 DB_* 环境变量拼接
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -84,10 +87,20 @@ def create_app(config_name='development'):
         app.config['PRODUCT_SEARCH_SERVICE'] = search_service
         app.logger.info("ImageSearchService 初始化完成 (Stateless)")
     
+    evidence_dir = os.getenv("PURGE_GATE_EVIDENCE_DIR")
+    app.config["ADMIN_AUTH"] = AdminAuth(
+        os.getenv("PURGE_ADMIN_TOKEN"),
+        actor_id=os.getenv("PURGE_ADMIN_ACTOR_ID", "admin"),
+    )
+    app.config["PURGE_SAFETY_GATE"] = PurgeSafetyGate(
+        FileGateEvidenceSource(Path(evidence_dir) if evidence_dir else None)
+    )
+
     # 注册蓝图（使用新版本 products_v2）
     app.register_blueprint(products_v2_bp)
     app.register_blueprint(image_assets_bp)
     app.register_blueprint(image_imports_bp)
+    app.register_blueprint(admin_purge_bp)
     
     @app.route('/dataset-images/<path:filename>')
     def serve_dataset_image(filename):

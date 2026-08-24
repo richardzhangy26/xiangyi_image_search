@@ -355,3 +355,21 @@ export interface ProductFormData {
   intl_platform_url_1?: string;
   intl_platform_url_2?: string;
 }
+
+export type PurgeConditionStatus = 'valid' | 'failed' | 'unknown' | 'expired';
+
+export interface PurgeCondition {
+  id: string;
+  label: string;
+  status: PurgeConditionStatus;
+  checked_at: string | null;
+  expires_at: string | null;
+  summary: string | null;
+}
+
+export interface PurgeReadiness {
+  purge_available: boolean;
+  pipeline_available: boolean;
+  checked_at: string;
+  conditions: PurgeCondition[];
+}

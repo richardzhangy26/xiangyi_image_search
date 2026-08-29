@@ -4,7 +4,7 @@
 
 本手册对应 Issue #24，只处理 PostgreSQL 16 + pgvector 的每日全量备份、永久清除批次即时恢复点、双副本校验和隔离恢复验证。它不是 WAL/PITR，也不启用永久清除。
 
-CLI 只在显式调用时运行；应用启动和健康检查不会执行备份。所有命令必须在独立 ops 进程中运行，禁止把 `.env.backup` 注入 Flask/Gunicorn。
+CLI 只在显式调用时运行；应用启动和健康检查不会执行备份。所有命令必须在独立 ops 进程中运行，禁止把 `.env.backup` 注入 Flask/Gunicorn。永久清除批次的即时恢复点由 `purge-batch-worker` 以 `purge-<batch_id>` 创建并复验；保留期到期记为 `PURGE_BACKUP_RETENTION_EXPIRED`，不得自动删除 dump。
 
 ## 未满足前必须保持关闭的 production gate
 

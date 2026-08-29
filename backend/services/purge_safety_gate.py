@@ -74,7 +74,19 @@ class GateEvidenceSource(Protocol):
 
 
 def pipeline_available() -> bool:
-    return False
+    from flask import current_app
+    from services.purge_pipeline_capability import (
+        UnavailablePurgePipelineCapabilitySource,
+    )
+
+    source = current_app.config.get(
+        'PURGE_PIPELINE_CAPABILITY_SOURCE',
+        UnavailablePurgePipelineCapabilitySource(),
+    )
+    try:
+        return bool(source.evaluate(datetime.now(timezone.utc)))
+    except Exception:
+        return False
 
 
 def _contains_forbidden(value) -> bool:

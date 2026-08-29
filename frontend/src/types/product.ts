@@ -373,3 +373,46 @@ export interface PurgeReadiness {
   checked_at: string;
   conditions: PurgeCondition[];
 }
+
+export type PurgeBatchStatus =
+  | 'queued'
+  | 'database_backup'
+  | 'object_backup'
+  | 'verifying'
+  | 'pending_deletion'
+  | 'failed'
+  | 'cancelled';
+
+export const PURGE_BATCH_POLL_MS = 5_000;
+export const POLLABLE_PURGE_BATCH_STATUSES: PurgeBatchStatus[] = [
+  'queued',
+  'database_backup',
+  'object_backup',
+  'verifying',
+];
+
+export interface PurgeBatchItemDto {
+  asset_id: string;
+  status: PurgeBatchStatus;
+  result_code: string | null;
+  error_code: string | null;
+  checkpoint_at: string | null;
+}
+
+export interface PurgeBatchDto {
+  batch_id: string;
+  status: PurgeBatchStatus;
+  error_code: string | null;
+  retain_until?: string | null;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  failed_at?: string | null;
+  cancelled_at?: string | null;
+  items: PurgeBatchItemDto[];
+}
+
+export interface PurgeBatchListDto {
+  batches: PurgeBatchDto[];
+  next_cursor: string | null;
+}

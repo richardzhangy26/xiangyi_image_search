@@ -14,6 +14,10 @@ from blueprints.products_v2 import products_v2_bp  # 新版本
 from product_search import ImageSearchService
 from services.admin_auth import AdminAuth
 from services.purge_safety_gate import FileGateEvidenceSource, PurgeSafetyGate
+from services.purge_pipeline_capability import (
+    FilePurgePipelineCapabilitySource,
+    UnavailablePurgePipelineCapabilitySource,
+)
 # 数据库配置（本地 PostgreSQL + pgvector）
 # 优先使用 DATABASE_URL 完整连接串，否则由 DB_* 环境变量拼接
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -58,7 +62,7 @@ def create_app(config_name='development'):
         r"/*": {
             "origins": "*",
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+            "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Idempotency-Key"],
             "expose_headers": ["Content-Range", "X-Content-Range"],
             "max_age": 3600
         }
@@ -94,6 +98,14 @@ def create_app(config_name='development'):
     )
     app.config["PURGE_SAFETY_GATE"] = PurgeSafetyGate(
         FileGateEvidenceSource(Path(evidence_dir) if evidence_dir else None)
+    )
+    pipeline_evidence_dir = os.getenv("PURGE_PIPELINE_EVIDENCE_DIR")
+    app.config["PURGE_PIPELINE_CAPABILITY_SOURCE"] = (
+        FilePurgePipelineCapabilitySource(
+            Path(pipeline_evidence_dir) / 'purge_batch_worker.json'
+        )
+        if pipeline_evidence_dir
+        else UnavailablePurgePipelineCapabilitySource()
     )
 
     # 注册蓝图（使用新版本 products_v2）

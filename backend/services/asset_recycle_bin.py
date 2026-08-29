@@ -63,6 +63,16 @@ class RestoreRequestValidationError(ValueError):
     error_code = 'INVALID_IMAGE_ASSET_RESTORE_BATCH'
 
 
+class RestoreBlockedByPurgeBatch(Exception):
+    """Archived assets held by a non-cancelled purge batch cannot be restored."""
+
+    error_code = 'PURGE_ASSET_RESTORE_BLOCKED'
+
+    def __init__(self, batch_id):
+        super().__init__('图片属于未取消的永久清除批次，无法恢复')
+        self.batch_id = batch_id
+
+
 _RESTORE_ERRORS = {
     'IMAGE_ASSET_DUPLICATE_TARGET': '图片资产 ID 重复',
     'IMAGE_ASSET_NOT_FOUND': '图片资产不存在',
@@ -192,9 +202,10 @@ def restore_image_assets(
     asset_ids: object,
     *,
     request_id: str,
+    actor_id: str | None = None,
 ) -> RestoreBatchResult:
     """Restore a bounded image-asset batch atomically with activity records."""
-    from models import ImageAsset
+    from models import AssetActivityRecord, ImageAsset, PurgeBatch, PurgeBatchItem
 
     requested_ids = _parse_asset_ids(asset_ids)
     unique_requested_ids = list(dict.fromkeys(requested_ids))
@@ -213,6 +224,31 @@ def restore_image_assets(
     except Exception:
         session.rollback()
         raise
+
+    if locked:
+        blocking = session.execute(
+            select(PurgeBatchItem, PurgeBatch)
+            .join(PurgeBatch, PurgeBatch.id == PurgeBatchItem.batch_id)
+            .where(PurgeBatchItem.target_asset_id.in_([asset.id for asset in locked]))
+            .where(PurgeBatch.status != 'cancelled')
+            .order_by(PurgeBatchItem.target_asset_id, PurgeBatch.id)
+        ).first()
+        if blocking:
+            batch = blocking[1]
+            session.add(AssetActivityRecord(
+                event_type='asset.restore.rejected',
+                target_type='image_asset',
+                target_id=str(blocking[0].target_asset_id),
+                batch_id=str(batch.id),
+                request_id=request_id[:64],
+                source='api',
+                actor_id=actor_id,
+                result='rejected',
+                error_code='PURGE_ASSET_RESTORE_BLOCKED',
+                after_state={'batch_id': str(batch.id), 'status': batch.status},
+            ))
+            session.commit()
+            raise RestoreBlockedByPurgeBatch(batch.id)
 
     by_id = {asset.id: asset for asset in locked}
     errors = {}

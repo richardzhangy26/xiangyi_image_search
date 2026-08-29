@@ -1,11 +1,26 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ArchivedAssetGrid } from './ArchivedAssetGrid';
 import * as api from '../services/productApi';
 
 vi.mock('../services/productApi', () => ({
   getImageUrl: (path: string) => path,
   getPurgeReadiness: vi.fn(),
+  getPurgeBatches: vi.fn(),
+  getPurgeBatch: vi.fn(),
+  createPurgeBatch: vi.fn(),
+  cancelPurgeBatch: vi.fn(),
+  retryPurgeBatch: vi.fn(),
+  PurgeBatchRequestError: class PurgeBatchRequestError extends Error {
+    status: number;
+    errorCode?: string;
+    constructor(message: string, status: number, errorCode?: string) {
+      super(message);
+      this.name = 'PurgeBatchRequestError';
+      this.status = status;
+      this.errorCode = errorCode;
+    }
+  },
 }));
 
 const notReadyPayload = {
@@ -121,9 +136,18 @@ const baseProps: ArchivedAssetGridProps = {
 
 describe('ArchivedAssetGrid', () => {
   beforeEach(() => {
+    vi.useRealTimers();
     vi.clearAllMocks();
     sessionStorage.clear();
     vi.mocked(api.getPurgeReadiness).mockReset();
+    vi.mocked(api.getPurgeBatches).mockReset();
+    vi.mocked(api.getPurgeBatch).mockReset();
+    vi.mocked(api.cancelPurgeBatch).mockReset();
+    vi.mocked(api.getPurgeBatches).mockResolvedValue({ batches: [], next_cursor: null });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('keeps the admin panel collapsed and hides purge actions by default', () => {
@@ -281,5 +305,84 @@ describe('ArchivedAssetGrid', () => {
       .toHaveClass('ant-pagination-disabled');
     expect(screen.getByRole('button', { name: '恢复选中图片' }))
       .toBeDisabled();
+  });
+
+  it('does not request batch APIs without a session token', () => {
+    render(<ArchivedAssetGrid {...baseProps} />);
+    expect(api.getPurgeBatches).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: '管理员' }));
+    expect(api.getPurgeBatches).not.toHaveBeenCalled();
+  });
+
+  it('polls every 5000ms only while queued and stops at pending_deletion', async () => {
+    const queued = {
+      batch_id: 'batch-1',
+      status: 'queued' as const,
+      error_code: null,
+      retain_until: null,
+      created_at: '2026-08-29T12:00:00Z',
+      started_at: null,
+      completed_at: null,
+      failed_at: null,
+      cancelled_at: null,
+      items: [],
+    };
+    const pendingDeletion = { ...queued, status: 'pending_deletion' as const };
+    sessionStorage.setItem('xiangyi.adminPurgeToken', 'admin-token');
+    vi.mocked(api.getPurgeReadiness).mockResolvedValue({
+      ...readyPayload,
+      pipeline_available: true,
+    });
+    vi.mocked(api.getPurgeBatches).mockResolvedValue({
+      batches: [queued],
+      next_cursor: null,
+    });
+    vi.mocked(api.getPurgeBatch)
+      .mockResolvedValueOnce(queued)
+      .mockResolvedValueOnce(pendingDeletion);
+
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    render(<ArchivedAssetGrid {...baseProps} />);
+    fireEvent.click(screen.getByRole('button', { name: '管理员' }));
+    await waitFor(() => expect(api.getPurgeBatches).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByText('批次 queued')).toBeInTheDocument());
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(api.getPurgeBatch).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows the safe-gate cancellation explanation on gate 409', async () => {
+    const queued = {
+      batch_id: 'batch-1',
+      status: 'queued' as const,
+      error_code: null,
+      retain_until: null,
+      created_at: '2026-08-29T12:00:00Z',
+      started_at: null,
+      completed_at: null,
+      failed_at: null,
+      cancelled_at: null,
+      items: [],
+    };
+    sessionStorage.setItem('xiangyi.adminPurgeToken', 'admin-token');
+    vi.mocked(api.getPurgeReadiness).mockResolvedValue({
+      ...readyPayload,
+      pipeline_available: true,
+    });
+    vi.mocked(api.getPurgeBatches).mockResolvedValue({
+      batches: [queued],
+      next_cursor: null,
+    });
+    vi.mocked(api.cancelPurgeBatch).mockRejectedValue(
+      new api.PurgeBatchRequestError('安全门关闭时无法取消', 409, 'PURGE_GATE_NOT_READY'),
+    );
+
+    render(<ArchivedAssetGrid {...baseProps} />);
+    fireEvent.click(screen.getByRole('button', { name: '管理员' }));
+    await waitFor(() => expect(api.getPurgeBatches).toHaveBeenCalled());
+    await screen.findByRole('button', { name: '取消批次' });
+    fireEvent.click(screen.getByRole('button', { name: '取消批次' }));
+    expect(await screen.findByText('安全门关闭时无法取消')).toBeVisible();
   });
 });

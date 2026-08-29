@@ -18,7 +18,7 @@
 6. `plan.json` 在任何 payload 前以不可覆盖方式提交；所有 payload 通过写后 HEAD 和独立下载 SHA-256 校验后，`manifest.json` 才作为最后提交标记。
 7. final manifest 的 `authorization` 只能是 `backup_only_no_delete`。它是备份证据，不是删除授权。
 
-当前仓库没有 PostgreSQL 引用快照生产 Adapter，也没有对象备份创建 CLI，因此生产对象备份 gate 仍然关闭。
+生产引用快照由 `PostgresReferenceSnapshotReader` 提供。对象备份创建没有独立 CLI，只允许 `purge-batch-worker` 在已认证批次状态机中调用 `PurgeObjectBackupService.create_verified()`。本手册 CLI 仍只有 `verify-copies` 和 `restore-isolated`。残留副本与 orphan 不自动清理。
 
 ## 对象与凭证边界
 

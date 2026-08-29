@@ -99,6 +99,9 @@ class _Result:
     def mappings(self):
         return _Mappings(self.mapping_values)
 
+    def first(self):
+        return self.rows[0] if self.rows else None
+
 
 def _compiled_sql(statement):
     return ' '.join(str(statement.compile(
@@ -157,6 +160,8 @@ class FakeRestoreSession:
         if call_number in self.execute_errors:
             raise self.execute_errors[call_number]
         sql = _compiled_sql(statement).lower()
+        if 'purge_batch' in sql:
+            return _Result(rows=[])
         if sql.startswith('select '):
             return _Result(rows=self.locked)
         return _Result(mappings=self.updated)
@@ -277,8 +282,9 @@ def test_restores_archived_and_keeps_active_retry_idempotent():
         'version': 4,
         'status': 'active',
     }
-    lock_sql, update_sql = map(_compiled_sql, session.executed)
+    lock_sql, purge_sql, update_sql = map(_compiled_sql, session.executed)
     assert 'ORDER BY image_assets.id FOR UPDATE' in lock_sql
+    assert 'purge_batch' in purge_sql.lower()
     assert "image_assets.status = 'archived'" in update_sql
     assert 'image_assets.model_number IS NULL' in update_sql
 
@@ -356,7 +362,7 @@ def test_missing_duplicate_invalid_or_archived_assigned_rejects_all(
     assert result.status == 'rejected'
     assert result.restored_count == 0
     assert result.already_active_count == 0
-    assert len(session.executed) == 1
+    assert len(session.executed) == 2
     assert eligible.status == 'archived'
     assert eligible.version == 4
     assert session.commits == 1

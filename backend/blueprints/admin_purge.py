@@ -8,9 +8,15 @@ import uuid
 from datetime import timezone
 
 from flask import Blueprint, current_app, jsonify, request
+from werkzeug.exceptions import BadRequest
 
 from models import AssetActivityRecord, db
 from services.admin_auth import AdminAuthError
+from services.purge_batch_control import (
+    IDEMPOTENCY_KEY_RE,
+    PurgeBatchControlService,
+    PurgeBatchError,
+)
 from services.purge_safety_gate import (
     CONDITION_LABELS,
     GateNotReady,
@@ -31,10 +37,23 @@ _AUTH_STATUS = {
     "AUTH_REQUIRED": 401,
     "AUTH_FORBIDDEN": 403,
 }
+_CONTROL_STATUS = {
+    "INVALID_PURGE_IDEMPOTENCY_KEY": 400,
+    "INVALID_PURGE_ASSET_SELECTION": 400,
+    "DUPLICATE_PURGE_ASSET_ID": 400,
+    "INVALID_PURGE_CONFIRMATION": 400,
+    "INVALID_PURGE_BATCH_ID": 400,
+    "PURGE_BATCH_NOT_FOUND": 404,
+    "PURGE_ASSET_NOT_FOUND": 404,
+    "PURGE_IDEMPOTENCY_CONFLICT": 409,
+    "PURGE_ASSET_IN_ACTIVE_BATCH": 409,
+    "PURGE_ASSET_NOT_ARCHIVED": 409,
+    "PURGE_BATCH_NOT_CANCELLABLE": 409,
+    "PURGE_BATCH_NOT_RETRYABLE": 409,
+}
 
-# #26 只许替换写路由第 4 步（pipeline_available 之后）。
-# cancel/retry 同样执行 require_ready()；证据过期会挡住取消（fail-closed）。
-# 豁免须另行授权，不得在 #26 内删除步骤 3。
+# pipeline_available() 委托无密钥能力源是 #26 对第 4 步的替换。
+# Q9 只允许 create 在安全门之前做 Idempotency-Key 语法检查；cancel/retry 不得绕过 require_ready。
 
 
 def _request_id() -> str:
@@ -126,6 +145,14 @@ def _denied(exc: AdminAuthError, request_id: str):
     return jsonify({"error": exc.message, "error_code": exc.error_code}), status
 
 
+def _control():
+    return PurgeBatchControlService(db.session)
+
+
+def _idempotency_key_syntax_error(value) -> bool:
+    return not isinstance(value, str) or IDEMPOTENCY_KEY_RE.fullmatch(value) is None
+
+
 def _rejected(
     *,
     principal,
@@ -138,11 +165,13 @@ def _rejected(
     error,
     status,
     snapshot,
+    audit_error_code=None,
 ):
+    recorded = audit_error_code or error_code
     after_state = (
-        _gate_after_state(snapshot, error_code)
+        _gate_after_state(snapshot, recorded)
         if snapshot is not None
-        else {"error_code": error_code}
+        else {"error_code": recorded}
     )
     _record(
         event_type=event_type,
@@ -152,7 +181,7 @@ def _rejected(
         actor_id=principal.actor_id,
         batch_id=batch_id,
         result="rejected",
-        error_code=error_code,
+        error_code=recorded,
         after_state=after_state,
     )
     failed = _commit()
@@ -201,6 +230,12 @@ def create_purge_batch():
         )
     except AdminAuthError as exc:
         return _denied(exc, request_id)
+    key_error = (
+        "INVALID_PURGE_IDEMPOTENCY_KEY"
+        if _idempotency_key_syntax_error(request.headers.get("Idempotency-Key"))
+        else None
+    )
+    snapshot = None
     try:
         snapshot = current_app.config["PURGE_SAFETY_GATE"].require_ready()
         if not pipeline_available():
@@ -216,18 +251,55 @@ def create_purge_batch():
                 status=409,
                 snapshot=snapshot,
             )
-        return _rejected(
-            principal=principal,
+        if key_error:
+            return _rejected(
+                principal=principal,
+                request_id=request_id,
+                event_type="purge.batch.create.rejected",
+                target_type="purge_batch",
+                target_id="unspecified",
+                batch_id=None,
+                error_code="INVALID_PURGE_IDEMPOTENCY_KEY",
+                error="幂等键格式无效",
+                status=400,
+                snapshot=snapshot,
+            )
+        try:
+            payload = request.get_json(silent=False)
+        except BadRequest:
+            return _rejected(
+                principal=principal,
+                request_id=request_id,
+                event_type="purge.batch.create.rejected",
+                target_type="purge_batch",
+                target_id="unspecified",
+                batch_id=None,
+                error_code="INVALID_PURGE_ASSET_SELECTION",
+                error="请求体无效",
+                status=400,
+                snapshot=snapshot,
+            )
+        if not isinstance(payload, dict):
+            return _rejected(
+                principal=principal,
+                request_id=request_id,
+                event_type="purge.batch.create.rejected",
+                target_type="purge_batch",
+                target_id="unspecified",
+                batch_id=None,
+                error_code="INVALID_PURGE_ASSET_SELECTION",
+                error="请求体无效",
+                status=400,
+                snapshot=snapshot,
+            )
+        result = _control().create_or_replay(
+            actor_id=principal.actor_id,
+            idempotency_key=request.headers.get("Idempotency-Key"),
+            asset_ids=payload.get("asset_ids"),
+            confirmation=payload.get("confirmation"),
             request_id=request_id,
-            event_type="purge.batch.create.rejected",
-            target_type="purge_batch",
-            target_id="unspecified",
-            batch_id=None,
-            error_code="PURGE_PIPELINE_UNAVAILABLE",
-            error="永久清除流水线尚未开放",
-            status=409,
-            snapshot=snapshot,
         )
+        return jsonify(result.batch.to_public_dict()), (200 if result.replayed else 201)
     except GateNotReady as exc:
         return _rejected(
             principal=principal,
@@ -240,6 +312,20 @@ def create_purge_batch():
             error="永久清除安全门未满足",
             status=409,
             snapshot=exc.snapshot,
+            audit_error_code=key_error or "PURGE_GATE_NOT_READY",
+        )
+    except PurgeBatchError as exc:
+        return _rejected(
+            principal=principal,
+            request_id=request_id,
+            event_type="purge.batch.create.rejected",
+            target_type="purge_batch",
+            target_id="unspecified",
+            batch_id=None,
+            error_code=exc.error_code,
+            error=str(exc),
+            status=_CONTROL_STATUS.get(exc.error_code, 400),
+            snapshot=snapshot,
         )
     except Exception:
         return _control_failed()
@@ -282,18 +368,10 @@ def cancel_purge_batch(batch_id):
                 status=409,
                 snapshot=snapshot,
             )
-        return _rejected(
-            principal=principal,
-            request_id=request_id,
-            event_type="purge.batch.cancel.rejected",
-            target_type="purge_batch",
-            target_id=batch_id,
-            batch_id=batch_id,
-            error_code="PURGE_PIPELINE_UNAVAILABLE",
-            error="永久清除流水线尚未开放",
-            status=409,
-            snapshot=snapshot,
+        batch = _control().cancel(
+            batch_id, actor_id=principal.actor_id, request_id=request_id,
         )
+        return jsonify(batch.to_public_dict()), 200
     except GateNotReady as exc:
         return _rejected(
             principal=principal,
@@ -306,6 +384,19 @@ def cancel_purge_batch(batch_id):
             error="永久清除安全门未满足",
             status=409,
             snapshot=exc.snapshot,
+        )
+    except PurgeBatchError as exc:
+        return _rejected(
+            principal=principal,
+            request_id=request_id,
+            event_type="purge.batch.cancel.rejected",
+            target_type="purge_batch",
+            target_id=batch_id,
+            batch_id=batch_id,
+            error_code=exc.error_code,
+            error=str(exc),
+            status=_CONTROL_STATUS.get(exc.error_code, 400),
+            snapshot=None,
         )
     except Exception:
         return _control_failed()
@@ -348,18 +439,10 @@ def retry_purge_batch(batch_id):
                 status=409,
                 snapshot=snapshot,
             )
-        return _rejected(
-            principal=principal,
-            request_id=request_id,
-            event_type="purge.batch.retry.rejected",
-            target_type="purge_batch",
-            target_id=batch_id,
-            batch_id=batch_id,
-            error_code="PURGE_PIPELINE_UNAVAILABLE",
-            error="永久清除流水线尚未开放",
-            status=409,
-            snapshot=snapshot,
+        batch = _control().retry(
+            batch_id, actor_id=principal.actor_id, request_id=request_id,
         )
+        return jsonify(batch.to_public_dict()), 200
     except GateNotReady as exc:
         return _rejected(
             principal=principal,
@@ -373,5 +456,61 @@ def retry_purge_batch(batch_id):
             status=409,
             snapshot=exc.snapshot,
         )
+    except PurgeBatchError as exc:
+        return _rejected(
+            principal=principal,
+            request_id=request_id,
+            event_type="purge.batch.retry.rejected",
+            target_type="purge_batch",
+            target_id=batch_id,
+            batch_id=batch_id,
+            error_code=exc.error_code,
+            error=str(exc),
+            status=_CONTROL_STATUS.get(exc.error_code, 400),
+            snapshot=None,
+        )
+    except Exception:
+        return _control_failed()
+
+
+@admin_purge_bp.get('/batches')
+def list_purge_batches():
+    request_id = _request_id()
+    try:
+        principal = current_app.config["ADMIN_AUTH"].authenticate(
+            request.headers.get("Authorization")
+        )
+    except AdminAuthError as exc:
+        return _denied(exc, request_id)
+    try:
+        limit = request.args.get("limit", default=20, type=int) or 20
+        cursor = request.args.get("cursor")
+        batches = _control().list_batches(
+            actor_id=principal.actor_id, limit=limit, cursor=cursor,
+        )
+        payload = [item.to_public_dict() for item in batches]
+        bounded = min(max(int(limit), 1), 100)
+        next_cursor = payload[-1]["batch_id"] if len(payload) == bounded else None
+        return jsonify({"batches": payload, "next_cursor": next_cursor}), 200
+    except PurgeBatchError as exc:
+        return jsonify({"error": str(exc), "error_code": exc.error_code}), _CONTROL_STATUS.get(exc.error_code, 400)
+    except Exception:
+        return _control_failed()
+
+
+@admin_purge_bp.get('/batches/<batch_id>')
+def get_purge_batch(batch_id):
+    request_id = _request_id()
+    try:
+        principal = current_app.config["ADMIN_AUTH"].authenticate(
+            request.headers.get("Authorization")
+        )
+    except AdminAuthError as exc:
+        return _denied(exc, request_id)
+    try:
+        batch = _control().get_batch(batch_id, actor_id=principal.actor_id)
+        return jsonify(batch.to_public_dict()), 200
+    except PurgeBatchError as exc:
+        return jsonify({"error": str(exc), "error_code": exc.error_code}), _CONTROL_STATUS.get(exc.error_code, 400)
     except Exception:
         return _control_failed()

@@ -25,6 +25,8 @@ import type {
   ImageImportListResponse,
   ImageImportCancelBatchResponse,
   PurgeReadiness,
+  PurgeBatchDto,
+  PurgeBatchListDto,
 } from '../types/product';
 import { API_BASE_URL } from '../config';
 
@@ -366,6 +368,114 @@ export const getPurgeReadiness = async (
     );
   }
   return payload as PurgeReadiness;
+};
+
+export class PurgeBatchRequestError extends Error {
+  status: number;
+  errorCode?: string;
+
+  constructor(message: string, status: number, errorCode?: string) {
+    super(message);
+    this.name = 'PurgeBatchRequestError';
+    this.status = status;
+    this.errorCode = errorCode;
+  }
+}
+
+const requireAdminToken = (token: string): string => {
+  if (!token) {
+    throw new PurgeBatchRequestError('需要管理员认证', 401, 'AUTH_REQUIRED');
+  }
+  return token;
+};
+
+const readPurgePayload = async (response: Response) => {
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new PurgeBatchRequestError(
+      typeof payload.error === 'string' ? payload.error : '永久清除请求失败',
+      response.status,
+      typeof payload.error_code === 'string' ? payload.error_code : undefined,
+    );
+  }
+  return payload;
+};
+
+export const getPurgeBatches = async (
+  token: string,
+  cursor?: string,
+): Promise<PurgeBatchListDto> => {
+  const headers = { Authorization: `Bearer ${requireAdminToken(token)}` };
+  const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+  const response = await fetch(
+    `${API_BASE_URL}/api/admin/purge/batches${query}`,
+    { method: 'GET', headers },
+  );
+  return readPurgePayload(response) as Promise<PurgeBatchListDto>;
+};
+
+export const getPurgeBatch = async (
+  batchId: string,
+  token: string,
+): Promise<PurgeBatchDto> => {
+  const headers = { Authorization: `Bearer ${requireAdminToken(token)}` };
+  const response = await fetch(
+    `${API_BASE_URL}/api/admin/purge/batches/${encodeURIComponent(batchId)}`,
+    { method: 'GET', headers },
+  );
+  return readPurgePayload(response) as Promise<PurgeBatchDto>;
+};
+
+export const createPurgeBatch = async (
+  assetIds: string[],
+  confirmation: string,
+  idempotencyKey: string,
+  token: string,
+): Promise<PurgeBatchDto> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/admin/purge/batches`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${requireAdminToken(token)}`,
+        'Content-Type': 'application/json',
+        'Idempotency-Key': idempotencyKey,
+      },
+      body: JSON.stringify({
+        asset_ids: assetIds,
+        confirmation,
+      }),
+    },
+  );
+  return readPurgePayload(response) as Promise<PurgeBatchDto>;
+};
+
+export const cancelPurgeBatch = async (
+  batchId: string,
+  token: string,
+): Promise<PurgeBatchDto> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/admin/purge/batches/${encodeURIComponent(batchId)}/cancel`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${requireAdminToken(token)}` },
+    },
+  );
+  return readPurgePayload(response) as Promise<PurgeBatchDto>;
+};
+
+export const retryPurgeBatch = async (
+  batchId: string,
+  token: string,
+): Promise<PurgeBatchDto> => {
+  const response = await fetch(
+    `${API_BASE_URL}/api/admin/purge/batches/${encodeURIComponent(batchId)}/retry`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${requireAdminToken(token)}` },
+    },
+  );
+  return readPurgePayload(response) as Promise<PurgeBatchDto>;
 };
 
 export class ImageAssetRenameError extends Error {

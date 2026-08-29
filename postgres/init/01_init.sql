@@ -183,7 +183,49 @@ CREATE TABLE IF NOT EXISTS asset_activity_records (
     created_at   TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
--- 5) 索引
+-- 5) 永久清除批次（Issue #26；仅到 pending_deletion，不包含删除能力）
+CREATE TABLE IF NOT EXISTS purge_batches (
+    id                         UUID PRIMARY KEY,
+    actor_id                   VARCHAR(128) NOT NULL,
+    idempotency_key            VARCHAR(128) NOT NULL,
+    request_fingerprint_sha256 VARCHAR(64) NOT NULL,
+    confirmation_text          VARCHAR(64) NOT NULL,
+    status                     VARCHAR(24) NOT NULL DEFAULT 'queued',
+    claim_token                UUID,
+    claim_generation           BIGINT NOT NULL DEFAULT 0,
+    claimed_by                 VARCHAR(128),
+    lease_expires_at           TIMESTAMP,
+    database_backup_id         VARCHAR(160),
+    database_manifest_sha256   VARCHAR(64),
+    object_manifest_sha256     VARCHAR(64),
+    retain_until               TIMESTAMP,
+    error_code                 VARCHAR(80),
+    created_at                 TIMESTAMP NOT NULL DEFAULT NOW(),
+    started_at                 TIMESTAMP,
+    completed_at               TIMESTAMP,
+    failed_at                  TIMESTAMP,
+    cancelled_at               TIMESTAMP,
+    CONSTRAINT uq_purge_batches_actor_key UNIQUE (actor_id, idempotency_key),
+    CONSTRAINT ck_purge_batches_status CHECK (
+        status IN ('queued', 'database_backup', 'object_backup', 'verifying',
+                   'pending_deletion', 'failed', 'cancelled')
+    ),
+    CONSTRAINT ck_purge_batches_claim_generation CHECK (claim_generation >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS purge_batch_items (
+    batch_id        UUID NOT NULL REFERENCES purge_batches(id) ON DELETE CASCADE,
+    target_asset_id UUID NOT NULL,
+    ordinal         SMALLINT NOT NULL,
+    status          VARCHAR(24) NOT NULL DEFAULT 'queued',
+    result_code     VARCHAR(80),
+    error_code      VARCHAR(80),
+    checkpoint_at   TIMESTAMP,
+    PRIMARY KEY (batch_id, target_asset_id),
+    CONSTRAINT ck_purge_batch_items_ordinal CHECK (ordinal >= 0)
+);
+
+-- 6) 索引
 CREATE INDEX IF NOT EXISTS idx_image_assets_content_hash
     ON image_assets (content_hash);
 
@@ -211,13 +253,24 @@ CREATE INDEX IF NOT EXISTS idx_image_import_items_retry_schedule
 CREATE INDEX IF NOT EXISTS idx_image_import_items_purge_schedule
     ON image_import_items (status, purge_eligible_at);
 
+CREATE INDEX IF NOT EXISTS idx_purge_batches_claim_order
+    ON purge_batches (status, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_purge_batches_lease
+    ON purge_batches (status, lease_expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_purge_batch_items_target
+    ON purge_batch_items (target_asset_id, batch_id);
+
 CREATE INDEX IF NOT EXISTS idx_image_assets_vector_active_hnsw
     ON image_assets
     USING hnsw (vector vector_cosine_ops)
     WITH (m = 16, ef_construction = 64)
     WHERE status = 'active';
 
--- 6) 帮助优化器选用索引
+-- 7) 帮助优化器选用索引
 ANALYZE products;
 ANALYZE image_assets;
 ANALYZE image_import_items;
+ANALYZE purge_batches;
+ANALYZE purge_batch_items;

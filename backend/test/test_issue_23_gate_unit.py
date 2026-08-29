@@ -46,8 +46,11 @@ def _file_payload(condition, **overrides):
     return payload
 
 
-def test_pipeline_available_is_false():
-    assert pipeline_available() is False
+def test_pipeline_available_is_false_without_flask_capability_source():
+    from flask import Flask
+
+    with Flask(__name__).app_context():
+        assert pipeline_available() is False
 
 
 def test_missing_dir_is_all_unknown():

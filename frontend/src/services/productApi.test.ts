@@ -554,9 +554,43 @@ describe('image asset management API', () => {
         headers: { Authorization: 'Bearer abc' },
       })
     );
-    expect(productApi).not.toHaveProperty('createPurgeBatch');
-    expect(productApi).not.toHaveProperty('cancelPurgeBatch');
-    expect(productApi).not.toHaveProperty('retryPurgeBatch');
+    expect(productApi).toHaveProperty('createPurgeBatch');
+    expect(productApi).toHaveProperty('cancelPurgeBatch');
+    expect(productApi).toHaveProperty('retryPurgeBatch');
+  });
+
+  it('sends idempotency and bearer headers when creating a purge batch', async () => {
+    const batch = {
+      batch_id: 'batch-1',
+      status: 'queued',
+      error_code: null,
+      items: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true, json: async () => batch,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(productApi.createPurgeBatch(
+      ['asset-1'],
+      '永久删除 1 张',
+      'key.create01',
+      'admin-token',
+    )).resolves.toEqual(batch);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/purge/batches'),
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          Authorization: 'Bearer admin-token',
+          'Idempotency-Key': 'key.create01',
+        }),
+        body: JSON.stringify({
+          asset_ids: ['asset-1'],
+          confirmation: '永久删除 1 张',
+        }),
+      }),
+    );
   });
 
   it('surfaces the backend archive error', async () => {

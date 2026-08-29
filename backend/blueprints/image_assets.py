@@ -27,6 +27,7 @@ from services.asset_ingest import (
     ImageAssetIngestService,
 )
 from services.asset_recycle_bin import (
+    RestoreBlockedByPurgeBatch,
     RestoreRequestValidationError,
     list_archived_image_assets,
     restore_image_assets,
@@ -260,6 +261,12 @@ def restore_archived_image_assets():
             'error': str(exc),
             'error_code': 'INVALID_IMAGE_ASSET_RESTORE_BATCH',
         }), 400
+    except RestoreBlockedByPurgeBatch as exc:
+        return jsonify({
+            'error': str(exc),
+            'error_code': exc.error_code,
+            'batch_id': str(exc.batch_id),
+        }), 409
     except Exception as exc:
         db.session.rollback()
         logger.error(

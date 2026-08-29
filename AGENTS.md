@@ -29,7 +29,7 @@ This file provides guidance to AI coding agents (Claude Code, Qoder, etc.) when 
 5. VectorSearchService 只检索 image_assets.status = active 的向量。
 6. API 只返回资产 ID 和 /api/image-assets/<asset_id>/preview；该入口生成短时签名 URL 并返回私有 302，不保存或拼接公开 URL。签名过期时刻按 OSS_SIGNED_URL_TTL_SECONDS 长度的时间窗口对齐，同一资产在窗口内 URL 稳定，302 与 OSS 响应均携带私有 Cache-Control，浏览器在窗口内刷新不重复消耗 OSS 出口流量。
 7. 未归款资产可原地移入回收站并批量恢复；恢复只改变生命周期字段和版本，复用原资产 ID、向量及 OSS 绑定，不重新上传或生成 embedding。
-8. 永久清除 HTTP 控制面已存在但默认关闭：未配置 `PURGE_ADMIN_TOKEN` 或证据目录为空时不可用；`pipeline_available()` 恒为 False。能写 `PURGE_GATE_EVIDENCE_DIR` 即能让安全门报就绪，属主机信任边界。真实启用仍待现场证据与后续票授权。
+8. 永久清除 HTTP 控制面默认关闭：未配置 `PURGE_ADMIN_TOKEN` 或证据目录为空时不可用。`pipeline_available()` 只读取 worker 写入的无密钥能力证明（TTL 120 秒），有效能力不能让过期安全门变成就绪。能写 `PURGE_GATE_EVIDENCE_DIR` 即能让安全门报就绪，属主机信任边界。批次流水线在独立 `purge-batch-worker` 中止于 `pending_deletion`，不删除正式对象、资产行或向量。
 
 product_images 是**未修改的退休兼容表**，不属于新库 schema、应用 ORM 或活动写路径。任何另行授权的兼容迁移前，先运行 python -m scripts.audit_legacy_product_images，根据只读审计结果制作人工迁移清单；本仓库不自动迁移、删除或覆盖它，也不物理清理旧对象。
 
@@ -44,8 +44,12 @@ product_images 是**未修改的退休兼容表**，不属于新库 schema、应
 - backend/services/image_import_worker.py - 多实例任务领取、结果校验、原子资产提升和失败落库。
 - backend/services/asset_recycle_bin.py - 归档资产只读列表、计数与最多 100 张的原子批量恢复服务。
 - backend/services/admin_auth.py - 永久清除控制面共享令牌认证；未配置则失败关闭。
-- backend/services/purge_safety_gate.py - 五项安全门合取判定与证据探针；`pipeline_available()` 默认 False。
-- backend/blueprints/admin_purge.py - `/api/admin/purge` 准备状态与拒绝写路径。
+- backend/services/purge_safety_gate.py - 五项安全门合取判定与证据探针；`pipeline_available()` 委托无密钥能力源。
+- backend/blueprints/admin_purge.py - `/api/admin/purge` 准备状态、批次创建/取消/重试/列表与详情。
+- backend/services/purge_batch_control.py - Flask 安全的批次创建/重放/取消/重试/领取；不导入 ops 适配器。
+- backend/services/postgres_reference_snapshot.py - 生产 `PostgresReferenceSnapshotReader`，在只读可重复读事务中枚举 image_assets 与未清除 image_import_items 引用。
+- backend/services/purge_batch_worker.py - 独立 worker 编排恢复点、对象备份与复验；不含删除。
+- backend/scripts/run_purge_batch_worker.py - 唯一加载 `.env.backup` 并组合 ops 适配器的进程入口。
 - backend/services/vector_search.py - pgvector 检索服务。
 - backend/services/kodo_source.py - Kodo S3 只读对象来源。
 - backend/services/purge_object_backup.py - 永久清除前的完整引用规划、不可覆盖对象备份与 final manifest。
@@ -100,19 +104,20 @@ SET LOCAL 保证连接归还连接池时不污染后续请求；服务在成功�
 
 - React 18 + TypeScript + Vite；Ant Design 5 和 Tailwind CSS。
 - ProductSearch（以图搜款）和 ProductUpload（产品管理）是当前路由组件。
-- ProductUpload 默认展示待归款图片，支持按来源路径搜索、分页、多选并关联既有型号；资产工作台提供独立的“添加产品”按钮（仅型号快速创建，选中图片时一并关联），并提供独立回收站标签、图片导入入口、未解决任务徽标和持久任务抽屉（抽屉内支持手工重试与取消）；刷新后任务状态从服务端恢复。创建产品仅型号必填（其余字段空占位、可后续补全），页面不自动推断型号，也不提供解绑、跨型号改绑或永久清除。回收站有可折叠管理员面板，只读展示永久清除准备状态，任何状态下都没有执行按钮。
+- ProductUpload 默认展示待归款图片，支持按来源路径搜索、分页、多选并关联既有型号；资产工作台提供独立的“添加产品”按钮（仅型号快速创建，选中图片时一并关联），并提供独立回收站标签、图片导入入口、未解决任务徽标和持久任务抽屉（抽屉内支持手工重试与取消）；刷新后任务状态从服务端恢复。创建产品仅型号必填（其余字段空占位、可后续补全），页面不自动推断型号，也不提供解绑或跨型号改绑。回收站管理员面板在令牌有效且流水线能力证明未过期时，可用准确确认文字创建最多 20 张的永久清除备份批次、查看进度、取消或重试；页面不提供正式删除。未取消批次中的归档图片不能从回收站恢复。
 - 前端通过 /api/ 访问后端；Nginx 只代理 API，不提供本地图片静态源。
 - 图片卡片使用私有预览入口，浏览器跟随 302 获取短时签名地址；签名 URL 按时间窗口对齐且响应带私有缓存头，窗口内刷新直接命中浏览器缓存。
 
 ## Docker 部署
 
-docker-compose.yml 包含 db、backend、worker、frontend 四个服务，网络为 app-network：
+docker-compose.yml 包含 db、backend、worker、purge-batch-worker、frontend 五个日常服务，网络为 app-network：
 
 | 服务 | 容器 | 端口 | 说明 |
 | --- | --- | --- | --- |
 | db | fashion-crm-db | 127.0.0.1:5433 → 5432 | pgvector PostgreSQL 16 |
 | backend | fashion-crm-backend | 0.0.0.0:5000 → 5000 | Gunicorn；健康检查 /api/health |
 | worker | fashion-crm-image-import-worker | 无 | PostgreSQL 持久队列的独立 embedding worker |
+| purge-batch-worker | fashion-crm-purge-batch-worker | 无 | 唯一加载 `.env.backup` 的永久清除备份 worker |
 | frontend | fashion-crm-frontend | 0.0.0.0:80 → 80 | Nginx 静态构建和 API 代理 |
 
 - 数据库卷 postgres_data 保存 PostgreSQL 数据。
@@ -136,7 +141,7 @@ docker exec fashion-crm-db pg_dump -U postgres image_search > backup_$(date +%Y%
 
 数据库备份覆盖商品、image_assets 元数据和向量。OSS 原图、预览及 Kodo 只读备份由对象存储侧的私有备份/版本策略负责；不要在应用脚本中删除、覆盖或公开它们。恢复时先恢复 PostgreSQL，再核对 OSS 对象和 image_assets 的来源绑定。
 
-永久清除对象备份使用同一 `purge_batch_id` 绑定 PostgreSQL 恢复点，先写不可变 `plan.json`，逐项 HEAD/下载校验后写 payload，最后才写 `manifest.json`。当前没有 PostgreSQL 引用快照生产 Adapter，也没有对象备份创建 CLI；真实永久清除 gate 保持关闭。既有清单只能显式复验或恢复到独立隔离 Bucket：
+永久清除对象备份使用同一 `purge_batch_id` 绑定 PostgreSQL 恢复点，先写不可变 `plan.json`，逐项 HEAD/下载校验后写 payload，最后才写 `manifest.json`。生产引用快照由 `PostgresReferenceSnapshotReader` 提供；对象备份创建只发生在 `purge-batch-worker` 批次状态机内，没有独立创建 CLI。保留期到期代码为 `PURGE_BACKUP_RETENTION_EXPIRED`，该批次不能重试，只能取消后开新批次。#27 删除前仍须重新校验保留期与引用。既有清单只能显式复验或恢复到独立隔离 Bucket：
 
 ~~~
 python scripts/manage_purge_object_backups.py verify-copies --manifest <object-manifest>
@@ -167,9 +172,9 @@ backend/.env（由 .env.example 复制）中的必填项：
 - OSS_ACCESS_KEY_ID、OSS_ACCESS_KEY_SECRET、OSS_ENDPOINT、OSS_BUCKET_NAME - 私有 OSS 原图/预览和签名下载。
 - QINIU_ACCESS_KEY、QINIU_SECRET_KEY、QINIU_BUCKET_NAME、QINIU_REGION - **Kodo 只读迁移来源**，仅供 migrate_kodo_to_oss 的 preflight/迁移读取，绝不生成公开 URL。
 
-可选项：DATABASE_URL、QINIU_S3_BUCKET_NAME、OSS_IMAGE_BASE_PREFIX、OSS_SIGNED_URL_TTL_SECONDS、IMAGE_PREVIEW_MAX_EDGE、IMAGE_PREVIEW_MAX_MB、IMAGE_MAX_PIXELS、IMAGE_NORMALIZATION_VERSION、SEARCH_OVERSAMPLE、LOG_LEVEL、PURGE_ADMIN_TOKEN、PURGE_ADMIN_ACTOR_ID、PURGE_GATE_EVIDENCE_DIR。未设置管理员令牌或证据目录时永久清除控制面保持关闭。Docker Compose 会把容器内的数据库地址覆盖为 db:5432。
+可选项：DATABASE_URL、QINIU_S3_BUCKET_NAME、OSS_IMAGE_BASE_PREFIX、OSS_SIGNED_URL_TTL_SECONDS、IMAGE_PREVIEW_MAX_EDGE、IMAGE_PREVIEW_MAX_MB、IMAGE_MAX_PIXELS、IMAGE_NORMALIZATION_VERSION、SEARCH_OVERSAMPLE、LOG_LEVEL、PURGE_ADMIN_TOKEN、PURGE_ADMIN_ACTOR_ID、PURGE_GATE_EVIDENCE_DIR、PURGE_PIPELINE_EVIDENCE_DIR、PURGE_REFERENCE_SNAPSHOT_MAX_AGE_SECONDS。未设置管理员令牌或证据目录时永久清除控制面保持关闭。能力证明 TTL 120 秒、heartbeat 30 秒、引用快照最大时效 60 秒。Docker Compose 会把容器内的数据库地址覆盖为 db:5432。
 
-独立 ops 环境 `backend/.env.backup` 还使用 `BACKUP_OSS_*`、`PURGE_SOURCE_OSS_*` 与 `PURGE_RESTORE_OSS_*`。它们不得注入 Flask/Gunicorn 或 Docker 日常应用服务：正式源角色仅 Head/Get，备份角色仅 Put-if-absent/Head/Get，隔离角色仅隔离前缀 Put-if-absent/Head/Get，三类 ops 凭证均不能与应用 `OSS_*` 复用。`PURGE_RESTORE_ISOLATED` 默认必须为 `0`。
+独立 ops 环境 `backend/.env.backup` 还使用 `BACKUP_OSS_*`、`PURGE_SOURCE_OSS_*` 与 `PURGE_RESTORE_OSS_*`。它们只允许注入 `purge-batch-worker`（及独立备份 CLI），不得注入 Flask/Gunicorn、图片导入 worker、cleanup 或 frontend：正式源角色仅 Head/Get，备份角色仅 Put-if-absent/Head/Get，隔离角色仅隔离前缀 Put-if-absent/Head/Get，三类 ops 凭证均不能与应用 `OSS_*` 复用。`PURGE_RESTORE_ISOLATED` 默认必须为 `0`。
 
 ## 数据库结构
 
@@ -200,6 +205,10 @@ backend/.env（由 .env.example 复制）中的必填项：
 ### image_import_items
 
 持久保存已通过图片校验并写入私有 OSS 的导入项，状态为 queued、embedding、completed、failed、awaiting_retry、cancelled、abandoned。表中保存四列来源身份、对象绑定、规范化元数据、预期模型/维度、正式 asset_id、重试预算与 next_retry_at、取消/放弃时间以及 claim token/generation/owner/lease；worker 崩溃后只通过过期租约恢复领取。瞬时失败按错误分类指数退避自动重试（默认最多 5 次），失败、取消与放弃项都不会产生正式资产或占位向量。
+
+### purge_batches / purge_batch_items
+
+持久保存永久清除备份批次。状态为 queued、database_backup、object_backup、verifying、pending_deletion、failed、cancelled。`purge_batch_items.target_asset_id` 是墓碑 UUID，不是 image_assets 外键。公开 DTO 只含状态、时间戳、安全错误码和逐项摘要。
 
 ## 产品与迁移操作
 
@@ -248,7 +257,7 @@ python -m pytest test/ \
 
 - 不执行 DROP、DELETE、覆盖上传或云对象清理来“迁移”旧数据；所有收缩动作必须另行授权并可回滚。
 - 图片正式来源始终是私有 OSS，Kodo 只读备份；预览始终经过 /api/image-assets/<asset_id>/preview 的短时签名 302，不在代码中拼接公开对象地址。
-- 回收站只保存 image_assets 的归档状态；恢复不得复制对象、重算向量或更改来源身份，自动过期与永久清除不属于当前应用能力。
+- 回收站只保存 image_assets 的归档状态；恢复不得复制对象、重算向量或更改来源身份。未取消的永久清除批次会阻断恢复（`PURGE_ASSET_RESTORE_BLOCKED`）。自动过期与正式对象删除不属于当前应用能力；备份流水线止于 `pending_deletion`。
 - 图片导入以 source_provider、source_bucket、source_relative_path、source_revision 组成的来源身份去重：相同来源身份和同一内容返回既有结果；同一来源身份但内容不同返回来源冲突且绝不覆盖；命中归档来源身份时返回回收站结果且不自动恢复；不同来源路径即使内容相同也分别创建资产，只允许复用兼容预览和向量。
 - 持久异步图片导入任务只由独立 worker 处理；HTTP 请求内不启动线程或可靠内存队列。瞬时失败按错误分类指数退避自动重试并受尝试预算约束，手工重试、取消与放弃项恢复只改持久状态；当前没有暂存对象清理或永久删除能力。现存 POST /api/image-assets/import 是每请求最多 20 张、无持久任务/自动重试/取消语义的同步兼容入口；该受限例外不得扩展为新的请求内 embedding 入口。
 - 不在应用启动、普通部署或健康检查中隐式运行兼容审计或迁移。

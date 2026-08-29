@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ReloadOutlined, UndoOutlined } from '@ant-design/icons';
 import {
   Alert,
@@ -13,10 +13,24 @@ import {
 } from 'antd';
 import type {
   ImageAssetManagementItem,
+  PurgeBatchDto,
   PurgeConditionStatus,
   PurgeReadiness,
 } from '../types/product';
-import { getImageUrl, getPurgeReadiness } from '../services/productApi';
+import {
+  POLLABLE_PURGE_BATCH_STATUSES,
+  PURGE_BATCH_POLL_MS,
+} from '../types/product';
+import {
+  cancelPurgeBatch,
+  createPurgeBatch,
+  getImageUrl,
+  getPurgeBatch,
+  getPurgeBatches,
+  getPurgeReadiness,
+  PurgeBatchRequestError,
+  retryPurgeBatch,
+} from '../services/productApi';
 
 const ADMIN_TOKEN_KEY = 'xiangyi.adminPurgeToken';
 
@@ -77,8 +91,14 @@ export function ArchivedAssetGrid({
   const [adminOpen, setAdminOpen] = useState(false);
   const [tokenDraft, setTokenDraft] = useState('');
   const [readiness, setReadiness] = useState<PurgeReadiness | null>(null);
+  const [batches, setBatches] = useState<PurgeBatchDto[]>([]);
+  const [batchError, setBatchError] = useState<string | null>(null);
+  const [confirmation, setConfirmation] = useState('');
+  const idempotencyKeyRef = useRef<string | null>(null);
 
   useEffect(() => setDraftSearch(search), [search]);
+
+  const sessionToken = (): string | null => sessionStorage.getItem(ADMIN_TOKEN_KEY);
 
   const loadReadiness = async (token: string) => {
     try {
@@ -89,17 +109,49 @@ export function ArchivedAssetGrid({
     }
   };
 
+  const loadBatches = async (token: string) => {
+    try {
+      const result = await getPurgeBatches(token);
+      setBatches(result.batches);
+    } catch {
+      setBatches([]);
+    }
+  };
+
   useEffect(() => {
     if (!adminOpen) {
       return;
     }
-    const stored = sessionStorage.getItem(ADMIN_TOKEN_KEY);
+    const stored = sessionToken();
     if (!stored) {
       return;
     }
     setTokenDraft(stored);
     void loadReadiness(stored);
+    void loadBatches(stored);
   }, [adminOpen]);
+
+  const pollable = batches.find((batch) => (
+    POLLABLE_PURGE_BATCH_STATUSES as string[]
+  ).includes(batch.status));
+
+  useEffect(() => {
+    if (!adminOpen || !pollable) {
+      return;
+    }
+    const stored = sessionToken();
+    if (!stored) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void getPurgeBatch(pollable.batch_id, stored).then((latest) => {
+        setBatches((current) => current.map((item) => (
+          item.batch_id === latest.batch_id ? latest : item
+        )));
+      }).catch(() => undefined);
+    }, PURGE_BATCH_POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [adminOpen, pollable?.batch_id, pollable?.status]);
 
   const saveToken = () => {
     const token = tokenDraft.trim();
@@ -108,12 +160,82 @@ export function ArchivedAssetGrid({
     }
     sessionStorage.setItem(ADMIN_TOKEN_KEY, token);
     void loadReadiness(token);
+    void loadBatches(token);
   };
 
   const clearToken = () => {
     sessionStorage.removeItem(ADMIN_TOKEN_KEY);
     setTokenDraft('');
     setReadiness(null);
+    setBatches([]);
+    setBatchError(null);
+    idempotencyKeyRef.current = null;
+  };
+
+  const expectedConfirmation = `永久删除 ${selectedAssetIds.length} 张`;
+
+  const submitCreate = async () => {
+    const token = sessionToken();
+    if (!token) {
+      return;
+    }
+    if (confirmation !== expectedConfirmation) {
+      setBatchError(`请输入「${expectedConfirmation}」`);
+      return;
+    }
+    if (!idempotencyKeyRef.current) {
+      idempotencyKeyRef.current = crypto.randomUUID();
+    }
+    try {
+      const created = await createPurgeBatch(
+        selectedAssetIds,
+        confirmation,
+        idempotencyKeyRef.current,
+        token,
+      );
+      setBatches((current) => [created, ...current.filter((item) => item.batch_id !== created.batch_id)]);
+      setBatchError(null);
+      idempotencyKeyRef.current = null;
+    } catch (error) {
+      setBatchError(error instanceof Error ? error.message : '创建清除批次失败');
+    }
+  };
+
+  const submitCancel = async (batchId: string) => {
+    const token = sessionToken();
+    if (!token) {
+      return;
+    }
+    try {
+      const cancelled = await cancelPurgeBatch(batchId, token);
+      setBatches((current) => current.map((item) => (
+        item.batch_id === cancelled.batch_id ? cancelled : item
+      )));
+      setBatchError(null);
+      idempotencyKeyRef.current = null;
+    } catch (error) {
+      if (error instanceof PurgeBatchRequestError && error.errorCode === 'PURGE_GATE_NOT_READY') {
+        setBatchError(error.message || '安全门关闭时无法取消');
+        return;
+      }
+      setBatchError(error instanceof Error ? error.message : '取消批次失败');
+    }
+  };
+
+  const submitRetry = async (batchId: string) => {
+    const token = sessionToken();
+    if (!token) {
+      return;
+    }
+    try {
+      const retried = await retryPurgeBatch(batchId, token);
+      setBatches((current) => current.map((item) => (
+        item.batch_id === retried.batch_id ? retried : item
+      )));
+      setBatchError(null);
+    } catch (error) {
+      setBatchError(error instanceof Error ? error.message : '重试批次失败');
+    }
   };
 
   return (
@@ -145,14 +267,61 @@ export function ArchivedAssetGrid({
                     </div>
                   ))}
                   {readiness.purge_available
-                    ? '安全门已满足，永久清除流水线尚未开放'
+                    ? (readiness.pipeline_available
+                      ? '安全门已满足，可创建永久清除批次'
+                      : '安全门已满足，永久清除流水线尚未开放')
                     : '未满足安全门，永久清除不可用'}
                 </div>
               )}
+              {readiness?.pipeline_available && selectedAssetIds.length > 0 && selectedAssetIds.length <= 20 && (
+                <div>
+                  <Input
+                    aria-label="永久删除确认"
+                    value={confirmation}
+                    onChange={(event) => {
+                      setConfirmation(event.target.value);
+                      idempotencyKeyRef.current = null;
+                    }}
+                    placeholder={expectedConfirmation}
+                  />
+                  <Button onClick={() => void submitCreate()}>创建批次</Button>
+                </div>
+              )}
+              {batches.map((batch) => (
+                <div key={batch.batch_id}>
+                  <div>{`批次 ${batch.status}`}</div>
+                  {batch.error_code && <div>{batch.error_code}</div>}
+                  {batch.items.map((item) => (
+                    <div key={item.asset_id}>
+                      {item.error_code || item.result_code || item.status}
+                    </div>
+                  ))}
+                  {batch.status !== 'pending_deletion' && batch.status !== 'cancelled' && (
+                    <Button
+                      aria-label="取消批次"
+                      onClick={() => void submitCancel(batch.batch_id)}
+                    >
+                      取消批次
+                    </Button>
+                  )}
+                  {batch.status === 'failed' && batch.error_code !== 'PURGE_BACKUP_RETENTION_EXPIRED' && (
+                    <Button
+                      aria-label="重试批次"
+                      onClick={() => void submitRetry(batch.batch_id)}
+                    >
+                      重试批次
+                    </Button>
+                  )}
+                </div>
+              ))}
+              <div>若恢复被拒绝，说明图片属于未取消的永久清除批次。</div>
             </div>
           ) : null,
         }]}
       />
+      {adminOpen && batchError && (
+        <div role="alert">{batchError}</div>
+      )}
       <div className="asset-toolbar">
         <div className="asset-search-wrap">
           <Input.Search

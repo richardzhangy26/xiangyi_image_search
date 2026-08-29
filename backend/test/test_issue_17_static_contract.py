@@ -72,9 +72,37 @@ def test_restore_update_only_writes_allowed_lifecycle_fields():
     assert 'ImageAsset.model_number.is_(None)' in source
 
 
+_FORBIDDEN_PURGE_IMPORTS = frozenset({
+    'purge_batch_control',
+    'purge_batch_worker',
+    'purge_object_backup',
+    'purge_object_restore',
+    'admin_purge',
+    'run_purge_batch_worker',
+})
+
+
+def _imported_module_tails(source: str) -> set[str]:
+    """Return imported module path tails (last dotted segment) and full names."""
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.name)
+                names.add(alias.name.rsplit('.', 1)[-1])
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module)
+            names.add(node.module.rsplit('.', 1)[-1])
+            for alias in node.names:
+                names.add(alias.name)
+                names.add(f'{node.module}.{alias.name}')
+    return names
+
+
 def test_recycle_bin_module_has_no_delete_storage_embedding_or_purge_path():
     source = _read(BACKEND_DIR / 'services' / 'asset_recycle_bin.py')
     lowered = source.lower()
+    imported = _imported_module_tails(source)
 
     assert 'session.delete' not in source
     assert 'OssObjectStorage' not in source
@@ -83,7 +111,15 @@ def test_recycle_bin_module_has_no_delete_storage_embedding_or_purge_path():
     assert '.preview_oss_path =' not in source
     assert '.vector =' not in source
     assert 'delete(' not in lowered
-    assert 'purge' not in lowered
     assert 'expiry' not in lowered
     assert 'expiration' not in lowered
     assert 'permanent' not in lowered
+    # Recycle-bin may observe purge-batch holding to block restore, but must
+    # not import any purge execution, backup, or worker module.
+    assert imported.isdisjoint(_FORBIDDEN_PURGE_IMPORTS)
+    assert all(
+        not any(name == forbidden or name.endswith('.' + forbidden) for name in imported)
+        for forbidden in _FORBIDDEN_PURGE_IMPORTS
+    )
+    assert 'RestoreBlockedByPurgeBatch' in source
+    assert 'PURGE_ASSET_RESTORE_BLOCKED' in source

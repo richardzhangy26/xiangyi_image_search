@@ -273,34 +273,22 @@ python -m pytest test/ \
 
 - Issues 和 PRD 使用 GitHub Issues（richardzhangy26/xiangyi_image_search），通过 gh CLI 操作；见 docs/agents/issue-tracker.md。
 - 默认 triage 标签为 needs-triage / needs-info / ready-for-agent / ready-for-human / wontfix；见 docs/agents/triage-labels.md。
-- 长期领域事实以根目录 CONTEXT.md 和 docs/adr/ 为准；见 docs/agents/domain.md。GitHub Issue 记录交付范围，Superpowers plan 只是单张高风险 Ticket 的短期执行配方。
+- 长期领域事实以根目录 CONTEXT.md 和 docs/adr/ 为准；见 docs/agents/domain.md。GitHub Issue 记录交付范围。
 
 ### Codex 技能调用
 
 - 在 Codex 中使用 `$skill-name` 显式调用技能，或通过 `/skills` 选择；不要把 Matt 文档中的通用 `/skill` 写法误当成 Codex 命令。
-- `$ask-matt` 必须由用户显式调用，并且只负责在 Matt skills 内选路，不负责选择 Matt 与 Superpowers 两条总工作流。
-- 对功能、修复或重构，在写代码前确定 `lane=matt` 或 `lane=superpowers`；纯解释、只读调查和代码审查不需要强行指定 lane。
+- `$ask-matt` 必须由用户显式调用，并且只负责在 Matt skills 内选路。
+- 对功能、修复或重构统一使用 Matt 工作流；纯解释、只读调查和代码审查按任务本身处理。
 
-### Lane 选择
-
-- 默认使用 `lane=matt`：普通前端功能、常规 Flask CRUD、CSV 校验、文档、小型 Bug，以及不改变存储、事务或 schema 语义的改动。
-- 以下情况使用 `lane=superpowers`：schema、事务、并发、OSS/Kodo、pgvector、embedding 模型或维度、权限、legacy 数据、数据迁移、恢复点、真实外部写入，或跨多个边界且失败代价高的改动。
-- Matt 可以先产出整体 spec 和 tickets；其中某张高风险 Ticket 只能在 Ticket 边界进入 Superpowers。执行中若范围升级为高风险，立即停止，重新确认 lane 和授权，不得在同一执行上下文中悄悄换流程。
-- 一张 Ticket 只能有一个 lane、一个 TDD 流程、一个诊断流程和一个主 review 流程；不得叠加两套完整工作流。
-
-### Matt lane
+### Matt 工作流
 
 - 不确定该用哪个 Matt skill 时，由用户显式调用 `$ask-matt`。
 - 一般主线为 `$grill-with-docs` → 必要时 `$prototype` → 多会话任务 `$to-spec` → `$to-tickets` → 每张 Ticket 在新任务中 `$implement` → `$code-review`。
 - 能在当前上下文完成的小改可直接 `$implement`；困难 Bug 使用 `$diagnosing-bugs`；外部资料调查使用 `$research`。
-- 从需求访谈到 `$to-tickets` 保持同一上下文；每张 `$implement` Ticket 使用新的 Codex 任务。Matt lane 不再调用 Superpowers 的 brainstorming、writing-plans 或 subagent-driven-development。
-
-### Superpowers lane
-
-- 主线为 `$brainstorming` → `$writing-plans` → `$using-git-worktrees` → `$subagent-driven-development`（或 `$executing-plans`）→ `$verification-before-completion` → `$finishing-a-development-branch`。
-- 已有 Matt spec 或 Ticket 时，将它作为 Superpowers 的输入并只确认该 Ticket 的设计，不重新访谈、拆分或实现整个上游功能。
-- 写计划前必须由 `architect` 审查架构边界、不变量、失败模式、回滚与测试接缝；实现完成后必须由 `risk_reviewer` 对完整 diff 做独立审查。
-- Superpowers lane 不再调用 Matt 的 `$to-spec`、`$to-tickets`、`$implement` 或 `$code-review`。`$verification-before-completion` 可作为两条 lane 共用的完成门，但不是第二套 review。
+- 从需求访谈到 `$to-tickets` 保持同一上下文；每张 `$implement` Ticket 使用新的 Codex 任务。
+- 涉及 schema、事务、并发、OSS/Kodo、pgvector、embedding 模型或维度、权限、legacy 数据、数据迁移、恢复点、真实外部写入，或跨多个边界且失败代价高的任务时，仍在 Matt 工作流内处理，并限定在单张 Ticket 边界内；写实施方案前由 `architect` 审查架构边界、不变量、失败模式、回滚与测试接缝，完成后由 `risk_reviewer` 审查完整 diff。
+- 执行中若范围升级为高风险，立即停止并重新确认 Ticket 边界与授权。一张 Ticket 只使用一套 TDD 流程、诊断流程和主 review 流程。
 
 ### 模型分工
 
@@ -318,6 +306,6 @@ python -m pytest test/ \
 
 ### 共享授权门
 
-- 模型或 lane 选择不构成迁移、部署、删除、真实 OSS/Kodo 写入、数据库收缩、创建或修改 GitHub Issues、commit、push 或 PR 的授权。
+- 模型或工作流选择不构成迁移、部署、删除、真实 OSS/Kodo 写入、数据库收缩、创建或修改 GitHub Issues、commit、push 或 PR 的授权。
 - 技能内置的发布、提交或合并步骤不得覆盖用户授权边界；执行外部或 Git 操作前确认用户是否明确要求。
 - 所有代理必须保护现有未提交改动，只修改被授权的文件；需要扩大范围时先报告原因和最小必要范围。

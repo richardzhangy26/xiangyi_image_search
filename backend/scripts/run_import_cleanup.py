@@ -17,7 +17,9 @@ import time
 from app import create_app
 from models import db
 from services.import_cleanup import cleanup_expired_imports
+from services.object_binding_fence import ObjectBindingFenceService
 from services.object_storage import OssObjectStorage
+from services.purge_object_fence import PurgeObjectFenceService
 
 
 logger = logging.getLogger(__name__)
@@ -48,7 +50,14 @@ def main():
         while not _stop_requested:
             try:
                 processed = cleanup_expired_imports(
-                    db.session, storage=storage, limit=batch
+                    db.session,
+                    storage=storage,
+                    limit=batch,
+                    binding_fence_service=ObjectBindingFenceService(
+                        db.session,
+                        purge_fence_service=PurgeObjectFenceService(db.session),
+                    ),
+                    formal_bucket=os.getenv('OSS_BUCKET_NAME'),
                 )
                 if processed:
                     logger.info(

@@ -35,6 +35,7 @@ from services.asset_recycle_bin import (
 from services.image_normalizer import ImageNormalizationError
 from services.object_source import InMemoryObjectSource
 from services.object_storage import ObjectStorageError, OssObjectStorage
+from services.fence_composition import request_fence_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +339,7 @@ def _import_ingest_service(source):
         embedding_client=current_app.config.get('IMAGE_INGEST_EMBEDDING'),
         normalizer=current_app.config.get('IMAGE_ASSET_NORMALIZER'),
         source_provider=IMPORT_SOURCE_PROVIDER,
+        **request_fence_kwargs(),
     )
 
 

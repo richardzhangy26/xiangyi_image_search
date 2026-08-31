@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -12,7 +13,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from models import ImageAsset, Product, db
+from models import ImageAsset, ObjectBindingFence, Product, PurgeObjectFence, db
 from services.asset_ingest import (
     AssetIngestConflictError,
     AssetIngestError,
@@ -152,6 +153,7 @@ def _service(
     *,
     normalizer=None,
     source_provider='qiniu-kodo',
+    **kwargs,
 ):
     return ImageAssetIngestService(
         source=source,
@@ -159,8 +161,94 @@ def _service(
         embedding_client=embedding,
         normalizer=normalizer,
         source_provider=source_provider,
+        **kwargs,
     )
 
+
+def test_held_formal_fence_blocks_ingest_before_any_oss_put(app):
+    relative_path = 'fenced/item.png'
+    original = _png_bytes()
+    source = FakeKodo({relative_path: original})
+    storage = FakeOss()
+    now = datetime.now()
+    db.session.add(PurgeObjectFence(
+        formal_bucket='private-formal-bucket',
+        formal_key=f'image-search/xiangxipackage/{relative_path}',
+        kind='source_image',
+        batch_id=uuid.uuid4(),
+        target_asset_id=uuid.uuid4(),
+        state='held',
+        acquired_at=now,
+        audit_retain_until=now.replace(year=now.year + 1),
+    ))
+    db.session.commit()
+
+    with pytest.raises(Exception, match='围栏'):
+        _service(
+            source, storage, FakeEmbedding(),
+            formal_bucket='private-formal-bucket',
+        ).ingest_one(relative_path)
+
+    assert storage.put_calls == []
+
+
+def test_sync_ingest_final_bind_releases_binding_leases(app):
+    from services.object_binding_fence import ObjectBindingFenceService
+
+    relative_path = 'binding/one.png'
+    service = _service(
+        FakeKodo({relative_path: _png_bytes()}),
+        FakeOss(),
+        FakeEmbedding(),
+        formal_bucket='private-formal-bucket',
+        binding_fence_service=ObjectBindingFenceService(db.session),
+    )
+
+    result = service.ingest_one(relative_path)
+
+    assert result.status == 'created'
+    assert ObjectBindingFence.query.filter_by(state='held').count() == 0
+
+
+def test_batch_chunk_owner_releases_binding_leases_without_changing_batch_embedding(app):
+    from services.object_binding_fence import ObjectBindingFenceService
+
+    source = FakeKodo({
+        'chunk/a.png': _png_bytes('red'),
+        'chunk/b.png': _png_bytes('green'),
+    })
+    embedding = FakeEmbedding()
+    results = _service(
+        source, FakeOss(), embedding,
+        formal_bucket='private-formal-bucket',
+        binding_fence_service=ObjectBindingFenceService(db.session),
+    ).ingest_many(list(source.objects))
+
+    assert [result.status for result in results] == ['created', 'created']
+    assert embedding.batch_calls == [2]
+    assert ObjectBindingFence.query.filter_by(state='held').count() == 0
+
+
+def test_prepare_one_only_prepares_without_formal_put(app, tmp_path):
+    relative_path = 'pure-prepare/one.png'
+    storage = FakeOss()
+    source = FakeKodo({relative_path: _png_bytes()})
+    service = _service(source, storage, FakeEmbedding())
+
+    prepared = service._prepare_one(
+        relative_path,
+        location=source.resolve_location(),
+        temp_dir=tmp_path,
+        item_index=0,
+        model_number=None,
+        content_cache={},
+        stages={},
+    )
+
+    assert prepared.source_path.is_file()
+    assert prepared.location.source_bucket == source.source_bucket
+    assert prepared.normalized is not None
+    assert storage.put_calls == []
 
 def test_one_unassigned_image_reaches_private_oss_and_postgresql(app):
     relative_path = '2025.4.18 海报照片/子目录/主图 一.png'

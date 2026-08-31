@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from models import AssetActivityRecord, ImageAsset, ImageImportItem
 from services import import_retention
 from services.object_storage import ObjectStorageError
+from services.purge_object_fence import ObjectIdentity
 
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,51 @@ def count_object_references(
     return int(asset_refs) + int(item_refs)
 
 
-def cleanup_one_item(session, item_id, *, storage, now=None) -> bool:
+def cleanup_one_item(
+    session, item_id, *, storage, now=None,
+    binding_fence_service=None, formal_bucket=None,
+) -> bool:
+    """Optionally protect cleanup with an import_cleanup binding lease."""
+    if binding_fence_service is None:
+        return _cleanup_one_item(session, item_id, storage=storage, now=now)
+    try:
+        item = session.execute(
+            select(ImageImportItem).where(ImageImportItem.id == item_id)
+        ).scalar_one_or_none()
+        if item is None or not formal_bucket:
+            session.rollback()
+            return False
+        identities = (
+            ObjectIdentity(formal_bucket, item.oss_path),
+            ObjectIdentity(formal_bucket, item.preview_oss_path),
+        )
+        session.rollback()
+        lease = binding_fence_service.acquire(
+            identities, owner_kind='import_cleanup', lease_seconds=300,
+        )
+        result_box = {}
+        completed = binding_fence_service.final_bind(
+            lease,
+            bind=lambda: result_box.setdefault(
+                'result', _cleanup_one_item(
+                    session, item_id, storage=storage, now=now, commit=False,
+                ),
+            ),
+        )
+        return result_box.get('result', False) if completed else False
+    except ObjectStorageError:
+        if 'lease' in locals():
+            binding_fence_service.session.rollback()
+            binding_fence_service.release(lease, reason='failed')
+        return False
+    except Exception:
+        if 'lease' in locals():
+            binding_fence_service.session.rollback()
+            binding_fence_service.release(lease, reason='failed')
+        raise
+
+
+def _cleanup_one_item(session, item_id, *, storage, now=None, commit=True) -> bool:
     """在独立短事务内清理一个导入项的暂存对象；返回是否完成清理。"""
     now = now or datetime.now()
     try:
@@ -66,7 +111,8 @@ def cleanup_one_item(session, item_id, *, storage, now=None) -> bool:
                 now=now,
             )
         ):
-            session.rollback()
+            if commit:
+                session.rollback()
             return False
 
         outcomes = {}
@@ -122,7 +168,8 @@ def cleanup_one_item(session, item_id, *, storage, now=None) -> bool:
             after_state={'objects': outcomes},
             result='purged',
         ))
-        session.commit()
+        if commit:
+            session.commit()
         logger.info(
             'import_cleanup.purged item_id=%s status=%s objects=%s',
             item.id,
@@ -131,7 +178,8 @@ def cleanup_one_item(session, item_id, *, storage, now=None) -> bool:
         )
         return True
     except ObjectStorageError as exc:
-        session.rollback()
+        if commit:
+            session.rollback()
         logger.error(
             'import_cleanup.object_delete_failed item_id=%s error_type=%s',
             item_id,
@@ -139,7 +187,8 @@ def cleanup_one_item(session, item_id, *, storage, now=None) -> bool:
         )
         return False
     except Exception:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
 
 
@@ -149,6 +198,8 @@ def cleanup_expired_imports(
     storage,
     now=None,
     limit: int = DEFAULT_CLEANUP_BATCH,
+    binding_fence_service=None,
+    formal_bucket=None,
 ) -> int:
     """扫描到期未清理项并逐项清理；每项独立事务，失败跳过、可重启续跑。"""
     now = now or datetime.now()
@@ -169,6 +220,10 @@ def cleanup_expired_imports(
 
     processed = 0
     for item_id in candidates:
-        if cleanup_one_item(session, item_id, storage=storage, now=now):
+        if cleanup_one_item(
+            session, item_id, storage=storage, now=now,
+            binding_fence_service=binding_fence_service,
+            formal_bucket=formal_bucket,
+        ):
             processed += 1
     return processed

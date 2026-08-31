@@ -12,6 +12,9 @@ from .purge_batch import (
     PurgeBatch,
     PurgeBatchItem,
 )
+from .purge_item_event import PurgeItemEvent
+from .purge_object_fence import PurgeObjectFence
+from .object_binding_fence import ObjectBindingFence
 
 __all__ = [
     'db',
@@ -24,4 +27,7 @@ __all__ = [
     'PURGE_BATCH_STATUSES',
     'PurgeBatch',
     'PurgeBatchItem',
+    'PurgeItemEvent',
+    'PurgeObjectFence',
+    'ObjectBindingFence',
 ]

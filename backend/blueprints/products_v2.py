@@ -26,6 +26,10 @@ from services.image_normalizer import ImageNormalizationError
 from services import legacy_product_images
 from services.object_storage import ObjectStorageError, OssObjectStorage
 from services.upload_source import prepare_multipart_source
+from services.fence_composition import (
+    caller_owned_ingest_boundary,
+    request_fence_kwargs,
+)
 
 products_v2_bp = Blueprint('products_v2', __name__, url_prefix='/api/products')
 
@@ -76,6 +80,7 @@ def get_asset_ingest_service(source):
         embedding_client=current_app.config.get('IMAGE_INGEST_EMBEDDING'),
         normalizer=current_app.config.get('IMAGE_ASSET_NORMALIZER'),
         source_provider=PRODUCT_UPLOAD_SOURCE_PROVIDER,
+        **request_fence_kwargs(),
     )
 
 
@@ -448,33 +453,46 @@ def create_product():
         ingested_asset_ids = []
         request_id = uuid.uuid4().hex
 
-        if relative_paths:
-            ingest_service = get_asset_ingest_service(source)
-            for aligned_path in aligned_paths:
-                if aligned_path is None:
-                    ingested_asset_ids.append(None)
-                    continue
-                result = ingest_service.ingest_one(
-                    aligned_path,
+        ingest_service = (
+            get_asset_ingest_service(source) if relative_paths else None
+        )
+        with caller_owned_ingest_boundary(ingest_service) as binding_leases:
+            if relative_paths:
+                ordered_paths = [
+                    aligned_path
+                    for aligned_path in aligned_paths
+                    if aligned_path is not None
+                ]
+                results, chunk_lease = ingest_service.ingest_many_caller_owned(
+                    ordered_paths,
                     model_number=model_number,
                     request_id=request_id,
-                    commit=False,
                 )
-                image_result = attach_product_upload_result(
-                    result,
-                    model_number,
-                )
-                if image_result:
-                    image_results.append(image_result)
-                    ingested_asset_ids.append(str(result.asset_id))
-                else:
-                    ingested_asset_ids.append(None)
+                if chunk_lease is not None:
+                    binding_leases.append(chunk_lease)
+                result_slots = iter(results)
+                for aligned_path in aligned_paths:
+                    if aligned_path is None:
+                        ingested_asset_ids.append(None)
+                        continue
+                    result = next(result_slots)
+                    image_result = attach_product_upload_result(
+                        result,
+                        model_number,
+                    )
+                    if image_result:
+                        image_results.append(image_result)
+                        ingested_asset_ids.append(str(result.asset_id))
+                    else:
+                        ingested_asset_ids.append(None)
 
-        ordered_new_ids = [asset_id for asset_id in ingested_asset_ids if asset_id]
-        if ordered_new_ids:
-            apply_product_image_order(model_number, ordered_new_ids)
+            ordered_new_ids = [
+                asset_id for asset_id in ingested_asset_ids if asset_id
+            ]
+            if ordered_new_ids:
+                apply_product_image_order(model_number, ordered_new_ids)
 
-        db.session.commit()
+            db.session.commit()
 
         return jsonify({
             'message': '产品创建成功',
@@ -598,53 +616,64 @@ def update_product(model_number):
         ingested_asset_ids = []
         request_id = uuid.uuid4().hex
 
-        if relative_paths:
-            ingest_service = get_asset_ingest_service(source)
-            for aligned_path in aligned_paths:
-                if aligned_path is None:
-                    ingested_asset_ids.append(None)
-                    continue
-                result = ingest_service.ingest_one(
-                    aligned_path,
+        ingest_service = (
+            get_asset_ingest_service(source) if relative_paths else None
+        )
+        with caller_owned_ingest_boundary(ingest_service) as binding_leases:
+            if relative_paths:
+                ordered_paths = [
+                    aligned_path
+                    for aligned_path in aligned_paths
+                    if aligned_path is not None
+                ]
+                results, chunk_lease = ingest_service.ingest_many_caller_owned(
+                    ordered_paths,
                     model_number=model_number,
                     request_id=request_id,
-                    commit=False,
                 )
-                image_result = attach_product_upload_result(
-                    result,
-                    model_number,
-                )
-                if image_result:
-                    image_results.append(image_result)
-                    ingested_asset_ids.append(str(result.asset_id))
-                else:
-                    ingested_asset_ids.append(None)
+                if chunk_lease is not None:
+                    binding_leases.append(chunk_lease)
+                result_slots = iter(results)
+                for aligned_path in aligned_paths:
+                    if aligned_path is None:
+                        ingested_asset_ids.append(None)
+                        continue
+                    result = next(result_slots)
+                    image_result = attach_product_upload_result(
+                        result,
+                        model_number,
+                    )
+                    if image_result:
+                        image_results.append(image_result)
+                        ingested_asset_ids.append(str(result.asset_id))
+                    else:
+                        ingested_asset_ids.append(None)
 
-        if image_order_raw is not None:
-            resolved_order = []
-            for entry in image_order_raw:
-                if entry.startswith('new:'):
-                    index_text = entry[4:]
-                    if index_text.isdigit():
-                        index = int(index_text)
-                        if index < len(ingested_asset_ids):
-                            asset_id = ingested_asset_ids[index]
-                            if asset_id:
-                                resolved_order.append(asset_id)
-                    continue
-                resolved_order.append(entry)
-            apply_product_image_order(model_number, resolved_order)
-        else:
-            ordered_new_ids = [
-                asset_id for asset_id in ingested_asset_ids if asset_id
-            ]
-            if ordered_new_ids:
-                apply_product_image_order(
-                    model_number,
-                    existing_ordered_ids + ordered_new_ids,
-                )
+            if image_order_raw is not None:
+                resolved_order = []
+                for entry in image_order_raw:
+                    if entry.startswith('new:'):
+                        index_text = entry[4:]
+                        if index_text.isdigit():
+                            index = int(index_text)
+                            if index < len(ingested_asset_ids):
+                                asset_id = ingested_asset_ids[index]
+                                if asset_id:
+                                    resolved_order.append(asset_id)
+                        continue
+                    resolved_order.append(entry)
+                apply_product_image_order(model_number, resolved_order)
+            else:
+                ordered_new_ids = [
+                    asset_id for asset_id in ingested_asset_ids if asset_id
+                ]
+                if ordered_new_ids:
+                    apply_product_image_order(
+                        model_number,
+                        existing_ordered_ids + ordered_new_ids,
+                    )
 
-        db.session.commit()
+            db.session.commit()
 
         return jsonify({
             'message': '产品更新成功',

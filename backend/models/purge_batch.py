@@ -18,10 +18,25 @@ PURGE_BATCH_STATUSES = (
     'object_backup',
     'verifying',
     'pending_deletion',
+    'deleting',
+    'partial_failure',
+    'completed',
     'failed',
     'cancelled',
 )
 CLAIMABLE_BATCH_STATUSES = ('queued', 'database_backup', 'object_backup', 'verifying')
+
+# #27 以单调检查点描述对象处置；失败是 item status，不是检查点。
+FORMAL_PURGE_ITEM_CHECKPOINTS = (
+    'pending',
+    'fenced',
+    'original_delete_started',
+    'original_deleted',
+    'preview_delete_started',
+    'preview_deleted',
+    'preview_shared',
+    'completed',
+)
 
 
 def _isoformat(value):
@@ -54,6 +69,8 @@ class PurgeBatch(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
     started_at = db.Column(db.DateTime, nullable=True)
     completed_at = db.Column(db.DateTime, nullable=True)
+    deleting_at = db.Column(db.DateTime, nullable=True)
+    partial_failure_at = db.Column(db.DateTime, nullable=True)
     failed_at = db.Column(db.DateTime, nullable=True)
     cancelled_at = db.Column(db.DateTime, nullable=True)
 
@@ -63,7 +80,8 @@ class PurgeBatch(db.Model):
         ),
         db.CheckConstraint(
             "status IN ('queued', 'database_backup', 'object_backup', 'verifying', "
-            "'pending_deletion', 'failed', 'cancelled')",
+            "'pending_deletion', 'deleting', 'partial_failure', 'completed', "
+            "'failed', 'cancelled')",
             name='ck_purge_batches_status',
         ),
         db.CheckConstraint(
@@ -77,6 +95,7 @@ class PurgeBatch(db.Model):
 
     def to_public_dict(self):
         """返回不含凭证、对象键或清单内容的批次 DTO。"""
+        items = [item.to_public_dict() for item in self.items]
         return {
             'batch_id': str(self.id),
             'status': self.status,
@@ -87,7 +106,11 @@ class PurgeBatch(db.Model):
             'completed_at': _isoformat(self.completed_at),
             'failed_at': _isoformat(self.failed_at),
             'cancelled_at': _isoformat(self.cancelled_at),
-            'items': [item.to_public_dict() for item in self.items],
+            'completed_count': sum(item['status'] == 'completed' for item in items),
+            'failed_count': sum(item['status'] == 'failed' for item in items),
+            'pending_count': sum(item['status'] not in {'completed', 'failed'} for item in items),
+            'cancellable': self.status == 'pending_deletion' and self.deleting_at is None,
+            'items': items,
         }
 
 
@@ -103,10 +126,33 @@ class PurgeBatchItem(db.Model):
     )
     target_asset_id = db.Column(Uuid(as_uuid=True), primary_key=True)
     ordinal = db.Column(db.SmallInteger, nullable=False)
-    status = db.Column(db.String(24), nullable=False, default='queued')
+    status = db.Column(db.String(24), nullable=False, default='pending')
     result_code = db.Column(db.String(80), nullable=True)
     error_code = db.Column(db.String(80), nullable=True)
+    checkpoint = db.Column(db.String(40), nullable=False, default='pending')
     checkpoint_at = db.Column(db.DateTime, nullable=True)
+    claim_token = db.Column(Uuid(as_uuid=True), nullable=True)
+    claim_generation = db.Column(db.BigInteger, nullable=False, default=0)
+    lease_expires_at = db.Column(db.DateTime, nullable=True)
+    original_delete_started_at = db.Column(db.DateTime, nullable=True)
+    original_deleted_at = db.Column(db.DateTime, nullable=True)
+    preview_delete_started_at = db.Column(db.DateTime, nullable=True)
+    preview_deleted_at = db.Column(db.DateTime, nullable=True)
+    preview_disposition = db.Column(db.String(40), nullable=True)
+    database_deleted_at = db.Column(db.DateTime, nullable=True)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    failed_at = db.Column(db.DateTime, nullable=True)
+    attempt_count = db.Column(db.Integer, nullable=False, default=0)
+    audit_retain_until = db.Column(db.DateTime, nullable=True)
+    original_formal_key = db.Column(db.Text, nullable=True)
+    original_backup_object_id = db.Column(db.String(128), nullable=True)
+    original_backup_sha256 = db.Column(db.String(64), nullable=True)
+    preview_formal_key = db.Column(db.Text, nullable=True)
+    preview_backup_object_id = db.Column(db.String(128), nullable=True)
+    preview_backup_sha256 = db.Column(db.String(64), nullable=True)
+    preview_delete_authorized = db.Column(db.Boolean, nullable=False, default=False)
+    authorization_retain_until = db.Column(db.DateTime, nullable=True)
+    formal_bucket = db.Column(db.String(255), nullable=True)
 
     batch = db.relationship('PurgeBatch', back_populates='items')
 
@@ -115,10 +161,17 @@ class PurgeBatchItem(db.Model):
     )
 
     def to_public_dict(self):
+        next_action = (
+            'retry_item' if self.status == 'failed' and self.result_code != 'nonretryable'
+            else 'awaiting_protection' if self.status == 'failed'
+            else 'none' if self.status == 'completed'
+            else 'in_progress'
+        )
         return {
             'asset_id': str(self.target_asset_id),
             'status': self.status,
             'result_code': self.result_code,
             'error_code': self.error_code,
             'checkpoint_at': _isoformat(self.checkpoint_at),
+            'next_action': next_action,
         }

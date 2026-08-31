@@ -6,7 +6,7 @@ import hashlib
 import os
 import tempfile
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -34,6 +34,9 @@ from services.object_storage import (
     ObjectWriter,
     StoredObject,
 )
+from services.formal_bucket_identity import FormalBucketIdentityProvider
+from services.purge_object_fence import ObjectIdentity, PurgeObjectFenceService
+from services.object_binding_fence import BindingFenceLease, ObjectBindingFenceService
 
 SOURCE_PROVIDER = 'qiniu-kodo'
 DEFAULT_OSS_IMAGE_BASE_PREFIX = 'image-search'
@@ -84,6 +87,9 @@ class AssetIngestResult:
     error_stage: Optional[str] = None
     error: Optional[str] = None
     recovery_action: Optional[dict[str, str]] = None
+    # caller-owned（commit=False + control factory）成功时随结果返回的绑定租约；
+    # 旧路径恒为 None。调用方回滚外层事务后用 abort_after_outer_rollback 释放。
+    binding_lease: object = None
 
 
 @dataclass(frozen=True)
@@ -93,6 +99,9 @@ class ImageImportQueueResult:
     asset_id: Optional[str]
     source_relative_path: str
     recovery_action: Optional[dict[str, str]] = None
+    # control-factory 模式下随结果返回的绑定租约（commit=False 时供调用方在
+    # 外层回滚后 abort_after_outer_rollback）；旧路径恒为 None。
+    binding_lease: object = None
 
 
 @dataclass
@@ -111,6 +120,10 @@ class _PreparedAsset:
     preview_path: Optional[Path]
     vector_values: Optional[list[float]]
     stages: dict[str, str]
+    source_path: Optional[Path] = None
+    location: Optional[SourceLocation] = None
+    normalized: Optional[NormalizedImage] = None
+    binding_lease: object = None
 
 
 class ImageAssetIngestService:
@@ -125,6 +138,10 @@ class ImageAssetIngestService:
         normalizer: Optional[ImageNormalizer] = None,
         oss_image_base_prefix: Optional[str] = None,
         source_provider: str = SOURCE_PROVIDER,
+        formal_bucket: Optional[str] = None,
+        fence_service: Optional[PurgeObjectFenceService] = None,
+        binding_fence_service: Optional[ObjectBindingFenceService] = None,
+        control_session_factory: Optional[object] = None,
     ):
         self._source = source
         self._storage = storage
@@ -145,6 +162,313 @@ class ImageAssetIngestService:
         self._base_prefix = configured_prefix.strip('/')
         if not self._base_prefix:
             raise ValueError('OSS 图片前缀不能为空')
+        self._formal_bucket = formal_bucket
+        self._fence_service = fence_service
+        self._binding_fence_service = binding_fence_service
+        self._control_session_factory = control_session_factory
+        if formal_bucket is not None and fence_service is None:
+            self._fence_service = PurgeObjectFenceService(db.session)
+            self._formal_bucket = FormalBucketIdentityProvider(
+                formal_bucket
+            ).formal_bucket()
+
+    def abort_after_outer_rollback(self, lease) -> bool:
+        """Caller invokes after a commit=False outer rollback; legacy path is inert."""
+        if self._control_session_factory is None or lease is None:
+            return False
+        if self._binding_fence_service is None:
+            return False
+        return self._binding_fence_service.abort_after_rollback(
+            lease, control_session_factory=self._control_session_factory,
+        )
+
+    def ingest_many_caller_owned(
+        self,
+        source_relative_paths: Sequence[str],
+        *,
+        model_number: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> tuple[list[AssetIngestResult], object]:
+        """Product 式多图 commit=False 循环的请求级 chunk-owner 入口。
+
+        整请求对完整去重 identity 集一次 ``acquire_prewrite``；逐 item
+        ``finalize_in_transaction`` 绑定进调用方事务并只释放独占 original 与
+        最后 consumer 的 preview；本方法不 commit。返回 ``(results, lease)``：
+        lease 随外层 commit 原子释放，外层回滚后由调用方
+        ``abort_after_outer_rollback(lease)`` 释放。请求内任一步失败立即抛出
+        （全有或全无，与逐图 ingest_one 语义一致）；finalize 已开始后失败时
+        租约挂在异常 ``binding_fence_lease`` 上供边界回滚后回收。
+        未注入 control factory 时逐图走旧路径（无租约可交还）。
+        输入相对路径须互异（同路径重复会在第二个 item 的 finalize 处确定性
+        全有或全无失败；当前所有生产蓝图入口天然产生互异路径）。
+        """
+        if self._control_session_factory is None:
+            results = [
+                self.ingest_one(
+                    relative_path,
+                    model_number=model_number,
+                    request_id=request_id,
+                    commit=False,
+                )
+                for relative_path in source_relative_paths
+            ]
+            return results, None
+        if self._binding_fence_service is None:
+            raise ValueError('caller-owned 批量入库要求注入绑定围栏服务')
+
+        location = self._source.resolve_location()
+        results_by_index: dict[int, AssetIngestResult] = {}
+        prepared_items: dict[int, _PreparedAsset] = {}
+        lease = None
+        finalize_attempted = False
+        with tempfile.TemporaryDirectory(prefix='image-assets-caller-owned-') as temp_dir:
+            temp_root = Path(temp_dir)
+            content_cache: dict[str, _PreparedAsset] = {}
+            try:
+                for index, relative_path in enumerate(source_relative_paths):
+                    if not relative_path:
+                        raise ValueError('来源相对路径不能为空')
+                    prepared = self._prepare_one(
+                        relative_path,
+                        location=location,
+                        temp_dir=temp_root,
+                        item_index=index,
+                        model_number=model_number,
+                        content_cache=content_cache,
+                        stages={},
+                    )
+                    if isinstance(prepared, AssetIngestResult):
+                        results_by_index[index] = prepared
+                    else:
+                        prepared_items[index] = prepared
+                        content_cache.setdefault(prepared.content_hash, prepared)
+                if prepared_items:
+                    lease = self._binding_fence_service.acquire_prewrite(
+                        self._binding_identities(tuple(
+                            (prepared.oss_path, prepared.preview_oss_path)
+                            for prepared in prepared_items.values()
+                        )),
+                        owner_kind='asset_ingest',
+                        control_session_factory=self._control_session_factory,
+                    )
+                for prepared in prepared_items.values():
+                    self._write_prepared_objects(prepared)
+                representatives: list[_PreparedAsset] = []
+                vectors_by_hash: dict[str, list[float]] = {}
+                for prepared in prepared_items.values():
+                    if prepared.vector_values is not None:
+                        vectors_by_hash[prepared.content_hash] = prepared.vector_values
+                        continue
+                    if not any(
+                        item.content_hash == prepared.content_hash
+                        for item in representatives
+                    ):
+                        representatives.append(prepared)
+                if representatives:
+                    vectors = self._embedding.embed_normalized_images(
+                        [str(item.preview_path) for item in representatives],
+                        request_id=request_id,
+                    )
+                    for item, vector in zip(representatives, vectors):
+                        vectors_by_hash[item.content_hash] = self._vector_values(vector)
+                if lease is not None:
+                    if not self._binding_fence_service.renew_prewrite(
+                        lease,
+                        control_session_factory=self._control_session_factory,
+                        lease_seconds=300,
+                    ):
+                        raise AssetIngestError(
+                            '绑定围栏租约已失效', stage='database',
+                        )
+                    preview_remaining: dict[ObjectIdentity, int] = {}
+                    for prepared in prepared_items.values():
+                        preview_identity = ObjectIdentity(
+                            self._formal_bucket, prepared.preview_oss_path,
+                        )
+                        preview_remaining[preview_identity] = (
+                            preview_remaining.get(preview_identity, 0) + 1
+                        )
+                    first_for_hash: set[str] = set()
+                    for index, prepared in prepared_items.items():
+                        vector_values = vectors_by_hash.get(prepared.content_hash)
+                        if vector_values is None:
+                            raise AssetIngestError(
+                                'Embedding 未返回可用向量', stage='embedding',
+                            )
+                        if prepared.stages.get('embedding') != 'reused':
+                            prepared.stages['embedding'] = (
+                                'new'
+                                if prepared.content_hash not in first_for_hash
+                                else 'reused'
+                            )
+                        first_for_hash.add(prepared.content_hash)
+                        preview_identity = ObjectIdentity(
+                            self._formal_bucket, prepared.preview_oss_path,
+                        )
+                        preview_remaining[preview_identity] -= 1
+                        release_identities = [
+                            ObjectIdentity(self._formal_bucket, prepared.oss_path),
+                        ]
+                        if preview_remaining[preview_identity] == 0:
+                            release_identities.append(preview_identity)
+                        sublease = ObjectBindingFenceService.sublease(
+                            lease, tuple(release_identities),
+                        )
+                        result_box: dict[str, AssetIngestResult] = {}
+
+                        def _bind():
+                            result_box['result'] = self._persist(
+                                prepared, vector_values, commit=False,
+                            )
+                            return True
+
+                        finalize_attempted = True
+                        if not self._binding_fence_service.finalize_in_transaction(
+                            sublease, db.session, _bind,
+                        ):
+                            raise AssetIngestError(
+                                '绑定围栏租约已失效', stage='database',
+                            )
+                        results_by_index[index] = result_box['result']
+            except Exception as exc:
+                if lease is not None:
+                    if not finalize_attempted:
+                        self.abort_after_outer_rollback(lease)
+                    else:
+                        exc.binding_fence_lease = lease
+                raise
+        ordered_results = [
+            results_by_index[index]
+            for index in range(len(source_relative_paths))
+        ]
+        return ordered_results, lease
+
+    def queue_many_caller_owned(
+        self,
+        source_relative_paths: Sequence[str],
+        *,
+        request_id: Optional[str] = None,
+    ) -> tuple[list[ImageImportQueueResult], object]:
+        """导入队列多图 commit=False 循环的请求级 chunk-owner 入口。
+
+        与 :meth:`ingest_many_caller_owned` 同协议（不 embedding、绑定
+        ``image_import_items``）；未注入 control factory 时逐图走旧路径。
+        """
+        if self._control_session_factory is None:
+            results = [
+                self.queue_one(
+                    relative_path, request_id=request_id, commit=False,
+                )
+                for relative_path in source_relative_paths
+            ]
+            return results, None
+        if self._binding_fence_service is None:
+            raise ValueError('caller-owned 批量排队要求注入绑定围栏服务')
+
+        location = self._source.resolve_location()
+        results_by_index: dict[int, ImageImportQueueResult] = {}
+        prepared_items: dict[int, _PreparedAsset] = {}
+        lease = None
+        finalize_attempted = False
+        with tempfile.TemporaryDirectory(prefix='image-import-caller-owned-') as temp_dir:
+            temp_root = Path(temp_dir)
+            content_cache: dict[str, _PreparedAsset] = {}
+            try:
+                for index, relative_path in enumerate(source_relative_paths):
+                    if not relative_path:
+                        raise ValueError('来源相对路径不能为空')
+                    prepared = self._prepare_one(
+                        relative_path,
+                        location=location,
+                        temp_dir=temp_root,
+                        item_index=index,
+                        model_number=None,
+                        content_cache=content_cache,
+                        stages={},
+                    )
+                    if isinstance(prepared, AssetIngestResult):
+                        results_by_index[index] = ImageImportQueueResult(
+                            status=prepared.status,
+                            item_id=None,
+                            asset_id=prepared.asset_id,
+                            source_relative_path=relative_path,
+                            recovery_action=prepared.recovery_action,
+                        )
+                    else:
+                        prepared_items[index] = prepared
+                        content_cache.setdefault(prepared.content_hash, prepared)
+                if prepared_items:
+                    lease = self._binding_fence_service.acquire_prewrite(
+                        self._binding_identities(tuple(
+                            (prepared.oss_path, prepared.preview_oss_path)
+                            for prepared in prepared_items.values()
+                        )),
+                        owner_kind='asset_ingest',
+                        control_session_factory=self._control_session_factory,
+                    )
+                for prepared in prepared_items.values():
+                    self._write_prepared_objects(prepared)
+                if lease is not None:
+                    if not self._binding_fence_service.renew_prewrite(
+                        lease,
+                        control_session_factory=self._control_session_factory,
+                        lease_seconds=300,
+                    ):
+                        raise AssetIngestError(
+                            '绑定围栏租约已失效', stage='database',
+                        )
+                    preview_remaining: dict[ObjectIdentity, int] = {}
+                    for prepared in prepared_items.values():
+                        preview_identity = ObjectIdentity(
+                            self._formal_bucket, prepared.preview_oss_path,
+                        )
+                        preview_remaining[preview_identity] = (
+                            preview_remaining.get(preview_identity, 0) + 1
+                        )
+                    request_id_value = request_id or uuid.uuid4().hex
+                    for index, prepared in prepared_items.items():
+                        preview_identity = ObjectIdentity(
+                            self._formal_bucket, prepared.preview_oss_path,
+                        )
+                        release_identities = [
+                            ObjectIdentity(self._formal_bucket, prepared.oss_path),
+                        ]
+                        preview_remaining[preview_identity] -= 1
+                        if preview_remaining[preview_identity] == 0:
+                            release_identities.append(preview_identity)
+                        sublease = ObjectBindingFenceService.sublease(
+                            lease, tuple(release_identities),
+                        )
+                        result_box: dict[str, ImageImportQueueResult] = {}
+
+                        def _bind():
+                            result_box['result'] = self._persist_import_item(
+                                prepared,
+                                request_id=request_id_value,
+                                commit=False,
+                            )
+                            return True
+
+                        finalize_attempted = True
+                        if not self._binding_fence_service.finalize_in_transaction(
+                            sublease, db.session, _bind,
+                        ):
+                            raise AssetIngestError(
+                                '绑定围栏租约已失效', stage='database',
+                            )
+                        results_by_index[index] = result_box['result']
+            except Exception as exc:
+                if lease is not None:
+                    if not finalize_attempted:
+                        self.abort_after_outer_rollback(lease)
+                    else:
+                        exc.binding_fence_lease = lease
+                raise
+        ordered_results = [
+            results_by_index[index]
+            for index in range(len(source_relative_paths))
+        ]
+        return ordered_results, lease
 
     def ingest_one(
         self,
@@ -158,9 +482,21 @@ class ImageAssetIngestService:
 
         ``commit=False`` 时只 flush，事务由调用方统一提交或回滚；Product
         multipart 请求借此保证商品字段和多张图片全有或全无。
+
+        注入 ``control_session_factory`` 且 ``commit=False`` 时走 caller-owned
+        分支：围栏经独立 control session 获取与续期，绑定写入调用方事务，
+        服务不开启、不提交、不回滚调用方事务；租约随结果返回，外层回滚后
+        由调用方 ``abort_after_outer_rollback`` 释放。
         """
         if not source_relative_path:
             raise ValueError('来源相对路径不能为空')
+
+        if self._control_session_factory is not None and not commit:
+            return self._ingest_one_caller_owned(
+                source_relative_path,
+                model_number=model_number,
+                request_id=request_id,
+            )
 
         location = self._source.resolve_location()
         try:
@@ -179,6 +515,10 @@ class ImageAssetIngestService:
                     return prepared_or_existing
 
                 prepared = prepared_or_existing
+                self._activate_single_binding_lease(prepared)
+                self._write_prepared_objects(prepared)
+                if prepared.binding_lease is not None:
+                    self._settle_binding_session()
                 vector_values = prepared.vector_values
                 if vector_values is None:
                     try:
@@ -195,15 +535,115 @@ class ImageAssetIngestService:
                         ) from exc
                     vector_values = self._vector_values(vector)
                     prepared.stages['embedding'] = 'new'
-
-                return self._persist(
-                    prepared,
-                    vector_values,
-                    commit=commit,
-                )
+                if prepared.binding_lease is not None:
+                    if not self._binding_fence_service.renew(
+                        prepared.binding_lease, lease_seconds=300,
+                    ):
+                        raise AssetIngestError('绑定围栏租约已失效', stage='database')
+                    result_box = {}
+                    if not self._binding_fence_service.final_bind(
+                        prepared.binding_lease,
+                        bind=lambda: result_box.setdefault(
+                            'result', self._persist(prepared, vector_values, commit=False)
+                        ),
+                    ):
+                        raise AssetIngestError('绑定围栏租约已失效', stage='database')
+                    return result_box['result']
+                return self._persist(prepared, vector_values, commit=commit)
         except Exception:
+            if 'prepared' in locals() and prepared.binding_lease is not None:
+                self._binding_fence_service.session.rollback()
+                self._binding_fence_service.release(prepared.binding_lease, reason='failed')
             if commit:
                 db.session.rollback()
+            raise
+
+    def _ingest_one_caller_owned(
+        self,
+        source_relative_path: str,
+        *,
+        model_number: Optional[str],
+        request_id: Optional[str],
+    ) -> AssetIngestResult:
+        """caller-owned 时序：prepare → acquire_prewrite → 写 OSS → renew → finalize。
+
+        围栏生命周期只经 ``control_session_factory`` 的独立短事务驱动；
+        绑定写入 ``db.session`` 的调用方事务（finalize_in_transaction），
+        本方法不调用 ``_settle_binding_session``，也不提交或回滚调用方事务。
+        """
+        if self._binding_fence_service is None:
+            raise ValueError('caller-owned 入库要求注入绑定围栏服务')
+
+        location = self._source.resolve_location()
+        lease = None
+        finalize_attempted = False
+        try:
+            with tempfile.TemporaryDirectory(prefix='image-asset-') as temp_dir:
+                prepared = self._prepare_one(
+                    source_relative_path,
+                    location=location,
+                    temp_dir=Path(temp_dir),
+                    item_index=0,
+                    model_number=model_number,
+                    content_cache={},
+                    stages={},
+                )
+                if isinstance(prepared, AssetIngestResult):
+                    return prepared
+
+                self._assert_bindable(prepared.oss_path, prepared.preview_oss_path)
+                lease = self._binding_fence_service.acquire_prewrite(
+                    self._binding_identities(
+                        ((prepared.oss_path, prepared.preview_oss_path),),
+                    ),
+                    owner_kind='asset_ingest',
+                    control_session_factory=self._control_session_factory,
+                )
+                self._write_prepared_objects(prepared)
+                vector_values = prepared.vector_values
+                if vector_values is None:
+                    try:
+                        vector = self._embedding.embed_normalized_image(
+                            str(prepared.preview_path),
+                            request_id=request_id,
+                        )
+                    except EmbeddingServiceError:
+                        raise
+                    except Exception as exc:
+                        raise AssetIngestError(
+                            f'Embedding 失败: {type(exc).__name__}',
+                            stage='embedding',
+                        ) from exc
+                    vector_values = self._vector_values(vector)
+                    prepared.stages['embedding'] = 'new'
+                if not self._binding_fence_service.renew_prewrite(
+                    lease,
+                    control_session_factory=self._control_session_factory,
+                    lease_seconds=300,
+                ):
+                    raise AssetIngestError('绑定围栏租约已失效', stage='database')
+                result_box: dict[str, AssetIngestResult] = {}
+
+                def _bind() -> bool:
+                    result_box['result'] = self._persist(
+                        prepared, vector_values, commit=False,
+                    )
+                    return True
+
+                finalize_attempted = True
+                if not self._binding_fence_service.finalize_in_transaction(
+                    lease, db.session, _bind,
+                ):
+                    raise AssetIngestError('绑定围栏租约已失效', stage='database')
+                return replace(result_box['result'], binding_lease=lease)
+        except Exception as exc:
+            # finalize 一旦开始，调用方事务可能已持有围栏行锁；此时服务不越权
+            # 释放，把租约挂到异常上由 caller 边界回滚后回收（或租约到期接管）。
+            if lease is not None:
+                if not finalize_attempted:
+                    self.abort_after_outer_rollback(lease)
+                else:
+                    exc.binding_fence_lease = lease
             raise
 
     def queue_one(
@@ -216,6 +656,13 @@ class ImageAssetIngestService:
         """验证并写入私有对象后持久排队，不在请求内生成 embedding。"""
         if not source_relative_path:
             raise ValueError('来源相对路径不能为空')
+
+        if self._control_session_factory is not None:
+            return self._queue_one_with_control_lease(
+                source_relative_path,
+                request_id=request_id,
+                commit=commit,
+            )
 
         location = self._source.resolve_location()
         try:
@@ -239,12 +686,34 @@ class ImageAssetIngestService:
                     )
                     self._commit_if_requested(commit)
                     return result
+                if prepared_or_existing.source_path is not None:
+                    self._activate_single_binding_lease(prepared_or_existing)
+                    self._write_prepared_objects(prepared_or_existing)
+                if prepared_or_existing.binding_lease is not None:
+                    self._settle_binding_session()
+                    result_box = {}
+                    if not self._binding_fence_service.final_bind(
+                        prepared_or_existing.binding_lease,
+                        bind=lambda: result_box.setdefault(
+                            'result', self._persist_import_item(
+                                prepared_or_existing,
+                                request_id=request_id or uuid.uuid4().hex,
+                                commit=False,
+                            ),
+                        ),
+                    ):
+                        raise AssetIngestError('绑定围栏租约已失效', stage='database')
+                    return result_box['result']
                 return self._persist_import_item(
                     prepared_or_existing,
                     request_id=request_id or uuid.uuid4().hex,
                     commit=commit,
                 )
         except Exception:
+            if 'prepared_or_existing' in locals() and isinstance(prepared_or_existing, _PreparedAsset):
+                if prepared_or_existing.binding_lease is not None:
+                    self._binding_fence_service.session.rollback()
+                    self._binding_fence_service.release(prepared_or_existing.binding_lease, reason='failed')
             if commit:
                 db.session.rollback()
             raise
@@ -426,6 +895,12 @@ class ImageAssetIngestService:
         request_id: Optional[str],
     ) -> list[AssetIngestResult]:
         """处理一个已限制大小的端到端批次。"""
+        if self._control_session_factory is not None:
+            return self._ingest_batch_with_control_lease(
+                source_relative_paths,
+                model_number=model_number,
+                request_id=request_id,
+            )
         location = self._source.resolve_location()
         results: list[Optional[AssetIngestResult]] = [
         None
@@ -464,6 +939,22 @@ class ImageAssetIngestService:
                         exc,
                         stages=item_stages[index],
                     )
+
+            chunk_lease = self._activate_chunk_binding_lease(
+                tuple(prepared_items.values())
+            )
+            for index, prepared in tuple(prepared_items.items()):
+                prepared.binding_lease = chunk_lease
+                try:
+                    self._write_prepared_objects(prepared)
+                except Exception as exc:
+                    results[index] = self._failure_result(
+                        prepared.source_relative_path, exc, prepared=prepared,
+                    )
+                    prepared_items.pop(index)
+
+            if chunk_lease is not None:
+                self._settle_binding_session()
 
             vectors_by_hash: dict[str, list[float]] = {}
             representatives: list[_PreparedAsset] = []
@@ -532,10 +1023,17 @@ class ImageAssetIngestService:
                 first_for_hash.add(prepared.content_hash)
 
                 try:
-                    results[index] = self._persist(
-                        prepared,
-                        vector_values,
-                        commit=True,
+                    result_box = {}
+                    if chunk_lease is not None and not self._binding_fence_service.final_bind(
+                        chunk_lease,
+                        bind=lambda: result_box.setdefault(
+                            'result', self._persist(prepared, vector_values, commit=False)
+                        ),
+                        release=False,
+                    ):
+                        raise AssetIngestError('绑定围栏租约已失效', stage='database')
+                    results[index] = result_box.get('result') or self._persist(
+                        prepared, vector_values, commit=True,
                     )
                 except Exception as exc:
                     db.session.rollback()
@@ -545,7 +1043,344 @@ class ImageAssetIngestService:
                         prepared=prepared,
                     )
 
+            if chunk_lease is not None:
+                self._binding_fence_service.release(chunk_lease, reason='completed')
+
         return [result for result in results if result is not None]
+
+    def _ingest_batch_with_control_lease(
+        self,
+        source_relative_paths: Sequence[str],
+        *,
+        model_number: Optional[str],
+        request_id: Optional[str],
+    ) -> list[AssetIngestResult]:
+        """``ingest_many`` 的 chunk-owner control-factory 变体。
+
+        整批一次 ``acquire_prewrite`` 完整去重 identity 集（独立 control session）；
+        对象写入与单次 ``embed_normalized_images`` 批量调用保持既有语义；逐 item
+        ``finalize_in_transaction`` 在 ``db.session`` 上绑定并提交，只释放该 item 的
+        独占 original 与最后一个 consumer 的 preview；批末剩余围栏经 control session
+        清扫释放（reason ``failed``），对象为重试保留、不删除。
+        """
+        if self._binding_fence_service is None:
+            raise ValueError('control-factory 批量入库要求注入绑定围栏服务')
+        location = self._source.resolve_location()
+        results: list[Optional[AssetIngestResult]] = [
+            None
+        ] * len(source_relative_paths)
+        prepared_items: dict[int, _PreparedAsset] = {}
+        content_cache: dict[str, _PreparedAsset] = {}
+        item_stages: list[dict[str, str]] = [
+            {} for _ in source_relative_paths
+        ]
+
+        with tempfile.TemporaryDirectory(prefix='image-assets-batch-') as temp_dir:
+            temp_root = Path(temp_dir)
+            for index, relative_path in enumerate(source_relative_paths):
+                try:
+                    prepared_or_existing = self._prepare_one(
+                        relative_path,
+                        location=location,
+                        temp_dir=temp_root,
+                        item_index=index,
+                        model_number=model_number,
+                        content_cache=content_cache,
+                        stages=item_stages[index],
+                    )
+                    if isinstance(prepared_or_existing, AssetIngestResult):
+                        results[index] = prepared_or_existing
+                    else:
+                        prepared_items[index] = prepared_or_existing
+                        content_cache.setdefault(
+                            prepared_or_existing.content_hash,
+                            prepared_or_existing,
+                        )
+                except Exception as exc:
+                    db.session.rollback()
+                    results[index] = self._failure_result(
+                        relative_path,
+                        exc,
+                        stages=item_stages[index],
+                    )
+
+            chunk_lease = None
+            released_fence_ids: set = set()
+            try:
+                if prepared_items:
+                    chunk_lease = self._binding_fence_service.acquire_prewrite(
+                        self._binding_identities(tuple(
+                            (prepared.oss_path, prepared.preview_oss_path)
+                            for prepared in prepared_items.values()
+                        )),
+                        owner_kind='asset_ingest',
+                        control_session_factory=self._control_session_factory,
+                    )
+                for index, prepared in tuple(prepared_items.items()):
+                    try:
+                        self._write_prepared_objects(prepared)
+                    except Exception as exc:
+                        results[index] = self._failure_result(
+                            prepared.source_relative_path, exc, prepared=prepared,
+                        )
+                        prepared_items.pop(index)
+
+                vectors_by_hash: dict[str, list[float]] = {}
+                representatives: list[_PreparedAsset] = []
+                for prepared in prepared_items.values():
+                    if prepared.vector_values is not None:
+                        vectors_by_hash[prepared.content_hash] = (
+                            prepared.vector_values
+                        )
+                        continue
+                    if not any(
+                        item.content_hash == prepared.content_hash
+                        for item in representatives
+                    ):
+                        representatives.append(prepared)
+                if representatives:
+                    try:
+                        vectors = self._embedding.embed_normalized_images(
+                            [str(item.preview_path) for item in representatives],
+                            request_id=request_id,
+                        )
+                    except Exception:
+                        vectors = [None] * len(representatives)
+                else:
+                    vectors = []
+                vector_errors: dict[str, Exception] = {}
+                for prepared, vector in zip(representatives, vectors):
+                    if vector is None:
+                        continue
+                    try:
+                        vectors_by_hash[prepared.content_hash] = (
+                            self._vector_values(vector)
+                        )
+                    except Exception as exc:
+                        # 一条损坏/错维向量只能让对应内容失败，不能终止同批其余项。
+                        vector_errors[prepared.content_hash] = (
+                            exc
+                            if isinstance(exc, AssetIngestError)
+                            else AssetIngestError(
+                                f'Embedding 向量格式无效: {type(exc).__name__}',
+                                stage='embedding',
+                            )
+                        )
+
+                if chunk_lease is not None and prepared_items:
+                    if not self._binding_fence_service.renew_prewrite(
+                        chunk_lease,
+                        control_session_factory=self._control_session_factory,
+                        lease_seconds=300,
+                    ):
+                        for index, prepared in prepared_items.items():
+                            results[index] = self._failure_result(
+                                prepared.source_relative_path,
+                                AssetIngestError(
+                                    '绑定围栏租约已失效', stage='database',
+                                ),
+                                prepared=prepared,
+                            )
+                        prepared_items = {}
+                    else:
+                        self._bind_chunk_items(
+                            chunk_lease,
+                            prepared_items,
+                            vectors_by_hash,
+                            vector_errors,
+                            results,
+                            released_fence_ids,
+                        )
+            finally:
+                if chunk_lease is not None:
+                    remaining = [
+                        (identity, fence_id)
+                        for identity, fence_id in zip(
+                            chunk_lease.identities, chunk_lease.fence_ids,
+                        )
+                        if fence_id not in released_fence_ids
+                    ]
+                    if remaining:
+                        self.abort_after_outer_rollback(
+                            BindingFenceLease(
+                                owner_token=chunk_lease.owner_token,
+                                owner_generation=chunk_lease.owner_generation,
+                                fence_ids=tuple(
+                                    fence_id for _, fence_id in remaining
+                                ),
+                                identities=tuple(
+                                    identity for identity, _ in remaining
+                                ),
+                            ),
+                        )
+
+        return [result for result in results if result is not None]
+
+    def _bind_chunk_items(
+        self,
+        chunk_lease: BindingFenceLease,
+        prepared_items: dict[int, _PreparedAsset],
+        vectors_by_hash: dict[str, list[float]],
+        vector_errors: dict[str, Exception],
+        results: list[Optional[AssetIngestResult]],
+        released_fence_ids: set,
+    ) -> None:
+        """chunk 租约下的逐 item 绑定：original 随 item 释放，preview 等最后 consumer。"""
+        preview_remaining: dict[ObjectIdentity, int] = {}
+        for prepared in prepared_items.values():
+            preview_identity = ObjectIdentity(
+                self._formal_bucket, prepared.preview_oss_path,
+            )
+            preview_remaining[preview_identity] = (
+                preview_remaining.get(preview_identity, 0) + 1
+            )
+        first_for_hash: set[str] = set()
+        for index, prepared in prepared_items.items():
+            preview_identity = ObjectIdentity(
+                self._formal_bucket, prepared.preview_oss_path,
+            )
+            vector_values = vectors_by_hash.get(prepared.content_hash)
+            if vector_values is None:
+                preview_remaining[preview_identity] -= 1
+                results[index] = self._failure_result(
+                    prepared.source_relative_path,
+                    vector_errors.get(prepared.content_hash) or AssetIngestError(
+                        'Embedding 未返回可用向量',
+                        stage='embedding',
+                    ),
+                    prepared=prepared,
+                )
+                continue
+
+            if prepared.stages.get('embedding') != 'reused':
+                prepared.stages['embedding'] = (
+                    'new'
+                    if prepared.content_hash not in first_for_hash
+                    else 'reused'
+                )
+            first_for_hash.add(prepared.content_hash)
+            preview_remaining[preview_identity] -= 1
+            release_identities = [
+                ObjectIdentity(self._formal_bucket, prepared.oss_path),
+            ]
+            if preview_remaining[preview_identity] == 0:
+                release_identities.append(preview_identity)
+            try:
+                sublease = ObjectBindingFenceService.sublease(
+                    chunk_lease, tuple(release_identities),
+                )
+                result_box: dict[str, AssetIngestResult] = {}
+
+                def _bind():
+                    result_box['result'] = self._persist(
+                        prepared, vector_values, commit=False,
+                    )
+                    return True
+
+                if not self._binding_fence_service.finalize_in_transaction(
+                    sublease, db.session, _bind,
+                ):
+                    raise AssetIngestError(
+                        '绑定围栏租约已失效', stage='database',
+                    )
+                self._commit_if_requested(True)
+                released_fence_ids.update(sublease.fence_ids)
+                results[index] = result_box['result']
+            except Exception as exc:
+                db.session.rollback()
+                results[index] = self._failure_result(
+                    prepared.source_relative_path,
+                    exc,
+                    prepared=prepared,
+                )
+
+    def _queue_one_with_control_lease(
+        self,
+        source_relative_path: str,
+        *,
+        request_id: Optional[str],
+        commit: bool,
+    ) -> ImageImportQueueResult:
+        """``queue_one`` 的 control-factory 变体：单 item 租约经独立 control session。"""
+        if self._binding_fence_service is None:
+            raise ValueError('control-factory 排队入库要求注入绑定围栏服务')
+        location = self._source.resolve_location()
+        with tempfile.TemporaryDirectory(prefix='image-import-') as temp_dir:
+            prepared = self._prepare_one(
+                source_relative_path,
+                location=location,
+                temp_dir=Path(temp_dir),
+                item_index=0,
+                model_number=None,
+                content_cache={},
+                stages={},
+            )
+            if isinstance(prepared, AssetIngestResult):
+                result = ImageImportQueueResult(
+                    status=prepared.status,
+                    item_id=None,
+                    asset_id=prepared.asset_id,
+                    source_relative_path=source_relative_path,
+                    recovery_action=prepared.recovery_action,
+                )
+                self._commit_if_requested(commit)
+                return result
+
+            lease = None
+            finalize_attempted = False
+            try:
+                if prepared.source_path is not None:
+                    lease = self._binding_fence_service.acquire_prewrite(
+                        self._binding_identities(
+                            ((prepared.oss_path, prepared.preview_oss_path),),
+                        ),
+                        owner_kind='asset_ingest',
+                        control_session_factory=self._control_session_factory,
+                    )
+                    self._write_prepared_objects(prepared)
+                if lease is not None and not self._binding_fence_service.renew_prewrite(
+                    lease,
+                    control_session_factory=self._control_session_factory,
+                    lease_seconds=300,
+                ):
+                    raise AssetIngestError(
+                        '绑定围栏租约已失效', stage='database',
+                    )
+                if lease is None:
+                    return self._persist_import_item(
+                        prepared,
+                        request_id=request_id or uuid.uuid4().hex,
+                        commit=commit,
+                    )
+                result_box: dict[str, ImageImportQueueResult] = {}
+
+                def _bind():
+                    result_box['result'] = self._persist_import_item(
+                        prepared,
+                        request_id=request_id or uuid.uuid4().hex,
+                        commit=False,
+                    )
+                    return True
+
+                finalize_attempted = True
+                if not self._binding_fence_service.finalize_in_transaction(
+                    lease, db.session, _bind,
+                ):
+                    raise AssetIngestError(
+                        '绑定围栏租约已失效', stage='database',
+                    )
+                self._commit_if_requested(commit)
+                return replace(result_box['result'], binding_lease=lease)
+            except Exception as exc:
+                if lease is not None:
+                    if not finalize_attempted:
+                        self.abort_after_outer_rollback(lease)
+                    elif commit:
+                        db.session.rollback()
+                        self.abort_after_outer_rollback(lease)
+                    else:
+                        exc.binding_fence_lease = lease
+                raise
 
     def _prepare_one(
         self,
@@ -630,20 +1465,13 @@ class ImageAssetIngestService:
 
         cached = content_cache.get(content_hash)
         if cached is not None:
-            original_status = self._ensure_original_from_metadata(
-                original_key,
-                source_path,
-                location=location,
-                content_hash=content_hash,
-                actual_size=actual_size,
-                source_mime_type=cached.source_mime_type,
-            )
             stages.update({
-                'original': original_status,
                 'preview': 'reused',
                 'embedding': 'reused',
             })
             return _PreparedAsset(
+                source_path=source_path,
+                location=location,
                 source_relative_path=source_relative_path,
                 source_bucket=location.source_bucket,
                 model_number=model_number,
@@ -656,6 +1484,7 @@ class ImageAssetIngestService:
                 oss_path=original_key,
                 preview_oss_path=cached.preview_oss_path,
                 preview_path=cached.preview_path,
+                normalized=None,
                 vector_values=cached.vector_values,
                 stages=stages,
             )
@@ -673,25 +1502,13 @@ class ImageAssetIngestService:
                     stage='preview',
                     kind='oss_conflict',
                 )
-            original_status = self._ensure_original_from_metadata(
-                original_key,
-                source_path,
-                location=location,
-                content_hash=content_hash,
-                actual_size=actual_size,
-                source_mime_type=reusable.source_mime_type,
-            )
-            stages['original'] = original_status
-            self._validate_preview_metadata(
-                preview_key,
-                content_hash=content_hash,
-                normalization_version=reusable.normalization_version,
-            )
             stages.update({
                 'preview': 'reused',
                 'embedding': 'reused',
             })
             return _PreparedAsset(
+                source_path=source_path,
+                location=location,
                 source_relative_path=source_relative_path,
                 source_bucket=location.source_bucket,
                 model_number=model_number,
@@ -704,6 +1521,7 @@ class ImageAssetIngestService:
                 oss_path=original_key,
                 preview_oss_path=preview_key,
                 preview_path=None,
+                normalized=None,
                 vector_values=list(reusable.vector),
                 stages=stages,
             )
@@ -718,24 +1536,11 @@ class ImageAssetIngestService:
                 stage='preview',
             ) from exc
 
-        original_status = self._ensure_original(
-            original_key,
-            source_path,
-            location=location,
-            content_hash=content_hash,
-            actual_size=actual_size,
-            normalized=normalized,
-        )
-        stages['original'] = original_status
-        preview_status = self._ensure_preview(
-            preview_key,
-            content_hash=content_hash,
-            normalized=normalized,
-        )
-        stages['preview'] = preview_status
         preview_path = temp_dir / f'preview-{item_index}.jpg'
         preview_path.write_bytes(normalized.data)
         return _PreparedAsset(
+            source_path=source_path,
+            location=location,
             source_relative_path=source_relative_path,
             source_bucket=location.source_bucket,
             model_number=model_number,
@@ -748,9 +1553,99 @@ class ImageAssetIngestService:
             oss_path=original_key,
             preview_oss_path=preview_key,
             preview_path=preview_path,
+            normalized=normalized,
             vector_values=None,
             stages=stages,
         )
+
+    def _assert_bindable(self, original_key: str, preview_key: str) -> None:
+        if self._fence_service is None:
+            return
+        self._fence_service.assert_bindable((
+            ObjectIdentity(self._formal_bucket, original_key),
+            ObjectIdentity(self._formal_bucket, preview_key),
+        ))
+
+    def _acquire_binding_lease(self, original_key: str, preview_key: str):
+        self._assert_bindable(original_key, preview_key)
+        if self._binding_fence_service is None:
+            return None
+        session = self._binding_fence_service.session
+        state_session = session() if callable(session) else session
+        if state_session.in_transaction():
+            if state_session.new or state_session.dirty or state_session.deleted:
+                raise AssetIngestError(
+                    '绑定围栏要求在干净事务边界获取', stage='database',
+                )
+            session.commit()
+        return self._binding_fence_service.acquire(
+            self._binding_identities(((original_key, preview_key),)),
+            owner_kind='asset_ingest', lease_seconds=300,
+        )
+
+    def _activate_chunk_binding_lease(self, prepared_items) -> object:
+        if self._binding_fence_service is None or not prepared_items:
+            return None
+        pairs = tuple(
+            (prepared.oss_path, prepared.preview_oss_path)
+            for prepared in prepared_items
+        )
+        self._settle_binding_session()
+        return self._binding_fence_service.acquire(
+            self._binding_identities(pairs),
+            owner_kind='asset_ingest', lease_seconds=300,
+        )
+
+    def _binding_identities(self, pairs):
+        return tuple(
+            ObjectIdentity(self._formal_bucket, key)
+            for pair in pairs for key in pair
+        )
+
+    def _activate_single_binding_lease(self, prepared: _PreparedAsset) -> None:
+        prepared.binding_lease = self._acquire_binding_lease(
+            prepared.oss_path, prepared.preview_oss_path,
+        )
+
+    def _write_prepared_objects(self, prepared: _PreparedAsset) -> None:
+        self._assert_bindable(prepared.oss_path, prepared.preview_oss_path)
+        if prepared.normalized is not None:
+            prepared.stages['original'] = self._ensure_original(
+                prepared.oss_path,
+                prepared.source_path,
+                location=prepared.location,
+                content_hash=prepared.content_hash,
+                actual_size=prepared.source_size,
+                normalized=prepared.normalized,
+            )
+            prepared.stages['preview'] = self._ensure_preview(
+                prepared.preview_oss_path,
+                content_hash=prepared.content_hash,
+                normalized=prepared.normalized,
+            )
+            return
+        prepared.stages['original'] = self._ensure_original_from_metadata(
+            prepared.oss_path,
+            prepared.source_path,
+            location=prepared.location,
+            content_hash=prepared.content_hash,
+            actual_size=prepared.source_size,
+            source_mime_type=prepared.source_mime_type,
+        )
+        self._validate_preview_metadata(
+            prepared.preview_oss_path,
+            content_hash=prepared.content_hash,
+            normalization_version=prepared.normalization_version,
+        )
+        prepared.stages['preview'] = 'reused'
+
+    def _settle_binding_session(self) -> None:
+        session = self._binding_fence_service.session
+        state_session = session() if callable(session) else session
+        if state_session.in_transaction():
+            if state_session.new or state_session.dirty or state_session.deleted:
+                raise AssetIngestError('绑定围栏后存在未预期数据库写入', stage='database')
+            session.commit()
 
     def _persist(
         self,

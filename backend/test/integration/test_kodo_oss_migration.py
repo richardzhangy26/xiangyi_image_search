@@ -7,6 +7,7 @@ import io
 import json
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -228,11 +229,18 @@ def _write_full_authorization(tmp_path, source):
     image_count = len(image_items)
     image_bytes = sum(item['source_size'] for item in image_items)
     total_bytes = sum(len(data) for data in source.objects.values())
+    # 全量授权要求 preflight/dry-run 在过去 24 小时内按序生成；
+    # 报告时间戳必须相对当前时间生成，避免日历推进造成假失败。
+    generated_at = datetime.now().astimezone()
+    report_timestamps = {
+        'preflight': (generated_at - timedelta(minutes=30)).isoformat(),
+        'dry-run': (generated_at - timedelta(minutes=15)).isoformat(),
+    }
     for mode in ('preflight', 'dry-run'):
         report_path = tmp_path / f'{mode}.json'
         report = {
             'status': 'ok',
-            'generated_at': '2026-08-02T10:00:00+08:00',
+            'generated_at': report_timestamps[mode],
             'mode': mode,
             'read_only': True,
             'source': source_binding,

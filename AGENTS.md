@@ -29,7 +29,7 @@ This file provides guidance to AI coding agents (Claude Code, Qoder, etc.) when 
 5. VectorSearchService 只检索 image_assets.status = active 的向量。
 6. API 只返回资产 ID 和 /api/image-assets/<asset_id>/preview；该入口生成短时签名 URL 并返回私有 302，不保存或拼接公开 URL。签名过期时刻按 OSS_SIGNED_URL_TTL_SECONDS 长度的时间窗口对齐，同一资产在窗口内 URL 稳定，302 与 OSS 响应均携带私有 Cache-Control，浏览器在窗口内刷新不重复消耗 OSS 出口流量。
 7. 未归款资产可原地移入回收站并批量恢复；恢复只改变生命周期字段和版本，复用原资产 ID、向量及 OSS 绑定，不重新上传或生成 embedding。
-8. 永久清除 HTTP 控制面默认关闭：未配置 `PURGE_ADMIN_TOKEN` 或证据目录为空时不可用。`pipeline_available()` 只读取 worker 写入的无密钥能力证明（TTL 120 秒），有效能力不能让过期安全门变成就绪。能写 `PURGE_GATE_EVIDENCE_DIR` 即能让安全门报就绪，属主机信任边界。批次流水线在独立 `purge-batch-worker` 中止于 `pending_deletion`，不删除正式对象、资产行或向量。
+8. 永久清除 HTTP 控制面默认关闭：未配置 `PURGE_ADMIN_TOKEN` 或证据目录为空时不可用。`pipeline_available()` 只读取 worker 写入的无密钥能力证明（TTL 120 秒），有效能力不能让过期安全门变成就绪。能写 `PURGE_GATE_EVIDENCE_DIR` 即能让安全门报就绪，属主机信任边界。生产 `purge-batch-worker` 在 `pending_deletion` 中止，正式删除能力保持**硬性关闭**：不加载删除凭证、不组合 `FormalPurgeRepository` 或 deleter。`FormalPurgeRepository` 只作为经过授权快照、租约、检查点和一年期审计的测试/未来 T14 组合 seam；T14 取得人工授权并验证 manifest、副本与 OSS 信任边界前，不得启用正式对象、资产行或向量删除。
 
 product_images 是**未修改的退休兼容表**，不属于新库 schema、应用 ORM 或活动写路径。任何另行授权的兼容迁移前，先运行 python -m scripts.audit_legacy_product_images，根据只读审计结果制作人工迁移清单；本仓库不自动迁移、删除或覆盖它，也不物理清理旧对象。
 
@@ -48,7 +48,8 @@ product_images 是**未修改的退休兼容表**，不属于新库 schema、应
 - backend/blueprints/admin_purge.py - `/api/admin/purge` 准备状态、批次创建/取消/重试/列表与详情。
 - backend/services/purge_batch_control.py - Flask 安全的批次创建/重放/取消/重试/领取；不导入 ops 适配器。
 - backend/services/postgres_reference_snapshot.py - 生产 `PostgresReferenceSnapshotReader`，在只读可重复读事务中枚举 image_assets 与未清除 image_import_items 引用。
-- backend/services/purge_batch_worker.py - 独立 worker 编排恢复点、对象备份与复验；不含删除。
+- backend/services/purge_batch_worker.py - 独立 worker 编排恢复点、对象备份与复验；生产组合不含删除。
+- backend/services/formal_purge.py - 授权快照、逐项检查点、部分失败/重试与 fake-deleter 测试 seam；T13 生产 worker 不组合它。
 - backend/scripts/run_purge_batch_worker.py - 唯一加载 `.env.backup` 并组合 ops 适配器的进程入口。
 - backend/services/vector_search.py - pgvector 检索服务。
 - backend/services/kodo_source.py - Kodo S3 只读对象来源。

@@ -26,6 +26,10 @@ from services.asset_ingest import (
 from services.image_normalizer import ImageNormalizationError
 from services.object_storage import ObjectStorageError, OssObjectStorage
 from services.upload_source import prepare_multipart_source
+from services.fence_composition import (
+    caller_owned_ingest_boundary,
+    request_fence_kwargs,
+)
 
 
 image_imports_bp = Blueprint(
@@ -73,6 +77,7 @@ def _get_ingest_service(source):
         embedding_client=current_app.config.get('IMAGE_INGEST_EMBEDDING'),
         normalizer=current_app.config.get('IMAGE_ASSET_NORMALIZER'),
         source_provider=IMPORT_SOURCE_PROVIDER,
+        **request_fence_kwargs(),
     )
 
 
@@ -110,14 +115,16 @@ def create_image_imports():
     results = []
     try:
         service = _get_ingest_service(source)
-        for relative_path in relative_paths:
-            result = service.queue_one(
-                relative_path,
+        with caller_owned_ingest_boundary(service) as binding_leases:
+            queued_results, chunk_lease = service.queue_many_caller_owned(
+                relative_paths,
                 request_id=request_id,
-                commit=False,
             )
-            results.append(_queue_result_dict(result))
-        db.session.commit()
+            if chunk_lease is not None:
+                binding_leases.append(chunk_lease)
+            for queued_result in queued_results:
+                results.append(_queue_result_dict(queued_result))
+            db.session.commit()
     except AssetIngestConflictError:
         db.session.rollback()
         return _error(

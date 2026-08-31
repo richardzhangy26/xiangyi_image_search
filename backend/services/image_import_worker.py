@@ -23,6 +23,7 @@ from services.embedding import (
     EMBEDDING_MODEL,
     EmbeddingResult,
 )
+from services.purge_object_fence import ObjectIdentity
 
 
 logger = logging.getLogger(__name__)
@@ -326,6 +327,52 @@ def complete_import_item(
     vector: Sequence[float],
     *,
     now: datetime | None = None,
+    binding_fence_service=None,
+    formal_bucket: str | None = None,
+) -> bool | str:
+    """完成提升；可选 binding lease 令最终绑定与 lease release 原子发生。"""
+    if binding_fence_service is None:
+        return _complete_import_item(session, claim, vector, now=now)
+    try:
+        item = session.execute(
+            select(ImageImportItem)
+            .where(ImageImportItem.id == claim.item_id)
+        ).scalar_one_or_none()
+        if item is None or not formal_bucket:
+            session.rollback()
+            return False
+        identities = (
+            ObjectIdentity(formal_bucket, item.oss_path),
+            ObjectIdentity(formal_bucket, item.preview_oss_path),
+        )
+        session.rollback()
+        lease = binding_fence_service.acquire(
+            identities, owner_kind='import_promotion', lease_seconds=300,
+        )
+        result_box = {}
+        succeeded = binding_fence_service.final_bind(
+            lease,
+            bind=lambda: result_box.setdefault(
+                'result', _complete_import_item(
+                    session, claim, vector, now=now, commit=False,
+                ),
+            ),
+        )
+        return result_box.get('result', False) if succeeded else False
+    except Exception:
+        if 'lease' in locals():
+            binding_fence_service.session.rollback()
+            binding_fence_service.release(lease, reason='failed')
+        raise
+
+
+def _complete_import_item(
+    session,
+    claim: ClaimedImportItem,
+    vector: Sequence[float],
+    *,
+    now: datetime | None = None,
+    commit: bool = True,
 ) -> bool | str:
     """在一个事务内建立正式资产并完成仍由本 claim 拥有的任务。
 
@@ -344,7 +391,8 @@ def complete_import_item(
             or item.status != 'embedding'
             or item.claim_token != claim.claim_token
         ):
-            session.rollback()
+            if commit:
+                session.rollback()
             return False
 
         if item.cancel_requested_at is not None:
@@ -354,7 +402,8 @@ def complete_import_item(
                 event_type='image_import.late_result_discarded',
                 now=now,
             )
-            session.commit()
+            if commit:
+                session.commit()
             return 'discarded'
 
         checked_vector = validate_embedding_result(
@@ -404,10 +453,12 @@ def complete_import_item(
             },
             result='completed',
         ))
-        session.commit()
+        if commit:
+            session.commit()
         return True
     except Exception:
-        session.rollback()
+        if commit:
+            session.rollback()
         raise
 
 
@@ -572,8 +623,10 @@ class ImportRepository(Protocol):
 class SqlAlchemyImageImportRepository:
     """把 worker 流程适配到一个 SQLAlchemy session。"""
 
-    def __init__(self, session):
+    def __init__(self, session, *, binding_fence_service=None, formal_bucket=None):
         self._session = session
+        self._binding_fence_service = binding_fence_service
+        self._formal_bucket = formal_bucket
 
     def claim_next(self, *, worker_id: str, lease_seconds: int):
         return claim_next_import_item(
@@ -583,7 +636,11 @@ class SqlAlchemyImageImportRepository:
         )
 
     def complete(self, claim, vector):
-        return complete_import_item(self._session, claim, vector)
+        return complete_import_item(
+            self._session, claim, vector,
+            binding_fence_service=self._binding_fence_service,
+            formal_bucket=self._formal_bucket,
+        )
 
     def fail(self, claim, failure_message, *, error_class=None):
         return mark_import_item_failed(

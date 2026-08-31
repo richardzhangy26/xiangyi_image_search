@@ -2,7 +2,7 @@
 
 ## 范围与默认状态
 
-本手册只描述永久清除批次在 `pending_deletion` 前的备份、复验和恢复证据。它不授权正式对象、资产记录、向量、备份副本或孤儿对象的删除；任何残留恢复点、副本或 orphan 均由管理员人工登记和处置。
+本手册描述永久清除批次的备份、复验、`pending_deletion` 可观测性与当前**硬性关闭**边界。T13 的生产 worker 在 `pending_deletion` 中止：它不加载删除凭证、不组合 `FormalPurgeRepository` 或 deleter，因而不能删除正式对象、资产记录或向量。`FormalPurgeRepository` 仅是有授权快照、逐项检查点、部分失败与一年期审计的测试/未来组合 seam；任何残留恢复点、副本或 orphan 仍由管理员人工登记和处置。
 
 `purge-batch-worker` 是唯一加载 `backend/.env.backup` 的应用容器，也是唯一写入 worker 能力证明的容器。Flask、常规图片导入 worker、cleanup 和 frontend 不得加载该文件或其 ops 凭证。
 
@@ -22,6 +22,10 @@
 ## 人工处置边界
 
 `PURGE_BACKUP_RETENTION_EXPIRED` 表示恢复点或对象副本保留证据缺失/到期。该批次不得重试；只能取消后以新批次 ID、新 `Idempotency-Key` 和新确认重新开始。后续正式删除前仍须在写入 fence、锁或等效串行化边界重新核对完整引用与保留期；本仓库不自动清理任何恢复点、对象副本或 orphan。
+
+## T14 正式删除启用前提
+
+T14 是唯一可改变正式删除硬关闭状态的人工授权点。启用前必须验证每项 canonical manifest 成员身份、备份副本与保留期、正式对象身份、完整引用、对象 binding/deletion fence 和 OSS 无外部覆盖信任边界；还必须提供专用最小权限删除凭证。未完成这些现场验证时，禁止向 `purge-batch-worker` 注入删除凭证、deleter 或任何启用证据。
 
 ## Worker 运行时
 

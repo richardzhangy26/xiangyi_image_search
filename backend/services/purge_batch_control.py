@@ -19,7 +19,7 @@ from sqlalchemy.exc import IntegrityError
 
 IDEMPOTENCY_KEY_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$')
 _CANCELLABLE_STATUSES = {
-    'queued', 'database_backup', 'object_backup', 'verifying', 'failed',
+    'queued', 'database_backup', 'object_backup', 'verifying', 'pending_deletion', 'failed',
 }
 
 
@@ -169,13 +169,50 @@ class PurgeBatchControlService:
                 return self._replay_or_conflict(existing, fingerprint)
             self.session.rollback()
             raise
+
+    def advance_verified_to_pending_if_current(self, batch_id, *, authorizations, manifest_sha256):
+        """Only complete verified item authorizations may enter pending_deletion."""
+        from models import ImageAsset, PurgeBatch, PurgeBatchItem
+
+        try:
+            batch = self.session.execute(
+                select(PurgeBatch).where(PurgeBatch.id == batch_id, PurgeBatch.status == 'verifying').with_for_update()
+            ).scalar_one_or_none()
+            if batch is None or batch.object_manifest_sha256 != manifest_sha256:
+                raise ValueError('verified batch/manifest mismatch')
+            items = self.session.execute(
+                select(PurgeBatchItem).where(PurgeBatchItem.batch_id == batch.id).order_by(PurgeBatchItem.ordinal).with_for_update()
+            ).scalars().all()
+            if set(authorizations) != {item.target_asset_id for item in items}:
+                raise ValueError('incomplete item authorization')
+            for item in items:
+                asset = self.session.execute(
+                    select(ImageAsset).where(ImageAsset.id == item.target_asset_id, ImageAsset.status == 'archived').with_for_update()
+                ).scalar_one_or_none()
+                auth = authorizations[item.target_asset_id]
+                required = ('original_formal_key', 'original_backup_object_id', 'original_backup_sha256', 'preview_formal_key', 'authorization_retain_until')
+                if asset is None or any(not auth.get(field) for field in required):
+                    raise ValueError('incomplete item authorization')
+                if asset.oss_path != auth['original_formal_key'] or asset.preview_oss_path != auth['preview_formal_key']:
+                    raise ValueError('asset identity mismatch')
+                for field, value in auth.items():
+                    if hasattr(item, field):
+                        setattr(item, field, value)
+                item.status = 'pending'
+                item.checkpoint = 'pending'
+            batch.status = 'pending_deletion'
+            self.session.commit()
+            return True
+        except Exception:
+            self.session.rollback()
+            raise
         except Exception:
             self.session.rollback()
             raise
 
     def cancel(self, batch_id, *, actor_id: str, request_id: str):
         batch = self._locked_batch(batch_id, actor_id)
-        if batch.status not in _CANCELLABLE_STATUSES:
+        if batch.status not in _CANCELLABLE_STATUSES or (batch.status == 'pending_deletion' and batch.deleting_at is not None):
             self.session.rollback()
             raise PurgeBatchStateError('批次当前不可取消', error_code='PURGE_BATCH_NOT_CANCELLABLE')
         batch.status = 'cancelled'

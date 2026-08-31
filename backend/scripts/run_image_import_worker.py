@@ -15,6 +15,8 @@ from services.image_import_worker import (
     ImageImportWorker,
     SqlAlchemyImageImportRepository,
 )
+from services.object_binding_fence import ObjectBindingFenceService
+from services.purge_object_fence import PurgeObjectFenceService
 from services.object_storage import OssObjectStorage
 
 
@@ -40,7 +42,14 @@ def main():
     app = create_app()
     with app.app_context():
         worker = ImageImportWorker(
-            repository=SqlAlchemyImageImportRepository(db.session),
+            repository=SqlAlchemyImageImportRepository(
+                db.session,
+                binding_fence_service=ObjectBindingFenceService(
+                    db.session,
+                    purge_fence_service=PurgeObjectFenceService(db.session),
+                ),
+                formal_bucket=os.getenv('OSS_BUCKET_NAME'),
+            ),
             storage=OssObjectStorage.from_env(),
             embedding_client=EmbeddingClient(),
             worker_id=worker_id,
@@ -55,4 +64,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

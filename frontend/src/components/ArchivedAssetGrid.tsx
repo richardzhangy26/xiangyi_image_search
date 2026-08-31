@@ -290,13 +290,16 @@ export function ArchivedAssetGrid({
               {batches.map((batch) => (
                 <div key={batch.batch_id}>
                   <div>{`批次 ${batch.status}`}</div>
+                  <div>{`已完成 ${batch.completed_count ?? 0} · 失败 ${batch.failed_count ?? 0} · 待处理 ${batch.pending_count ?? 0}`}</div>
+                  {batch.cancellable === false && <div>批次已不可取消</div>}
                   {batch.error_code && <div>{batch.error_code}</div>}
                   {batch.items.map((item) => (
                     <div key={item.asset_id}>
                       {item.error_code || item.result_code || item.status}
+                      {` · ${item.next_action}`}
                     </div>
                   ))}
-                  {batch.status !== 'pending_deletion' && batch.status !== 'cancelled' && (
+                  {batch.cancellable !== false && (
                     <Button
                       aria-label="取消批次"
                       onClick={() => void submitCancel(batch.batch_id)}

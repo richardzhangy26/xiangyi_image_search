@@ -19,7 +19,13 @@ def test_import_api_has_persistent_create_list_and_detail_routes():
     assert "@image_imports_bp.get('/<uuid:item_id>')" in source
     assert "request.files.getlist('images')" in source
     assert 'MAX_IMPORT_FILES = 20' in source
-    assert 'service.queue_one(' in source
+    # #19 合同意图：创建路由必须经持久队列服务（不是同步 ingest）。#27 允许
+    # 请求级 chunk-owner 入口 queue_many_caller_owned（工厂未注入时逐图委托
+    # queue_one），两种入口都必须继续落到 image_import_items 持久队列。
+    assert (
+        'service.queue_one(' in source
+        or 'service.queue_many_caller_owned(' in source
+    )
     assert "status_code = 202 if queued_count else 200" in source
     assert 'unresolved_count' in source
     assert 'processing_count' in source

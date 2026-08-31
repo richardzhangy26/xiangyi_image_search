@@ -380,6 +380,9 @@ export type PurgeBatchStatus =
   | 'object_backup'
   | 'verifying'
   | 'pending_deletion'
+  | 'deleting'
+  | 'partial_failure'
+  | 'completed'
   | 'failed'
   | 'cancelled';
 
@@ -393,10 +396,11 @@ export const POLLABLE_PURGE_BATCH_STATUSES: PurgeBatchStatus[] = [
 
 export interface PurgeBatchItemDto {
   asset_id: string;
-  status: PurgeBatchStatus;
+  status: string;
   result_code: string | null;
   error_code: string | null;
   checkpoint_at: string | null;
+  next_action?: 'retry_item' | 'awaiting_protection' | 'none' | 'in_progress';
 }
 
 export interface PurgeBatchDto {
@@ -409,6 +413,10 @@ export interface PurgeBatchDto {
   completed_at?: string | null;
   failed_at?: string | null;
   cancelled_at?: string | null;
+  completed_count?: number;
+  failed_count?: number;
+  pending_count?: number;
+  cancellable?: boolean;
   items: PurgeBatchItemDto[];
 }
 

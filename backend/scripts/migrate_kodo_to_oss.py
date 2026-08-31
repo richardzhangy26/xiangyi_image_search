@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from services.asset_ingest import ImageAssetIngestService
 from services.embedding import MAX_BATCH_SIZE, EmbeddingClient
 from services.kodo_config import KodoConfig, KodoConfigError
+from services.fence_composition import binding_fence_kwargs
 from services.kodo_migration import (
     MigrationError,
     MigrationOptions,
@@ -371,6 +372,7 @@ def main(
             storage=storage,
             embedding_client=embedding_factory(environment),
             oss_image_base_prefix=validated_prefix,
+            **binding_fence_kwargs(environment),
         )
 
     try:

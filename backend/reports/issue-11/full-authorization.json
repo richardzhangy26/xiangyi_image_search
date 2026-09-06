@@ -1,0 +1,14 @@
+{
+  "issue_9_url": "https://github.com/richardzhangy26/xiangyi_image_search/issues/9",
+  "issue_10_evidence_url": "https://github.com/richardzhangy26/xiangyi_image_search/issues/10#issuecomment-5154798535",
+  "user_approval_url": "https://github.com/richardzhangy26/xiangyi_image_search/issues/10#issuecomment-5154732806",
+  "database_backup_reference": "image_search-before-full-20260802T105500+0800.sql sha256=b2e57b74b9342c197b646de013d5926fc426433308141520495e940c3f848e0d",
+  "preflight_report": {
+    "path": "preflight-full.json",
+    "sha256": "3066a89865450a9e71c6578bf471fff1255437f757af129482ebf28449be13be"
+  },
+  "dry_run_report": {
+    "path": "dry-run-full.json",
+    "sha256": "eccf8683858bffc6629035dadc31e4becb671b4344423a939b77f71255965f37"
+  }
+}

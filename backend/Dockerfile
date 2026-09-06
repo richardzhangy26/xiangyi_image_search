@@ -25,7 +25,7 @@ RUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 # -------------------------------------------------------------------
 
 # 生产阶段 - 精简镜像
-FROM python:3.11-slim
+FROM python:3.11-slim AS backend-runtime
 
 WORKDIR /app
 
@@ -37,12 +37,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# 创建非 root 用户运行应用
+# 创建非 root 用户运行应用（uploads/data 被 .dockerignore 排除，需显式 chown 给 appuser）
 RUN useradd -m -s /bin/bash -u 1000 appuser && \
     mkdir -p /app/data/product_search/images \
              /app/data/product_search/db \
              /app/data/product_search/index \
-             /app/uploads
+             /app/uploads && \
+    chown -R appuser:appuser /app/data /app/uploads
 
 # 复制应用代码并直接赋予正确的所有权，避免额外 chown
 COPY --chown=appuser:appuser . /app
@@ -68,3 +69,17 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
 # 使用 Gunicorn 运行生产环境应用
 # 由於 PATH 已經設定，系統會自動找到 /opt/venv/bin/gunicorn
 CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "4", "--threads", "2", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-", "app:app"]
+
+FROM backend-runtime AS purge-batch-worker-runtime
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-16 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app/purge-evidence /var/lib/purge-batch-worker \
+    && chown -R appuser:appuser /app/purge-evidence /var/lib/purge-batch-worker \
+    && chmod 0755 /app/scripts/purge_batch_worker_entrypoint.sh
+ENTRYPOINT ["/app/scripts/purge_batch_worker_entrypoint.sh"]
+CMD ["python", "-m", "scripts.run_purge_batch_worker"]

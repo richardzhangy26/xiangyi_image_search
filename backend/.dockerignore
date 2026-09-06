@@ -19,6 +19,7 @@ var/
 .installed.cfg
 *.egg
 .env
+.env.backup
 .venv
 venv/
 ENV/

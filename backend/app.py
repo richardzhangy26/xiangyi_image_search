@@ -1,21 +1,28 @@
+import logging
 import os
 from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file
 
-from flask import Flask, send_from_directory, request, jsonify, abort
+from flask import Flask, send_from_directory, jsonify, abort
 from flask_cors import CORS
 from pathlib import Path
 from models import db
+from blueprints.admin_purge import admin_purge_bp
+from blueprints.image_assets import image_assets_bp
+from blueprints.image_imports import image_imports_bp
 from blueprints.products_v2 import products_v2_bp  # 新版本
 from product_search import ImageSearchService
-# 数据库配置（优先使用 Supabase，否则回退到本地 PostgreSQL）
-# Supabase 提供两种连接方式:
-# - DIRECT_URL: 直连数据库（适用于迁移、长事务）
-# - DATABASE_URL: 连接池方式（推荐用于应用运行时，性能更好）
-SUPABASE_DIRECT_URL = os.getenv('DIRECT_URL')
-SUPABASE_DATABASE_URL = os.getenv('DATABASE_URL')
+from services.admin_auth import AdminAuth
+from services.purge_safety_gate import FileGateEvidenceSource, PurgeSafetyGate
+from services.purge_pipeline_capability import (
+    FilePurgePipelineCapabilitySource,
+    UnavailablePurgePipelineCapabilitySource,
+)
+from services.fence_composition import validate_formal_writer_deployment
+# 数据库配置（本地 PostgreSQL + pgvector）
+# 优先使用 DATABASE_URL 完整连接串，否则由 DB_* 环境变量拼接
+DATABASE_URL = os.getenv('DATABASE_URL')
 
-# 本地 PostgreSQL 配置（作为回退选项）
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
     'port': int(os.getenv('DB_PORT', 5432)),
@@ -24,58 +31,62 @@ DB_CONFIG = {
     'password': os.getenv('DB_PASSWORD', ''),
 }
 def create_app(config_name='development'):
+    # 配置结构化日志：services/ 下模块级 logger 继承 root logger 的默认级别
+    # （WARNING），若不显式配置，logger.info(...)（如 vector.search.success）
+    # 永远不会被输出。basicConfig 本身是幂等的——若 root 已有 handler 则
+    # 不生效，这是当前唯一的日志配置点，不存在冲突。
+    logging.basicConfig(
+        level=os.getenv('LOG_LEVEL', 'INFO'),
+        format='%(asctime)s %(levelname)s %(name)s %(message)s',
+    )
+
+    # T14 fail-closed deployment gate: if any environment claims formal
+    # deletion is deployed, every HTTP formal-object writer must fence before
+    # the Flask app can even start accepting requests.
+    validate_formal_writer_deployment(os.environ)
+
     app = Flask(__name__)
-    
+
     # 根据配置类型设置配置
     if config_name == 'testing':
         app.config['TESTING'] = True
         app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
     else:
-        # 优先使用 Supabase 连接池（DATABASE_URL）
-        # 如果不存在，则使用直连（DIRECT_URL）
-        # 最后回退到本地 PostgreSQL
-        if SUPABASE_DATABASE_URL:
-            app.config['SQLALCHEMY_DATABASE_URI'] = SUPABASE_DATABASE_URL
-            app.logger.info("使用 Supabase 连接池 (DATABASE_URL)")
-        elif SUPABASE_DIRECT_URL:
-            app.config['SQLALCHEMY_DATABASE_URI'] = SUPABASE_DIRECT_URL
-            app.logger.info("使用 Supabase 直连 (DIRECT_URL)")
+        # 优先使用 DATABASE_URL，否则用 DB_* 配置拼接本地 PostgreSQL 连接
+        if DATABASE_URL:
+            app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+            app.logger.info("使用 DATABASE_URL 连接 PostgreSQL")
         else:
-            # 回退到本地 PostgreSQL
             app.config['SQLALCHEMY_DATABASE_URI'] = (
                 f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@"
                 f"{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
             )
             app.logger.info(f"使用本地 PostgreSQL: {DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}")
     
-    # 配置CORS
+    # 配置CORS（内网工具，允许任意来源：支持 Vite 开发端口、Docker 80 端口及局域网 IP 访问）
     CORS(app, resources={
         r"/*": {
-            "origins": [
-                "http://localhost:5173", 
-            ],
+            "origins": "*",
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+            "allow_headers": ["Content-Type", "Authorization", "X-Requested-With", "Idempotency-Key"],
             "expose_headers": ["Content-Range", "X-Content-Range"],
-            "supports_credentials": True,
             "max_age": 3600
         }
-    }, supports_credentials=True)
+    })
     
     # 基础配置
-    app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uploads')
     app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-    app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    # 签名 URL 过期时刻按该值长度的时间窗口对齐；窗口同时决定浏览器对
+    # 302 跳转和 OSS 响应的私有缓存时长。
+    app.config['OSS_SIGNED_URL_TTL_SECONDS'] = int(
+        os.getenv('OSS_SIGNED_URL_TTL_SECONDS', '3600')
+    )
     app.config['DATASET_ROOT'] = os.getenv(
         'DATASET_ROOT',
         os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', '摄像师拍摄素材')
     )
     
-    # 确保上传目录存在
-    if not app.config['TESTING']:
-        os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'product_images'), exist_ok=True)
-
     # 初始化扩展
     db.init_app(app)
 
@@ -86,14 +97,29 @@ def create_app(config_name='development'):
         app.config['PRODUCT_SEARCH_SERVICE'] = search_service
         app.logger.info("ImageSearchService 初始化完成 (Stateless)")
     
+    evidence_dir = os.getenv("PURGE_GATE_EVIDENCE_DIR")
+    app.config["ADMIN_AUTH"] = AdminAuth(
+        os.getenv("PURGE_ADMIN_TOKEN"),
+        actor_id=os.getenv("PURGE_ADMIN_ACTOR_ID", "admin"),
+    )
+    app.config["PURGE_SAFETY_GATE"] = PurgeSafetyGate(
+        FileGateEvidenceSource(Path(evidence_dir) if evidence_dir else None)
+    )
+    pipeline_evidence_dir = os.getenv("PURGE_PIPELINE_EVIDENCE_DIR")
+    app.config["PURGE_PIPELINE_CAPABILITY_SOURCE"] = (
+        FilePurgePipelineCapabilitySource(
+            Path(pipeline_evidence_dir) / 'purge_batch_worker.json'
+        )
+        if pipeline_evidence_dir
+        else UnavailablePurgePipelineCapabilitySource()
+    )
+
     # 注册蓝图（使用新版本 products_v2）
     app.register_blueprint(products_v2_bp)
+    app.register_blueprint(image_assets_bp)
+    app.register_blueprint(image_imports_bp)
+    app.register_blueprint(admin_purge_bp)
     
-    # 添加静态文件路由
-    @app.route('/uploads/<path:filename>')
-    def serve_upload(filename):
-        return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
     @app.route('/dataset-images/<path:filename>')
     def serve_dataset_image(filename):
         dataset_root = app.config.get('DATASET_ROOT')

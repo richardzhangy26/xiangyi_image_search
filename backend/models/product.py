@@ -1,6 +1,5 @@
 from . import db
 from datetime import datetime
-from pgvector.sqlalchemy import Vector
 
 class Product(db.Model):
     """电子产品配件模型（相机肩带、挂绳等）"""
@@ -83,51 +82,3 @@ class Product(db.Model):
                 setattr(product, key, value)
 
         return product
-
-
-class ProductImage(db.Model):
-    """产品图片模型，存储产品图片路径和向量表示"""
-    __tablename__ = 'product_images'
-
-    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    model_number = db.Column(db.String(100), db.ForeignKey('products.model_number', ondelete='CASCADE'), nullable=False, comment='关联产品型号')
-    image_path = db.Column(db.String(255), nullable=False, unique=True, comment='Web访问路径')
-    vector = db.Column(Vector(1024), nullable=False, comment='1024维图像向量')
-    original_path = db.Column(db.Text, nullable=True, comment='文件系统原始路径')
-    oss_path = db.Column(db.Text, nullable=True, comment='OSS云存储路径')
-    image_order = db.Column(db.Integer, default=0, comment='图片排序')
-    is_primary = db.Column(db.Boolean, default=False, comment='是否主图')
-    created_at = db.Column(db.DateTime, default=datetime.now, comment='创建时间')
-
-    # 建立与Product的关系
-    product = db.relationship('Product', backref=db.backref('images', lazy=True, cascade='all, delete-orphan'))
-
-    def __repr__(self):
-        return f'<ProductImage {self.id} for Product {self.model_number}>'
-
-    def to_dict(self):
-        """将图片信息转换为字典，用于API响应"""
-        return {
-            'id': self.id,
-            'model_number': self.model_number,
-            'image_path': self.image_path,
-            'original_path': self.original_path,
-            'oss_path': self.oss_path,
-            'image_order': self.image_order,
-            'is_primary': self.is_primary,
-            'created_at': self.created_at.isoformat() if self.created_at else None
-        }
-
-    @staticmethod
-    def from_dict(data):
-        """从字典创建图片对象"""
-        image = ProductImage()
-
-        for key, value in data.items():
-            if key == 'id':
-                continue  # 跳过id字段，让数据库自动生成
-
-            if hasattr(image, key) and value is not None:
-                setattr(image, key, value)
-
-        return image

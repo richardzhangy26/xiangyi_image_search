@@ -1,3 +1,5 @@
+/// <reference types="vitest/config" />
+
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
@@ -18,5 +20,11 @@ export default defineConfig({
     host: '0.0.0.0', // 预览模式也支持局域网访问
     port: 4173,
     strictPort: true,
+  },
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./src/test/setup.ts'],
+    globals: true,
+    css: true,
   },
 });

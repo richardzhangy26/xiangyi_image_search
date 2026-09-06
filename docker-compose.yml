@@ -1,25 +1,22 @@
 services:
-  # MySQL 数据库
+  # PostgreSQL 数据库（内置 pgvector 扩展，支持向量搜索）
   db:
-    build:
-      context: ./mysql
-      dockerfile: Dockerfile
-    image: fashion-crm-db:latest
+    image: pgvector/pgvector:pg16
     container_name: fashion-crm-db
     environment:
-      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
-      MYSQL_DATABASE: ${DB_NAME}
-      MYSQL_CHARACTER_SET_SERVER: utf8mb4
-      MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-image_search}
       TZ: Asia/Shanghai
     ports:
-      - "127.0.0.1:3307:3306"
+      # 宿主机映射到 5433，避免与本机已安装的 PostgreSQL(5432) 冲突
+      - "127.0.0.1:5433:5432"
     volumes:
-      - mysql_data:/var/lib/mysql
-      - ./mysql/conf.d:/etc/mysql/conf.d
-    command: --default-authentication-plugin=mysql_native_password
+      - postgres_data:/var/lib/postgresql/data
+      # 首次启动时自动执行初始化 SQL（建扩展/建表/建索引）
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_PASSWORD}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-image_search}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -33,27 +30,31 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      target: backend-runtime
     image: fashion-crm-backend:latest
     container_name: fashion-crm-backend
+    # 应用凭证由被 Git/Docker build context 忽略的 backend/.env 注入；
+    # 下方容器数据库地址显式覆盖其中面向宿主机的 localhost:5433。
+    env_file:
+      - ./backend/.env
     environment:
-      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DB_HOST=db
-      - DB_PORT=3306
-      - DB_NAME=${DB_NAME}
-      - DB_USER=root
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-image_search}
+      - DB_USER=${DB_USER:-postgres}
       - DB_PASSWORD=${DB_PASSWORD}
-      - OSS_ACCESS_KEY_ID=${OSS_ACCESS_KEY_ID}
-      - OSS_ACCESS_KEY_SECRET=${OSS_ACCESS_KEY_SECRET}
-      - OSS_ENDPOINT=${OSS_ENDPOINT}
-      - OSS_BUCKET_NAME=${OSS_BUCKET_NAME}
       - FLASK_ENV=production
+      - PURGE_GATE_EVIDENCE_DIR=/app/purge-gate-evidence
+      - PURGE_PIPELINE_EVIDENCE_DIR=/app/purge-evidence
       - TZ=Asia/Shanghai
     ports:
       - "0.0.0.0:5000:5000"
     volumes:
-      - ./backend/uploads:/app/uploads
       - ./backend/data:/app/data
+      # 五项安全门由部署侧证据发布者维护；应用只读。
+      - purge_gate_evidence:/app/purge-gate-evidence:ro
+      # 专用清除 worker 写能力证明；Flask 只读并按 TTL 失效关闭。
+      - purge_pipeline_evidence:/app/purge-evidence:ro
     depends_on:
       db:
         condition: service_healthy
@@ -66,6 +67,127 @@ services:
     networks:
       - app-network
     restart: unless-stopped
+
+  # PostgreSQL 持久队列 worker；与 HTTP 进程独立，可安全水平扩展。
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: backend-runtime
+    image: fashion-crm-backend:latest
+    container_name: fashion-crm-image-import-worker
+    command: ["python", "-m", "scripts.run_image_import_worker"]
+    env_file:
+      - ./backend/.env
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-image_search}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - TZ=Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # 永久清除批次 worker：唯一可加载 ops 备份凭证的应用容器。
+  # 它读取五项安全门证据，但只写自己的短期能力证明。
+  purge-batch-worker:
+    build:
+      context: ./backend
+      target: purge-batch-worker-runtime
+    image: fashion-crm-purge-batch-worker:latest
+    container_name: fashion-crm-purge-batch-worker
+    command: ["python", "-m", "scripts.run_purge_batch_worker"]
+    env_file:
+      - ./backend/.env.backup
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-image_search}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - PURGE_GATE_EVIDENCE_DIR=/app/purge-gate-evidence
+      - PURGE_PIPELINE_EVIDENCE_DIR=/app/purge-evidence
+      - BACKUP_ROOT=/var/lib/purge-batch-worker/postgres
+      - PURGE_OBJECT_BACKUP_LOCAL_ROOT=/var/lib/purge-batch-worker/object-manifests
+      - TZ=Asia/Shanghai
+    volumes:
+      - purge_gate_evidence:/app/purge-gate-evidence:ro
+      - purge_pipeline_evidence:/app/purge-evidence
+      - purge_batch_worker_state:/var/lib/purge-batch-worker
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # 导入暂存对象清理任务（Issue #22）。
+  # 默认不启动：位于 cleanup profile 之后，且进程自身还要求
+  # IMPORT_CLEANUP_ENABLED=true。真实 OSS 清理启用需单独明确授权。
+  cleanup:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: backend-runtime
+    image: fashion-crm-backend:latest
+    container_name: fashion-crm-import-cleanup
+    command: ["python", "-m", "scripts.run_import_cleanup"]
+    profiles: ["cleanup"]
+    env_file:
+      - ./backend/.env
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME:-image_search}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - IMPORT_CLEANUP_ENABLED=${IMPORT_CLEANUP_ENABLED:-false}
+      - TZ=Asia/Shanghai
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # T14 正式清除 one-shot 组合根。默认 profile 不启动，且当前镜像内
+  # capability 恒 false；不加载应用/备份/删除凭证。后续真实组合必须经
+  # 独立授权与部署 override，不能修改本默认硬关闭合同。
+  formal-purge-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: backend-runtime
+    image: fashion-crm-backend:latest
+    container_name: fashion-crm-formal-purge-worker
+    command: ["python", "-m", "scripts.run_formal_purge_worker"]
+    profiles: ["formal-delete"]
+    environment:
+      - PURGE_FORMAL_DELETION_ENABLED=0
+      - PURGE_FORMAL_HEALTH_PATH=/tmp/formal-purge-health.json
+      - PURGE_FORMAL_ENVIRONMENT_ID=unconfigured
+      - PURGE_FORMAL_BATCH_ID=00000000-0000-0000-0000-000000000000
+      - TZ=Asia/Shanghai
+    # one-shot + restart:no 下容器在恒 false capability 后立即退出，
+    # Compose healthcheck 无法在进程存活期内采集。只读探针是
+    # python -m scripts.check_formal_purge_health --evidence <path>，
+    # 缺 evidence 非 0；不得为此改 restart、启用删除或加载 env file。
+    healthcheck:
+      disable: true
+    networks:
+      - app-network
+    restart: "no"
 
   # React 前端服务
   frontend:
@@ -93,7 +215,15 @@ services:
 
 # 持久化存储卷
 volumes:
-  mysql_data:
+  postgres_data:
+    driver: local
+  # 外部 ops 证据发布者是唯一写者；所有应用服务只读。
+  purge_gate_evidence:
+    driver: local
+  # purge-batch-worker 写能力 heartbeat，Flask 只读。
+  purge_pipeline_evidence:
+    driver: local
+  purge_batch_worker_state:
     driver: local
 
 # 网络配置

@@ -1,0 +1,428 @@
+-- ========================================
+-- 商品图像搜索系统 PostgreSQL 初始化脚本
+-- 由 docker-entrypoint-initdb.d 在数据库首次启动时自动执行
+-- 也可手动执行: psql -U postgres -d image_search -f 01_init.sql
+-- 表结构与 backend/models/product.py 保持一致
+-- ========================================
+
+-- 1) 启用 pgvector 扩展（向量搜索）
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- 2) products 表（电子产品配件主表）
+CREATE TABLE IF NOT EXISTS products (
+    -- 主键和必填字段
+    model_number        VARCHAR(100) PRIMARY KEY,
+    photographer_file   VARCHAR(255) NOT NULL,
+    alibaba_product_url VARCHAR(500) NOT NULL,
+    category            VARCHAR(100) NOT NULL,
+
+    -- 产品参数
+    spec_cn_reference   TEXT,
+    spec_cn             TEXT,
+    spec_en             TEXT,
+    product_size        VARCHAR(200),
+    package_size        VARCHAR(200),
+
+    -- 价格相关（单位：美元）
+    price_1688          NUMERIC(10, 2),
+    fob_price_tier1     NUMERIC(10, 2),
+    fob_price_tier2     NUMERIC(10, 2),
+    fob_price_tier3     NUMERIC(10, 2),
+    intl_platform_price NUMERIC(10, 2),
+    competitor_price    NUMERIC(10, 2),
+
+    -- 参考链接
+    ref_link_1          VARCHAR(500),
+    ref_link_2          VARCHAR(500),
+    ref_link_3          VARCHAR(500),
+    intl_platform_url   VARCHAR(500),
+    intl_platform_url_1 VARCHAR(500),
+    intl_platform_url_2 VARCHAR(500),
+
+    -- 系统字段
+    created_at          TIMESTAMP DEFAULT NOW(),
+    updated_at          TIMESTAMP DEFAULT NOW()
+);
+
+COMMENT ON TABLE products IS '电子产品配件主表（相机肩带、挂绳等）';
+
+-- 3) image_assets 表（独立图片资产，不要求先关联商品）
+CREATE TABLE IF NOT EXISTS image_assets (
+    id                    UUID PRIMARY KEY,
+    model_number          VARCHAR(100) REFERENCES products(model_number) ON DELETE SET NULL,
+    source_provider       VARCHAR(32) NOT NULL,
+    source_bucket         VARCHAR(255) NOT NULL,
+    source_relative_path  TEXT NOT NULL,
+    source_revision       INTEGER NOT NULL DEFAULT 1,
+    display_name        TEXT NOT NULL,
+    version             BIGINT NOT NULL DEFAULT 1,
+    oss_path              TEXT NOT NULL UNIQUE,
+    preview_oss_path      TEXT NOT NULL,
+    content_hash          VARCHAR(64) NOT NULL,
+    source_size           BIGINT NOT NULL,
+    source_mime_type      VARCHAR(100) NOT NULL,
+    source_width          INTEGER NOT NULL,
+    source_height         INTEGER NOT NULL,
+    vector                vector(1024) NOT NULL,
+    embedding_model       VARCHAR(128) NOT NULL,
+    embedding_dimension   SMALLINT NOT NULL,
+    normalization_version VARCHAR(32) NOT NULL,
+    sort_order            INTEGER NOT NULL DEFAULT 0,
+    status                VARCHAR(20) NOT NULL DEFAULT 'active',
+    archived_at           TIMESTAMP,
+    created_at            TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMP NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_image_assets_source_identity UNIQUE (
+        source_provider,
+        source_bucket,
+        source_relative_path,
+        source_revision
+    ),
+    CONSTRAINT ck_image_assets_status CHECK (status IN ('active', 'archived')),
+    CONSTRAINT ck_image_assets_source_revision CHECK (source_revision >= 1),
+    CONSTRAINT ck_image_assets_embedding_dimension CHECK (embedding_dimension = 1024),
+    CONSTRAINT ck_image_assets_version CHECK (version >= 1)
+);
+
+COMMENT ON TABLE image_assets IS '独立图片资产：可无商品型号，源图与预览存放于私有 OSS';
+COMMENT ON COLUMN image_assets.sort_order IS '商品内图片展示顺序；0 即主图，未归款资产无意义';
+
+-- 4) image_import_items 表（持久、可重启的异步 embedding 队列）
+CREATE TABLE IF NOT EXISTS image_import_items (
+    id                           UUID PRIMARY KEY,
+    source_provider              VARCHAR(32) NOT NULL,
+    source_bucket                VARCHAR(255) NOT NULL,
+    source_relative_path         TEXT NOT NULL,
+    source_revision              INTEGER NOT NULL DEFAULT 1,
+    display_name                 TEXT NOT NULL,
+    oss_path                     TEXT NOT NULL,
+    preview_oss_path             TEXT NOT NULL,
+    content_hash                 VARCHAR(64) NOT NULL,
+    source_size                  BIGINT NOT NULL,
+    source_mime_type             VARCHAR(100) NOT NULL,
+    source_width                 INTEGER NOT NULL,
+    source_height                INTEGER NOT NULL,
+    normalization_version        VARCHAR(32) NOT NULL,
+    expected_embedding_model     VARCHAR(128) NOT NULL
+        DEFAULT 'tongyi-embedding-vision-plus-2026-03-06',
+    expected_embedding_dimension SMALLINT NOT NULL DEFAULT 1024,
+    status                       VARCHAR(20) NOT NULL DEFAULT 'queued',
+    attempt_count                INTEGER NOT NULL DEFAULT 0,
+    last_error_class             VARCHAR(32),
+    last_attempt_at              TIMESTAMP,
+    next_retry_at                TIMESTAMP,
+    asset_id                     UUID REFERENCES image_assets(id) ON DELETE SET NULL,
+    request_id                   VARCHAR(64) NOT NULL,
+    claim_token                  UUID,
+    claim_generation             BIGINT NOT NULL DEFAULT 0,
+    claimed_by                   VARCHAR(128),
+    claimed_at                   TIMESTAMP,
+    lease_expires_at             TIMESTAMP,
+    embedding_started_at         TIMESTAMP,
+    completed_at                 TIMESTAMP,
+    failed_at                    TIMESTAMP,
+    failure_message              VARCHAR(512),
+    cancel_requested_at          TIMESTAMP,
+    cancel_requested_by          VARCHAR(128),
+    cancelled_at                 TIMESTAMP,
+    purge_eligible_at            TIMESTAMP,
+    objects_purged_at            TIMESTAMP,
+    created_at                   TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at                   TIMESTAMP NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_image_import_items_source_identity UNIQUE (
+        source_provider,
+        source_bucket,
+        source_relative_path,
+        source_revision
+    ),
+    CONSTRAINT ck_image_import_items_status_v2 CHECK (
+        status IN ('queued', 'embedding', 'completed', 'failed', 'awaiting_retry', 'cancelled', 'abandoned')
+    ),
+    CONSTRAINT ck_image_import_items_attempt_count CHECK (attempt_count >= 0),
+    CONSTRAINT ck_image_import_items_source_revision CHECK (source_revision >= 1),
+    CONSTRAINT ck_image_import_items_embedding_model CHECK (
+        expected_embedding_model = 'tongyi-embedding-vision-plus-2026-03-06'
+    ),
+    CONSTRAINT ck_image_import_items_embedding_dimension CHECK (
+        expected_embedding_dimension = 1024
+    ),
+    CONSTRAINT ck_image_import_items_claim_generation CHECK (claim_generation >= 0)
+);
+
+CREATE OR REPLACE FUNCTION set_image_asset_display_name()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.display_name IS NULL THEN
+        NEW.display_name := regexp_replace(NEW.source_relative_path, '^.*/', '');
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_image_assets_display_name ON image_assets;
+CREATE TRIGGER trg_image_assets_display_name
+    BEFORE INSERT ON image_assets
+    FOR EACH ROW EXECUTE FUNCTION set_image_asset_display_name();
+
+CREATE TABLE IF NOT EXISTS asset_activity_records (
+    id          UUID PRIMARY KEY,
+    event_type  VARCHAR(64) NOT NULL,
+    target_type VARCHAR(32) NOT NULL,
+    target_id   TEXT NOT NULL,
+    request_id  VARCHAR(64) NOT NULL,
+    source      VARCHAR(32) NOT NULL,
+    actor_id    TEXT,
+    batch_id    TEXT,
+    task_id     TEXT,
+    before_state JSONB,
+    after_state  JSONB,
+    result       VARCHAR(32) NOT NULL,
+    error_code   VARCHAR(64),
+    created_at   TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- 5) 永久清除批次（Issue #26；仅到 pending_deletion，不包含删除能力）
+CREATE TABLE IF NOT EXISTS purge_batches (
+    id                         UUID PRIMARY KEY,
+    actor_id                   VARCHAR(128) NOT NULL,
+    idempotency_key            VARCHAR(128) NOT NULL,
+    request_fingerprint_sha256 VARCHAR(64) NOT NULL,
+    confirmation_text          VARCHAR(64) NOT NULL,
+    status                     VARCHAR(24) NOT NULL DEFAULT 'queued',
+    claim_token                UUID,
+    claim_generation           BIGINT NOT NULL DEFAULT 0,
+    claimed_by                 VARCHAR(128),
+    lease_expires_at           TIMESTAMP,
+    database_backup_id         VARCHAR(160),
+    database_manifest_sha256   VARCHAR(64),
+    object_manifest_sha256     VARCHAR(64),
+    retain_until               TIMESTAMP,
+    error_code                 VARCHAR(80),
+    created_at                 TIMESTAMP NOT NULL DEFAULT NOW(),
+    started_at                 TIMESTAMP,
+    completed_at               TIMESTAMP,
+    deleting_at                TIMESTAMP,
+    partial_failure_at         TIMESTAMP,
+    failed_at                  TIMESTAMP,
+    cancelled_at               TIMESTAMP,
+    CONSTRAINT uq_purge_batches_actor_key UNIQUE (actor_id, idempotency_key),
+    CONSTRAINT ck_purge_batches_status CHECK (
+        status IN ('queued', 'database_backup', 'object_backup', 'verifying',
+                   'pending_deletion', 'deleting', 'partial_failure', 'completed',
+                   'failed', 'cancelled')
+    ),
+    CONSTRAINT ck_purge_batches_claim_generation CHECK (claim_generation >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS purge_batch_items (
+    batch_id        UUID NOT NULL REFERENCES purge_batches(id) ON DELETE CASCADE,
+    target_asset_id UUID NOT NULL,
+    ordinal         SMALLINT NOT NULL,
+    status          VARCHAR(24) NOT NULL DEFAULT 'pending',
+    result_code     VARCHAR(80),
+    error_code      VARCHAR(80),
+    checkpoint      VARCHAR(40) NOT NULL DEFAULT 'pending',
+    checkpoint_at   TIMESTAMP,
+    claim_token     UUID,
+    claim_generation BIGINT NOT NULL DEFAULT 0,
+    lease_expires_at TIMESTAMP,
+    original_delete_started_at TIMESTAMP,
+    original_deleted_at TIMESTAMP,
+    preview_delete_started_at TIMESTAMP,
+    preview_deleted_at TIMESTAMP,
+    preview_disposition VARCHAR(40),
+    database_deleted_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    failed_at TIMESTAMP,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    audit_retain_until TIMESTAMP,
+    original_formal_key TEXT,
+    original_backup_object_id VARCHAR(128),
+    original_backup_sha256 VARCHAR(64),
+    preview_formal_key TEXT,
+    preview_backup_object_id VARCHAR(128),
+    preview_backup_sha256 VARCHAR(64),
+    preview_delete_authorized BOOLEAN NOT NULL DEFAULT FALSE,
+    authorization_retain_until TIMESTAMP,
+    formal_bucket VARCHAR(255),
+    PRIMARY KEY (batch_id, target_asset_id),
+    CONSTRAINT ck_purge_batch_items_ordinal CHECK (ordinal >= 0)
+);
+
+-- 6) 索引
+CREATE INDEX IF NOT EXISTS idx_image_assets_content_hash
+    ON image_assets (content_hash);
+
+CREATE INDEX IF NOT EXISTS idx_image_assets_model_number
+    ON image_assets (model_number);
+
+CREATE INDEX IF NOT EXISTS idx_image_assets_status
+    ON image_assets (status);
+
+CREATE INDEX IF NOT EXISTS idx_asset_activity_target_created
+    ON asset_activity_records (target_type, target_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_asset_activity_request_id
+    ON asset_activity_records (request_id);
+
+CREATE INDEX IF NOT EXISTS idx_image_import_items_claim_order
+    ON image_import_items (status, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_image_import_items_lease
+    ON image_import_items (status, lease_expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_image_import_items_retry_schedule
+    ON image_import_items (status, next_retry_at);
+
+CREATE INDEX IF NOT EXISTS idx_image_import_items_purge_schedule
+    ON image_import_items (status, purge_eligible_at);
+
+CREATE INDEX IF NOT EXISTS idx_purge_batches_claim_order
+    ON purge_batches (status, created_at, id);
+
+CREATE INDEX IF NOT EXISTS idx_purge_batches_lease
+    ON purge_batches (status, lease_expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_purge_batch_items_target
+    ON purge_batch_items (target_asset_id, batch_id);
+
+CREATE INDEX IF NOT EXISTS idx_purge_batch_items_claim
+    ON purge_batch_items (status, lease_expires_at, batch_id, ordinal);
+
+CREATE TABLE IF NOT EXISTS object_binding_fences (
+    id UUID PRIMARY KEY,
+    formal_bucket VARCHAR(255) NOT NULL,
+    formal_key TEXT NOT NULL,
+    owner_kind VARCHAR(32) NOT NULL,
+    owner_token UUID NOT NULL,
+    owner_generation BIGINT NOT NULL DEFAULT 0,
+    state VARCHAR(16) NOT NULL DEFAULT 'held',
+    acquired_at TIMESTAMP NOT NULL,
+    lease_expires_at TIMESTAMP NOT NULL,
+    released_at TIMESTAMP,
+    release_reason VARCHAR(32),
+    CONSTRAINT ck_object_binding_fences_owner_kind CHECK (owner_kind IN ('asset_ingest', 'import_promotion', 'import_cleanup')),
+    CONSTRAINT ck_object_binding_fences_state CHECK (state IN ('held', 'released')),
+    CONSTRAINT ck_object_binding_fences_lease_order CHECK (lease_expires_at > acquired_at),
+    CONSTRAINT ck_object_binding_fences_release_state CHECK ((state = 'held' AND released_at IS NULL AND release_reason IS NULL) OR (state = 'released' AND released_at IS NOT NULL AND release_reason IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_object_binding_fences_held_identity
+    ON object_binding_fences (formal_bucket, formal_key) WHERE state = 'held';
+CREATE INDEX IF NOT EXISTS idx_object_binding_fences_owner_expiry
+    ON object_binding_fences (owner_token, state, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_object_binding_fences_identity_expiry
+    ON object_binding_fences (formal_bucket, formal_key, state, lease_expires_at);
+
+CREATE TABLE IF NOT EXISTS purge_object_fences (
+    id UUID PRIMARY KEY,
+    formal_bucket VARCHAR(255) NOT NULL,
+    formal_key TEXT NOT NULL,
+    kind VARCHAR(24) NOT NULL,
+    batch_id UUID NOT NULL,
+    target_asset_id UUID NOT NULL,
+    state VARCHAR(24) NOT NULL DEFAULT 'held',
+    acquired_at TIMESTAMP NOT NULL,
+    released_at TIMESTAMP,
+    audit_retain_until TIMESTAMP NOT NULL,
+    CONSTRAINT ck_purge_object_fences_state CHECK (state IN ('held', 'released'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_purge_object_fences_held_identity
+    ON purge_object_fences (formal_bucket, formal_key) WHERE state = 'held';
+
+CREATE TABLE IF NOT EXISTS purge_item_events (
+    id UUID PRIMARY KEY,
+    batch_id UUID NOT NULL,
+    target_asset_id UUID NOT NULL,
+    event_type VARCHAR(80) NOT NULL,
+    result_code VARCHAR(80),
+    error_code VARCHAR(80),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    audit_retain_until TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS formal_deletion_grant_consumptions (
+    grant_id VARCHAR(128) PRIMARY KEY,
+    batch_id UUID NOT NULL UNIQUE,
+    environment_id VARCHAR(128) NOT NULL,
+    deployment_sha256 VARCHAR(64) NOT NULL,
+    database_manifest_sha256 VARCHAR(64) NOT NULL,
+    object_manifest_sha256 VARCHAR(64) NOT NULL,
+    formal_bucket VARCHAR(255) NOT NULL,
+    asset_scope_sha256 VARCHAR(64) NOT NULL,
+    max_assets SMALLINT NOT NULL,
+    max_object_deletes SMALLINT NOT NULL,
+    used_object_deletes SMALLINT NOT NULL DEFAULT 0,
+    issued_at TIMESTAMP NOT NULL,
+    expires_at TIMESTAMP NOT NULL,
+    consumed_at TIMESTAMP NOT NULL,
+    state VARCHAR(16) NOT NULL DEFAULT 'active',
+    trust_attestation_sha256 VARCHAR(64) NOT NULL,
+    audit_retain_until TIMESTAMP NOT NULL,
+    CONSTRAINT ck_formal_deletion_grant_state CHECK (state IN ('active', 'closed', 'expired')),
+    CONSTRAINT ck_formal_deletion_grant_max_assets CHECK (max_assets BETWEEN 1 AND 20),
+    CONSTRAINT ck_formal_deletion_grant_max_deletes CHECK (max_object_deletes BETWEEN 1 AND 40),
+    CONSTRAINT ck_formal_deletion_grant_used_deletes CHECK (used_object_deletes >= 0 AND used_object_deletes <= max_object_deletes),
+    CONSTRAINT ck_formal_deletion_grant_time_order CHECK (expires_at > issued_at)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_formal_deletion_grant_batch
+    ON formal_deletion_grant_consumptions (batch_id);
+CREATE INDEX IF NOT EXISTS idx_formal_deletion_grant_expiry
+    ON formal_deletion_grant_consumptions (state, expires_at);
+
+CREATE TABLE IF NOT EXISTS formal_delete_call_permits (
+    id UUID PRIMARY KEY,
+    grant_id VARCHAR(128) NOT NULL REFERENCES formal_deletion_grant_consumptions(grant_id),
+    batch_id UUID NOT NULL,
+    target_asset_id UUID NOT NULL,
+    operation_kind VARCHAR(16) NOT NULL,
+    claim_generation BIGINT NOT NULL,
+    formal_bucket VARCHAR(255) NOT NULL,
+    formal_key TEXT NOT NULL,
+    object_size BIGINT NOT NULL,
+    object_sha256 VARCHAR(64) NOT NULL,
+    object_etag TEXT NOT NULL,
+    original_fence_id UUID NOT NULL,
+    preview_fence_id UUID NOT NULL,
+    state VARCHAR(16) NOT NULL DEFAULT 'issued',
+    issued_at TIMESTAMP NOT NULL,
+    executing_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    cancelled_at TIMESTAMP,
+    expires_at TIMESTAMP NOT NULL,
+    result_code VARCHAR(80),
+    audit_retain_until TIMESTAMP NOT NULL,
+    CONSTRAINT uq_formal_delete_permit_item_operation UNIQUE (batch_id, target_asset_id, operation_kind),
+    CONSTRAINT ck_formal_delete_permit_operation CHECK (operation_kind IN ('original', 'preview')),
+    CONSTRAINT ck_formal_delete_permit_state CHECK (state IN ('issued', 'executing', 'completed', 'cancelled')),
+    CONSTRAINT ck_formal_delete_permit_object_size CHECK (object_size > 0),
+    CONSTRAINT ck_formal_delete_permit_time_order CHECK (expires_at > issued_at),
+    CONSTRAINT ck_formal_delete_permit_state_times CHECK (
+        (state = 'issued' AND executing_at IS NULL AND completed_at IS NULL AND cancelled_at IS NULL) OR
+        (state = 'executing' AND executing_at IS NOT NULL AND completed_at IS NULL AND cancelled_at IS NULL) OR
+        (state = 'completed' AND executing_at IS NOT NULL AND completed_at IS NOT NULL AND cancelled_at IS NULL) OR
+        (state = 'cancelled' AND executing_at IS NULL AND completed_at IS NULL AND cancelled_at IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_formal_delete_permit_grant_state
+    ON formal_delete_call_permits (grant_id, state);
+CREATE INDEX IF NOT EXISTS idx_formal_delete_permit_batch_item
+    ON formal_delete_call_permits (batch_id, target_asset_id, operation_kind);
+
+CREATE INDEX IF NOT EXISTS idx_image_assets_vector_active_hnsw
+    ON image_assets
+    USING hnsw (vector vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+    WHERE status = 'active';
+
+-- 7) 帮助优化器选用索引
+ANALYZE products;
+ANALYZE image_assets;
+ANALYZE image_import_items;
+ANALYZE purge_batches;
+ANALYZE purge_batch_items;

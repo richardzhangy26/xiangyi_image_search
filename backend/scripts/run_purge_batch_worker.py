@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import signal
 import socket
@@ -21,6 +22,9 @@ from services.postgres_backup import (
 from services.postgres_reference_snapshot import PostgresReferenceSnapshotReader
 from services.purge_batch_control import PurgeBatchControlService
 from services.purge_batch_worker import PostgresRestorePointGate, PurgeBatchWorker
+from services.purge_formal_authorization import (
+    build_formal_purge_authorization_bundle,
+)
 from services.purge_object_backup import (
     PurgeObjectBackupConfig,
     PurgeObjectBackupManifest,
@@ -259,12 +263,21 @@ def _build_worker(
         local_manifest = Path(object_root).expanduser().resolve() / backup_id / 'objects' / 'manifest.json'
         if not local_manifest.is_file():
             raise FileNotFoundError('object-copy manifest missing')
-        manifest = PurgeObjectBackupManifest.from_dict(json.loads(local_manifest.read_bytes()))
+        manifest_bytes = local_manifest.read_bytes()
+        manifest = PurgeObjectBackupManifest.from_dict(json.loads(manifest_bytes))
         if _retain_until_from_object_manifest(manifest) <= datetime.now(timezone.utc):
             raise FileNotFoundError('object-copy retention expired')
         object_restore.verify_copies(manifest)
         object_backup.revalidate_current_candidates(manifest)
-        return 'pending_deletion'
+        bundle = build_formal_purge_authorization_bundle(
+            manifest,
+            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+            now=datetime.now(timezone.utc),
+        )
+        if str(bundle.purge_batch_id) != str(claim.batch_id):
+            raise ValueError('object manifest batch mismatch')
+        repo.advance_verified_to_pending_if_current(bundle)
+        return None
 
     gate_dir = environment.get('PURGE_GATE_EVIDENCE_DIR')
     gate = PurgeSafetyGate(FileGateEvidenceSource(Path(gate_dir) if gate_dir else None))

@@ -18,7 +18,6 @@ def _tree(path):
 
 def test_purge_object_modules_have_no_delete_or_broad_cloud_capabilities():
     forbidden_calls = {
-        "delete_object",
         "delete_objects",
         "batch_delete",
         "sign_url",
@@ -37,6 +36,17 @@ def test_purge_object_modules_have_no_delete_or_broad_cloud_capabilities():
             and isinstance(node.func, ast.Attribute)
         }
         assert called.isdisjoint(forbidden_calls), (path, called & forbidden_calls)
+        if path.name != "purge_object_storage.py":
+            assert "delete_object" not in called, path
+
+    storage_source = (BACKEND / "services" / "purge_object_storage.py").read_text(
+        encoding="utf-8"
+    )
+    assert storage_source.count(".delete_object(") == 1
+    assert "class OssFormalObjectDeleter" in storage_source
+    assert "def from_env" not in storage_source.split(
+        "class OssFormalObjectDeleter", 1
+    )[1]
 
 
 def test_purge_object_modules_are_not_wired_into_app_or_database_models():

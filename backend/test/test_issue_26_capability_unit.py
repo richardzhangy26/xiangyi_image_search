@@ -32,6 +32,20 @@ def test_sensitive_nested_key_or_unexpected_key_fails_closed(tmp_path):
     assert FilePurgePipelineCapabilitySource(path).evaluate(NOW) is False
 
 
+def test_pipeline_capability_rejects_verified_at_beyond_clock_skew(tmp_path):
+    from services.purge_pipeline_capability import FilePurgePipelineCapabilitySource
+
+    path = tmp_path / 'purge_batch_worker.json'
+    verified_at = NOW + timedelta(seconds=61)
+    path.write_text(json.dumps({
+        'schema_version': 1, 'component': 'purge_batch_worker', 'result': 'valid',
+        'verified_at': verified_at.isoformat(),
+        'expires_at': (verified_at + timedelta(seconds=120)).isoformat(),
+        'policy': 'backup_only_no_delete', 'summary': 'future heartbeat',
+    }), encoding='utf-8')
+    assert FilePurgePipelineCapabilitySource(path).evaluate(NOW) is False
+
+
 def test_pipeline_available_delegates_to_app_source_with_unavailable_fallback():
     from services.purge_safety_gate import pipeline_available
 

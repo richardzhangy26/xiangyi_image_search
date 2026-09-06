@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
+import hashlib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO, Mapping, Optional
 
@@ -15,6 +18,43 @@ from .backup_storage import (
 
 class PurgeObjectStorageConfigError(BackupStorageError):
     """对象备份角色凭证缺失或身份复用。"""
+
+
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class FormalObjectObservation:
+    formal_bucket: str
+    formal_key: str
+    size: int
+    sha256: str
+    etag: str
+    observed_at: datetime
+
+    def __post_init__(self):
+        _validate_bucket(self.formal_bucket)
+        _validate_key(self.formal_key)
+        if self.size <= 0 or not _SHA256.fullmatch(self.sha256):
+            raise ValueError("formal object byte identity invalid")
+        if not self.etag or any(ord(character) < 32 for character in self.etag):
+            raise ValueError("formal object etag invalid")
+        if self.observed_at.tzinfo is None:
+            raise ValueError("formal object observation must include timezone")
+
+
+@dataclass(frozen=True)
+class DeletionObservation:
+    result: str
+    before: FormalObjectObservation
+    deleted_at: datetime
+    after_missing: bool
+
+    def __post_init__(self):
+        if self.result not in {"deleted", "already_absent_after_intent"}:
+            raise ValueError("formal deletion result invalid")
+        if self.deleted_at.tzinfo is None or self.after_missing is not True:
+            raise ValueError("formal deletion postcondition invalid")
 
 
 @dataclass(frozen=True)
@@ -225,6 +265,157 @@ class OssPurgeIsolationStorage:
             )
         except Exception as exc:
             raise _safe_storage_error(exc) from None
+
+
+class FormalDeletionError(RuntimeError):
+    def __init__(self, message, *, error_code):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+class OssFormalObjectDeleter:
+    """Injected Head/Get/Delete adapter for the approved no-overwrite model.
+
+    It has no ``from_env`` factory and is not imported by either production
+    composition root.  T14 tests use an in-memory bucket; later authorized
+    deployment work must provide the isolated credential composition.
+    """
+
+    def __init__(
+        self,
+        *,
+        bucket,
+        formal_bucket: str,
+        permit_verifier,
+        clock=None,
+    ):
+        _validate_bucket(formal_bucket)
+        if not callable(permit_verifier):
+            raise ValueError("formal deleter requires persisted permit verifier")
+        self._bucket = bucket
+        self.formal_bucket = formal_bucket
+        self._permit_verifier = permit_verifier
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def observe(self, key: str) -> Optional[FormalObjectObservation]:
+        _validate_key(key)
+        try:
+            head = self._bucket.head_object(key)
+        except Exception as exc:
+            if getattr(exc, "status", None) in {404, "404"}:
+                return None
+            raise FormalDeletionError(
+                "正式对象身份读取失败",
+                error_code="PURGE_OBJECT_IDENTITY_MISMATCH",
+            ) from None
+        headers = getattr(head, "headers", {}) or {}
+        size = getattr(head, "content_length", None)
+        if size is None:
+            size = headers.get("Content-Length", headers.get("content-length", 0))
+        etag = headers.get("ETag", headers.get("etag", ""))
+        digest = hashlib.sha256()
+        actual_size = 0
+        try:
+            response = self._bucket.get_object(key)
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                actual_size += len(chunk)
+                digest.update(chunk)
+        except Exception:
+            raise FormalDeletionError(
+                "正式对象字节复验失败",
+                error_code="PURGE_OBJECT_IDENTITY_MISMATCH",
+            ) from None
+        if int(size) != actual_size:
+            raise FormalDeletionError(
+                "正式对象大小复验失败",
+                error_code="PURGE_OBJECT_IDENTITY_MISMATCH",
+            )
+        return FormalObjectObservation(
+            formal_bucket=self.formal_bucket,
+            formal_key=key,
+            size=actual_size,
+            sha256=digest.hexdigest(),
+            etag=str(etag).strip('"'),
+            observed_at=_aware_utc(self._clock()),
+        )
+
+    def delete(self, authorization) -> DeletionObservation:
+        from services.formal_purge import DeleteCallAuthorization
+
+        now = _aware_utc(self._clock())
+        try:
+            verified = self._permit_verifier(authorization)
+        except Exception:
+            verified = None
+        if (
+            not isinstance(verified, DeleteCallAuthorization)
+            or verified.permit_id != getattr(authorization, 'permit_id', None)
+            or verified.grant_id != getattr(authorization, 'grant_id', None)
+        ):
+            raise FormalDeletionError(
+                "持久删除 permit 未通过执行前复验",
+                error_code="PURGE_FORMAL_DELETION_DISABLED",
+            )
+        authorization = verified
+        if (
+            authorization.formal_bucket != self.formal_bucket
+            or authorization.formal_key != authorization.observation.formal_key
+            or _aware_utc(authorization.expires_at) <= now
+        ):
+            raise FormalDeletionError(
+                "正式删除调用授权无效",
+                error_code="PURGE_FORMAL_DELETION_DISABLED",
+            )
+        current = self.observe(authorization.formal_key)
+        if current is None or not _same_object_identity(
+            current, authorization.observation,
+        ):
+            raise FormalDeletionError(
+                "正式对象身份在授权后变化",
+                error_code="PURGE_OBJECT_IDENTITY_MISMATCH",
+            )
+        try:
+            self._bucket.delete_object(authorization.formal_key)
+        except Exception:
+            raise FormalDeletionError(
+                "正式对象删除失败",
+                error_code="PURGE_OBJECT_DELETE_FAILED",
+            ) from None
+        if self.observe(authorization.formal_key) is not None:
+            raise FormalDeletionError(
+                "正式对象删除后仍存在",
+                error_code="PURGE_OBJECT_DELETE_FAILED",
+            )
+        return DeletionObservation(
+            result="deleted",
+            before=current,
+            deleted_at=now,
+            after_missing=True,
+        )
+
+
+def _same_object_identity(left, right):
+    return bool(
+        isinstance(left, FormalObjectObservation)
+        and isinstance(right, FormalObjectObservation)
+        and left.formal_bucket == right.formal_bucket
+        and left.formal_key == right.formal_key
+        and left.size == right.size
+        and left.sha256 == right.sha256
+        and left.etag == right.etag
+    )
+
+
+def _aware_utc(value):
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise FormalDeletionError(
+            "正式删除时钟无效",
+            error_code="PURGE_FORMAL_DELETION_DISABLED",
+        )
+    return value.astimezone(timezone.utc)
 
 
 def _create_bucket(config):

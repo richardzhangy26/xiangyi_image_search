@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -29,13 +29,19 @@ def test_verified_promotion_requires_complete_authorization_for_every_item(tmp_p
 
 
 def _assert_incomplete_promotion():
+    from services.purge_formal_authorization import (
+        FormalPurgeAuthorizationBundle,
+    )
+
     asset = _asset()
     db.session.add(asset)
     db.session.flush()
     batch = PurgeBatch(
         actor_id='a', idempotency_key='key.promote.1', request_fingerprint_sha256='a' * 64,
         confirmation_text='永久删除 1 张', status='verifying',
-        retain_until=datetime.now() + timedelta(days=1), object_manifest_sha256='b' * 64,
+        retain_until=datetime.now() + timedelta(days=1),
+        database_backup_id='purge-test', database_manifest_sha256='c' * 64,
+        object_manifest_sha256='b' * 64,
     )
     item = PurgeBatchItem(batch=batch, target_asset_id=asset.id, ordinal=0, status='queued')
     db.session.add_all([batch, item])
@@ -44,6 +50,13 @@ def _assert_incomplete_promotion():
     service = PurgeBatchControlService(db.session)
     with pytest.raises(ValueError):
         service.advance_verified_to_pending_if_current(
-            batch.id, authorizations={}, manifest_sha256='b' * 64,
+            FormalPurgeAuthorizationBundle(
+                purge_batch_id=batch.id,
+                manifest_sha256='b' * 64,
+                database_backup_id='purge-test',
+                database_manifest_sha256='c' * 64,
+                retain_until=batch.retain_until.replace(tzinfo=timezone.utc),
+                items=(),
+            )
         )
     assert db.session.get(PurgeBatch, batch.id).status == 'verifying'

@@ -15,6 +15,10 @@ from .purge_batch import (
 from .purge_item_event import PurgeItemEvent
 from .purge_object_fence import PurgeObjectFence
 from .object_binding_fence import ObjectBindingFence
+from .formal_delete_permit import (
+    FormalDeleteCallPermit,
+    FormalDeletionGrantConsumption,
+)
 
 __all__ = [
     'db',
@@ -30,4 +34,6 @@ __all__ = [
     'PurgeItemEvent',
     'PurgeObjectFence',
     'ObjectBindingFence',
+    'FormalDeleteCallPermit',
+    'FormalDeletionGrantConsumption',
 ]

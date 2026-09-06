@@ -158,6 +158,11 @@ class PurgeBatchItem(db.Model):
 
     __table_args__ = (
         db.CheckConstraint('ordinal >= 0', name='ck_purge_batch_items_ordinal'),
+        db.Index('idx_purge_batch_items_target', 'target_asset_id', 'batch_id'),
+        db.Index(
+            'idx_purge_batch_items_claim',
+            'status', 'lease_expires_at', 'batch_id', 'ordinal',
+        ),
     )
 
     def to_public_dict(self):

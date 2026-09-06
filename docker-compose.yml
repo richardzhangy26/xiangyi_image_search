@@ -161,6 +161,34 @@ services:
       - app-network
     restart: unless-stopped
 
+  # T14 正式清除 one-shot 组合根。默认 profile 不启动，且当前镜像内
+  # capability 恒 false；不加载应用/备份/删除凭证。后续真实组合必须经
+  # 独立授权与部署 override，不能修改本默认硬关闭合同。
+  formal-purge-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: backend-runtime
+    image: fashion-crm-backend:latest
+    container_name: fashion-crm-formal-purge-worker
+    command: ["python", "-m", "scripts.run_formal_purge_worker"]
+    profiles: ["formal-delete"]
+    environment:
+      - PURGE_FORMAL_DELETION_ENABLED=0
+      - PURGE_FORMAL_HEALTH_PATH=/tmp/formal-purge-health.json
+      - PURGE_FORMAL_ENVIRONMENT_ID=unconfigured
+      - PURGE_FORMAL_BATCH_ID=00000000-0000-0000-0000-000000000000
+      - TZ=Asia/Shanghai
+    # one-shot + restart:no 下容器在恒 false capability 后立即退出，
+    # Compose healthcheck 无法在进程存活期内采集。只读探针是
+    # python -m scripts.check_formal_purge_health --evidence <path>，
+    # 缺 evidence 非 0；不得为此改 restart、启用删除或加载 env file。
+    healthcheck:
+      disable: true
+    networks:
+      - app-network
+    restart: "no"
+
   # React 前端服务
   frontend:
     build:

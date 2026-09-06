@@ -95,3 +95,27 @@ def test_cancelled_batch_allows_existing_restore_behavior(app):
         assert restored.status == 'succeeded'
         assert restored.restored_count == 1
         assert db.session.get(ImageAsset, asset.id).status == 'active'
+
+
+def test_reprotected_partial_failure_no_longer_blocks_restore(app):
+    with app.app_context():
+        asset = _asset()
+        batch = PurgeBatch(
+            actor_id='admin', idempotency_key='key.restore.reprotected',
+            request_fingerprint_sha256='a' * 64,
+            confirmation_text='永久删除 1 张', status='partial_failure',
+        )
+        item = PurgeBatchItem(
+            batch=batch, target_asset_id=asset.id, ordinal=0,
+            status='failed', result_code='reprotected',
+            error_code='PURGE_BACKUP_RETENTION_EXPIRED',
+        )
+        db.session.add_all([asset, batch, item])
+        db.session.commit()
+
+        restored = restore_image_assets(
+            db.session, [str(asset.id)], actor_id='admin', request_id='r3',
+        )
+
+        assert restored.status == 'succeeded'
+        assert db.session.get(ImageAsset, asset.id).status == 'active'

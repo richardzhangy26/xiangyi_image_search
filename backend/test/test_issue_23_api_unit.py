@@ -28,8 +28,8 @@ def _valid_source():
     now = datetime.now(timezone.utc)
     evidence = RawConditionEvidence(
         result="valid",
-        verified_at=now - timedelta(hours=1),
-        expires_at=now + timedelta(hours=12),
+        verified_at=now - timedelta(minutes=30),
+        expires_at=now + timedelta(minutes=30),
         summary="ok",
     )
     return {cid: evidence for cid in CONDITION_IDS}

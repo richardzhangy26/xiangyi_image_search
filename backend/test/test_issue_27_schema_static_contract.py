@@ -122,3 +122,45 @@ def test_public_purge_dto_exposes_only_safe_progress_summary():
     assert 'original_formal_key' not in public_scope
     assert 'preview_formal_key' not in public_scope
     assert 'backup_object_id' not in public_scope
+
+
+def test_issue_28_grant_and_delete_permit_schema_are_additive_and_audited():
+    from models import FormalDeleteCallPermit, FormalDeletionGrantConsumption
+
+    grant_columns = set(FormalDeletionGrantConsumption.__table__.columns.keys())
+    assert {
+        'grant_id', 'batch_id', 'environment_id', 'deployment_sha256',
+        'database_manifest_sha256', 'object_manifest_sha256', 'formal_bucket',
+        'asset_scope_sha256', 'max_assets', 'max_object_deletes',
+        'used_object_deletes', 'issued_at', 'expires_at', 'consumed_at',
+        'state', 'trust_attestation_sha256', 'audit_retain_until',
+    } <= grant_columns
+    permit_columns = set(FormalDeleteCallPermit.__table__.columns.keys())
+    assert {
+        'id', 'grant_id', 'batch_id', 'target_asset_id', 'operation_kind',
+        'claim_generation', 'formal_bucket', 'formal_key', 'object_size',
+        'object_sha256', 'object_etag', 'original_fence_id',
+        'preview_fence_id', 'state', 'issued_at', 'executing_at',
+        'completed_at', 'cancelled_at', 'expires_at', 'result_code',
+        'audit_retain_until',
+    } <= permit_columns
+
+    migration = ' '.join(
+        _read('migrations/issue_28_formal_delete_permits.py').split()
+    )
+    bootstrap = ' '.join(
+        (BACKEND_DIR.parent / 'postgres/init/01_init.sql').read_text(
+            encoding='utf-8'
+        ).split()
+    )
+    for contract in (
+        'CREATE TABLE IF NOT EXISTS formal_deletion_grant_consumptions',
+        'CREATE TABLE IF NOT EXISTS formal_delete_call_permits',
+        'CONSTRAINT uq_formal_delete_permit_item_operation UNIQUE (batch_id, target_asset_id, operation_kind)',
+        "state IN ('active', 'closed', 'expired')",
+        "state IN ('issued', 'executing', 'completed', 'cancelled')",
+        'used_object_deletes <= max_object_deletes',
+        'audit_retain_until TIMESTAMP NOT NULL',
+    ):
+        assert contract in migration
+        assert contract in bootstrap

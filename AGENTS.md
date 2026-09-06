@@ -29,7 +29,7 @@ This file provides guidance to AI coding agents (Claude Code, Qoder, etc.) when 
 5. VectorSearchService 只检索 image_assets.status = active 的向量。
 6. API 只返回资产 ID 和 /api/image-assets/<asset_id>/preview；该入口生成短时签名 URL 并返回私有 302，不保存或拼接公开 URL。签名过期时刻按 OSS_SIGNED_URL_TTL_SECONDS 长度的时间窗口对齐，同一资产在窗口内 URL 稳定，302 与 OSS 响应均携带私有 Cache-Control，浏览器在窗口内刷新不重复消耗 OSS 出口流量。
 7. 未归款资产可原地移入回收站并批量恢复；恢复只改变生命周期字段和版本，复用原资产 ID、向量及 OSS 绑定，不重新上传或生成 embedding。
-8. 永久清除 HTTP 控制面默认关闭：未配置 `PURGE_ADMIN_TOKEN` 或证据目录为空时不可用。`pipeline_available()` 只读取 worker 写入的无密钥能力证明（TTL 120 秒），有效能力不能让过期安全门变成就绪。能写 `PURGE_GATE_EVIDENCE_DIR` 即能让安全门报就绪，属主机信任边界。生产 `purge-batch-worker` 在 `pending_deletion` 中止，正式删除能力保持**硬性关闭**：不加载删除凭证、不组合 `FormalPurgeRepository` 或 deleter。`FormalPurgeRepository` 只作为经过授权快照、租约、检查点和一年期审计的测试/未来 T14 组合 seam；T14 取得人工授权并验证 manifest、副本与 OSS 信任边界前，不得启用正式对象、资产行或向量删除。
+8. 永久清除 HTTP 控制面默认关闭：未配置 `PURGE_ADMIN_TOKEN` 或证据目录为空时不可用。五项证据由消费者限制最大新鲜度（每日备份 26 小时、即时恢复点 60 分钟、对象保护/独立凭证/恢复演练 24 小时）；`pipeline_available()` 只读取 worker 写入的无密钥能力证明（TTL 120 秒），有效能力不能延长安全门证据。能写 `PURGE_GATE_EVIDENCE_DIR` 即能让基础安全门报就绪，属主机信任边界。生产 `purge-batch-worker` 在 `pending_deletion` 中止；独立 `formal-purge-worker` 仅存在于默认不启动的 Compose profile，入口在 capability 前校验 `PURGE_FORMAL_DELETION_DEPLOYED` 与 binding fence 合取，然后只组合恒 false capability，不加载删除凭证、不构造 repository 或 deleter，正式删除保持**硬性关闭**。T14 代码提供 typed manifest 授权、限时批次 grant、活恢复点 loader、围栏/对象身份/检查点与 re-protection seams，但任何真实删除组合、凭证注入、部署或试删仍需逐项人工授权。
 
 product_images 是**未修改的退休兼容表**，不属于新库 schema、应用 ORM 或活动写路径。任何另行授权的兼容迁移前，先运行 python -m scripts.audit_legacy_product_images，根据只读审计结果制作人工迁移清单；本仓库不自动迁移、删除或覆盖它，也不物理清理旧对象。
 
@@ -50,7 +50,15 @@ product_images 是**未修改的退休兼容表**，不属于新库 schema、应
 - backend/services/postgres_reference_snapshot.py - 生产 `PostgresReferenceSnapshotReader`，在只读可重复读事务中枚举 image_assets 与未清除 image_import_items 引用。
 - backend/services/purge_batch_worker.py - 独立 worker 编排恢复点、对象备份与复验；生产组合不含删除。
 - backend/services/formal_purge.py - 授权快照、逐项检查点、部分失败/重试与 fake-deleter 测试 seam；T13 生产 worker 不组合它。
+- backend/services/purge_formal_authorization.py - canonical 对象 manifest 到完整逐项正式清除授权 bundle 的唯一 seam。
+- backend/services/purge_formal_deletion_capability.py - 默认关闭、环境/部署/批次/资产/manifest 绑定且最长 15 分钟的正式删除 grant 读取器。
+- backend/services/purge_delete_trust.py - 围栏 writer inventory 与 IAM 禁覆盖的 no-overwrite trust attestation；不支持 exact-version 模式。
+- backend/services/formal_purge_observability.py - vendor-neutral formal worker 健康证据与脱敏结构化事件。
+- backend/services/purge_schema_manager.py - #27 additive schema 的稳定 plan/check/apply seam；迁移只能显式执行。
 - backend/scripts/run_purge_batch_worker.py - 唯一加载 `.env.backup` 并组合 ops 适配器的进程入口。
+- backend/scripts/run_formal_purge_worker.py - 默认硬关闭的独立 one-shot 入口；当前不会构造正式删除 worker。
+- backend/scripts/manage_purge_schema.py - 显式 schema plan/check/apply CLI；apply 需确认和已审 plan digest。
+- backend/scripts/check_formal_purge_health.py - 只读 formal worker 健康证据检查 CLI。
 - backend/services/vector_search.py - pgvector 检索服务。
 - backend/services/kodo_source.py - Kodo S3 只读对象来源。
 - backend/services/purge_object_backup.py - 永久清除前的完整引用规划、不可覆盖对象备份与 final manifest。
@@ -121,6 +129,8 @@ docker-compose.yml 包含 db、backend、worker、purge-batch-worker、frontend 
 | purge-batch-worker | fashion-crm-purge-batch-worker | 无 | 唯一加载 `.env.backup` 的永久清除备份 worker |
 | frontend | fashion-crm-frontend | 0.0.0.0:80 → 80 | Nginx 静态构建和 API 代理 |
 
+`formal-purge-worker` 是额外的 `formal-delete` profile one-shot 服务，默认不启动、`PURGE_FORMAL_DELETION_ENABLED=0`、不加载任何 env file 或删除凭证；它不属于日常五服务。
+
 - 数据库卷 postgres_data 保存 PostgreSQL 数据。
 - 后端只挂载 ./backend/data:/app/data 供运行时数据使用；正式图片不落盘到容器文件系统，原图和预览均在私有 OSS。
 - postgres/init/*.sql 只在空数据库首次启动时执行，创建扩展、商品表、image_assets 和 HNSW 索引。
@@ -173,7 +183,7 @@ backend/.env（由 .env.example 复制）中的必填项：
 - OSS_ACCESS_KEY_ID、OSS_ACCESS_KEY_SECRET、OSS_ENDPOINT、OSS_BUCKET_NAME - 私有 OSS 原图/预览和签名下载。
 - QINIU_ACCESS_KEY、QINIU_SECRET_KEY、QINIU_BUCKET_NAME、QINIU_REGION - **Kodo 只读迁移来源**，仅供 migrate_kodo_to_oss 的 preflight/迁移读取，绝不生成公开 URL。
 
-可选项：DATABASE_URL、QINIU_S3_BUCKET_NAME、OSS_IMAGE_BASE_PREFIX、OSS_SIGNED_URL_TTL_SECONDS、IMAGE_PREVIEW_MAX_EDGE、IMAGE_PREVIEW_MAX_MB、IMAGE_MAX_PIXELS、IMAGE_NORMALIZATION_VERSION、SEARCH_OVERSAMPLE、LOG_LEVEL、PURGE_ADMIN_TOKEN、PURGE_ADMIN_ACTOR_ID、PURGE_GATE_EVIDENCE_DIR、PURGE_PIPELINE_EVIDENCE_DIR、PURGE_REFERENCE_SNAPSHOT_MAX_AGE_SECONDS。未设置管理员令牌或证据目录时永久清除控制面保持关闭。能力证明 TTL 120 秒、heartbeat 30 秒、引用快照最大时效 60 秒。Docker Compose 会把容器内的数据库地址覆盖为 db:5432。
+可选项：DATABASE_URL、QINIU_S3_BUCKET_NAME、OSS_IMAGE_BASE_PREFIX、OSS_SIGNED_URL_TTL_SECONDS、IMAGE_PREVIEW_MAX_EDGE、IMAGE_PREVIEW_MAX_MB、IMAGE_MAX_PIXELS、IMAGE_NORMALIZATION_VERSION、SEARCH_OVERSAMPLE、LOG_LEVEL、PURGE_ADMIN_TOKEN、PURGE_ADMIN_ACTOR_ID、PURGE_GATE_EVIDENCE_DIR、PURGE_PIPELINE_EVIDENCE_DIR、PURGE_REFERENCE_SNAPSHOT_MAX_AGE_SECONDS、INGEST_BINDING_FENCE_ENABLED、PURGE_FORMAL_DELETION_DEPLOYED。未设置管理员令牌或证据目录时永久清除控制面保持关闭；若声明正式删除已部署而 binding fence 未开启，全部 HTTP 正式对象 writer 构造失败，不回退 legacy。能力证明 TTL 120 秒、heartbeat 30 秒、引用快照最大时效 60 秒。Docker Compose 会把容器内的数据库地址覆盖为 db:5432。
 
 独立 ops 环境 `backend/.env.backup` 还使用 `BACKUP_OSS_*`、`PURGE_SOURCE_OSS_*` 与 `PURGE_RESTORE_OSS_*`。它们只允许注入 `purge-batch-worker`（及独立备份 CLI），不得注入 Flask/Gunicorn、图片导入 worker、cleanup 或 frontend：正式源角色仅 Head/Get，备份角色仅 Put-if-absent/Head/Get，隔离角色仅隔离前缀 Put-if-absent/Head/Get，三类 ops 凭证均不能与应用 `OSS_*` 复用。`PURGE_RESTORE_ISOLATED` 默认必须为 `0`。
 
@@ -258,7 +268,7 @@ python -m pytest test/ \
 
 - 不执行 DROP、DELETE、覆盖上传或云对象清理来“迁移”旧数据；所有收缩动作必须另行授权并可回滚。
 - 图片正式来源始终是私有 OSS，Kodo 只读备份；预览始终经过 /api/image-assets/<asset_id>/preview 的短时签名 302，不在代码中拼接公开对象地址。
-- 回收站只保存 image_assets 的归档状态；恢复不得复制对象、重算向量或更改来源身份。未取消的永久清除批次会阻断恢复（`PURGE_ASSET_RESTORE_BLOCKED`）。自动过期与正式对象删除不属于当前应用能力；备份流水线止于 `pending_deletion`。
+- 回收站只保存 image_assets 的归档状态；恢复不得复制对象、重算向量或更改来源身份。未取消的永久清除批次会阻断恢复（`PURGE_ASSET_RESTORE_BLOCKED`）；唯一例外是过期删除项已用 exact Bucket/Key/SHA-256 证明 re-protected、释放 held fence 并持久标为 `reprotected`。自动过期与正式对象删除仍不属于当前生产能力；备份流水线止于 `pending_deletion`。
 - 图片导入以 source_provider、source_bucket、source_relative_path、source_revision 组成的来源身份去重：相同来源身份和同一内容返回既有结果；同一来源身份但内容不同返回来源冲突且绝不覆盖；命中归档来源身份时返回回收站结果且不自动恢复；不同来源路径即使内容相同也分别创建资产，只允许复用兼容预览和向量。
 - 持久异步图片导入任务只由独立 worker 处理；HTTP 请求内不启动线程或可靠内存队列。瞬时失败按错误分类指数退避自动重试并受尝试预算约束，手工重试、取消与放弃项恢复只改持久状态；当前没有暂存对象清理或永久删除能力。现存 POST /api/image-assets/import 是每请求最多 20 张、无持久任务/自动重试/取消语义的同步兼容入口；该受限例外不得扩展为新的请求内 embedding 入口。
 - 不在应用启动、普通部署或健康检查中隐式运行兼容审计或迁移。

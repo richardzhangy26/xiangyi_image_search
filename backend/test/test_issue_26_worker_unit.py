@@ -67,6 +67,7 @@ class FakeRepo:
         self.advanced = None
         self.error = None
         self.status = 'database_backup'
+        self.promoted_bundle = None
 
     def claim_next(self, **kwargs):
         self.claimed = True
@@ -82,6 +83,10 @@ class FakeRepo:
 
     def record_stale_result(self, claim, **kwargs):
         return None
+
+    def advance_verified_to_pending_if_current(self, bundle):
+        self.promoted_bundle = bundle
+        return True
 
 
 def test_late_result_after_cancel_never_advances_batch():
@@ -171,6 +176,59 @@ def test_build_worker_composes_ops_adapters_and_phase_handlers_from_injected_fac
     assert set(worker.phase_handlers) == {'database_backup', 'object_backup', 'verifying'}
     assert seen == [('backup', 'backup-bucket'), ('source', 'formal-bucket')]
     assert not hasattr(worker, 'isolated_store') or worker.isolated_store is None
+
+
+def test_verifying_phase_promotes_typed_bundle_without_generic_status_advance(
+    monkeypatch, tmp_path,
+):
+    from scripts import run_purge_batch_worker as entry
+
+    environ = _ops_environ(tmp_path)
+    repository = FakeRepo()
+    worker = entry._build_worker(
+        environ,
+        backup_storage_factory=lambda _env: FakeStore(),
+        source_reader_factory=lambda _env: FakeStore(),
+        repository=repository,
+        identities_match=lambda: True,
+    )
+    manifest_path = (
+        Path(environ['PURGE_OBJECT_BACKUP_LOCAL_ROOT'])
+        / 'purge-batch-1'
+        / 'objects'
+        / 'manifest.json'
+    )
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text('{}', encoding='utf-8')
+    manifest = SimpleNamespace(
+        retention={'retain_until': '2099-01-01T00:00:00Z'},
+    )
+    bundle = SimpleNamespace(purge_batch_id='batch-1')
+    monkeypatch.setattr(
+        entry.PurgeObjectBackupManifest,
+        'from_dict',
+        classmethod(lambda _cls, _payload: manifest),
+    )
+    monkeypatch.setattr(
+        entry,
+        'build_formal_purge_authorization_bundle',
+        lambda parsed, **_kwargs: bundle,
+        raising=False,
+    )
+    monkeypatch.setattr(worker.object_restore, 'verify_copies', lambda _manifest: None)
+    monkeypatch.setattr(
+        worker.object_backup,
+        'revalidate_current_candidates',
+        lambda _manifest: None,
+    )
+
+    outcome = worker.phase_handlers['verifying'](
+        Claim(expected_status='verifying')
+    )
+
+    assert outcome is None
+    assert repository.promoted_bundle is bundle
+    assert repository.advanced is None
 
 
 def test_worker_refuses_to_claim_when_queue_and_backup_database_identities_differ():

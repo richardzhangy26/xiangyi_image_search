@@ -20,8 +20,8 @@ NOW = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
 def _valid_raw(**overrides):
     payload = dict(
         result="valid",
-        verified_at=NOW - timedelta(hours=1),
-        expires_at=NOW + timedelta(hours=12),
+        verified_at=NOW - timedelta(minutes=30),
+        expires_at=NOW + timedelta(minutes=30),
         summary="ok",
         parse_error=False,
     )
@@ -93,6 +93,34 @@ def test_expired_and_future_verified_at():
     })
     snap = PurgeSafetyGate(source, clock=lambda: NOW).evaluate()
     assert {c.id: c.status for c in snap.conditions}["object_protection"] == "unknown"
+
+
+def test_condition_specific_max_freshness_cannot_be_extended_by_publisher():
+    too_old = DictGateEvidenceSource({
+        **_all_valid(),
+        "instant_restore_point_capability": _valid_raw(
+            verified_at=NOW - timedelta(minutes=61),
+            expires_at=NOW + timedelta(minutes=1),
+        ),
+    })
+    statuses = {
+        item.id: item.status
+        for item in PurgeSafetyGate(too_old, clock=lambda: NOW).evaluate().conditions
+    }
+    assert statuses["instant_restore_point_capability"] == "expired"
+
+    too_long = DictGateEvidenceSource({
+        **_all_valid(),
+        "object_protection": _valid_raw(
+            verified_at=NOW,
+            expires_at=NOW + timedelta(hours=25),
+        ),
+    })
+    statuses = {
+        item.id: item.status
+        for item in PurgeSafetyGate(too_long, clock=lambda: NOW).evaluate().conditions
+    }
+    assert statuses["object_protection"] == "failed"
 
 
 def test_nested_secret_key_is_parse_error(tmp_path: Path):

@@ -7,8 +7,9 @@ db.session 或独立 Session 连接交叉并发，不触碰真实 OSS。
 from __future__ import annotations
 
 import uuid
+import re
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
@@ -18,7 +19,9 @@ from models import ImageAsset, PurgeBatch, PurgeBatchItem, PurgeObjectFence, db
 from services.formal_purge import FormalPurgeRepository, FormalPurgeWorker
 from services.object_binding_fence import ObjectBindingFenceService
 from services.purge_object_fence import ObjectIdentity
+from services.purge_object_storage import DeletionObservation, FormalObjectObservation
 from services.vector_search import VectorSearchService
+from test_support.formal_grant import StaticFormalCapability, formal_grant_for
 
 
 def _asset(color='red'):
@@ -41,6 +44,8 @@ def _batch_item(asset):
         actor_id='admin', idempotency_key=f'key.{uuid.uuid4().hex}',
         request_fingerprint_sha256='a' * 64, confirmation_text='永久删除 1 张',
         status='pending_deletion', retain_until=datetime.now() + timedelta(days=1),
+        database_backup_id='purge-test', database_manifest_sha256='d' * 64,
+        object_manifest_sha256='e' * 64,
     )
     item = PurgeBatchItem(
         batch=batch, target_asset_id=asset.id, ordinal=0,
@@ -66,9 +71,13 @@ def _seed(assets, batch, item):
 def _sessions(app):
     with app.app_context():
         created = []
+        schema_name = db.session.execute(text('SELECT current_schema()')).scalar_one()
+        assert re.fullmatch(r'[a-z0-9_]+', schema_name)
 
         def Session():
             session = sessionmaker(bind=db.engine)()
+            session.execute(text(f'SET search_path TO "{schema_name}", public'))
+            session.commit()
             created.append(session)
             return session
 
@@ -80,18 +89,44 @@ def _sessions(app):
             db.session.remove()
 
 
-class Capability:
-    def evaluate(self):
-        return True
-
-
 class RecordingDeleter:
-    def __init__(self):
+    def __init__(self, item):
+        self.item = item
         self.calls = []
+        self.deleted = set()
 
-    def delete_if_present(self, key):
-        self.calls.append(key)
-        return 'deleted'
+    def observe(self, key):
+        if key in self.deleted:
+            return None
+        operation = 'original' if key == self.item.original_formal_key else 'preview'
+        return _observation(self.item, operation)
+
+    def delete(self, authorization):
+        self.calls.append(authorization.formal_key)
+        self.deleted.add(authorization.formal_key)
+        return DeletionObservation(
+            result='deleted', before=authorization.observation,
+            deleted_at=datetime.now(timezone.utc), after_missing=True,
+        )
+
+
+def _observation(item, operation_kind):
+    return FormalObjectObservation(
+        formal_bucket=item.formal_bucket,
+        formal_key=(
+            item.original_formal_key
+            if operation_kind == 'original'
+            else item.preview_formal_key
+        ),
+        size=1,
+        sha256=(
+            item.original_backup_sha256
+            if operation_kind == 'original'
+            else item.preview_backup_sha256
+        ),
+        etag=f'etag-{operation_kind}',
+        observed_at=datetime.now(timezone.utc),
+    )
 
 
 def test_held_binding_lease_blocks_authorize_until_released(concurrent_app):
@@ -101,7 +136,7 @@ def test_held_binding_lease_blocks_authorize_until_released(concurrent_app):
         _seed([asset], batch, item)
         repo = FormalPurgeRepository(db.session, manifest_validator=lambda _b, _i: True)
         claim = repo.claim_next_item()
-        assert repo.checkpoint(claim, 'original_delete_started') is True
+        grant = formal_grant_for(batch, item)
 
         binding_session = Session()
         lease = ObjectBindingFenceService(binding_session).acquire(
@@ -113,8 +148,11 @@ def test_held_binding_lease_blocks_authorize_until_released(concurrent_app):
         )
         try:
             # 活绑定租约必须阻止删除授权（authorize 在完整集合锁内复核绑定围栏）。
-            assert repo.authorize_delete_call(
-                claim, 'original_delete_started', {'verified': True}, 'original',
+            assert repo.begin_delete_intent(
+                claim,
+                operation_kind='original',
+                observation=_observation(item, 'original'),
+                grant=grant,
             ) is None
             # 围栏仍归绑定方；没有部分 purge fence 被提交。
             observer = Session()
@@ -128,10 +166,13 @@ def test_held_binding_lease_blocks_authorize_until_released(concurrent_app):
             ) is True
             releaser.close()
 
-        authorized = repo.authorize_delete_call(
-            claim, 'original_delete_started', {'verified': True}, 'original',
+        authorized = repo.begin_delete_intent(
+            claim,
+            operation_kind='original',
+            observation=_observation(item, 'original'),
+            grant=grant,
         )
-        assert authorized is not None and len(authorized) == 2
+        assert authorized is not None and len(authorized.fence_ids) == 2
 
 
 def test_expired_claim_takeover_on_second_session_zero_stale_deleter_calls(concurrent_app):
@@ -154,28 +195,38 @@ def test_expired_claim_takeover_on_second_session_zero_stale_deleter_calls(concu
         takeover_repo = FormalPurgeRepository(
             takeover_session, manifest_validator=lambda _b, _i: True,
         )
+        grant = formal_grant_for(batch, item)
         # 旧 token 的 checkpoint/authorize 都被 CAS 拒绝，授权门先于任何外部删除。
         assert takeover_repo.checkpoint(stale_claim, 'original_delete_started') is False
-        assert takeover_repo.authorize_delete_call(
-            stale_claim, 'original_delete_started', {'verified': True}, 'original',
+        assert takeover_repo.begin_delete_intent(
+            stale_claim,
+            operation_kind='original',
+            observation=_observation(item, 'original'),
+            grant=grant,
         ) is None
 
         # 第二会话 worker 经 claim_next_item 接管过期 in_progress（generation+1、
         # 换 token）并正常完成；删除调用恰来自新租约的一次合法运行。
-        fresh_deleter = RecordingDeleter()
+        fresh_deleter = RecordingDeleter(item)
+        worker_session = Session()
         worker = FormalPurgeWorker(
             repository=FormalPurgeRepository(
-                takeover_session, manifest_validator=lambda _b, _i: True,
+                worker_session, manifest_validator=lambda _b, _i: True,
             ),
-            capability=Capability(), deleter=fresh_deleter,
+            capability=StaticFormalCapability(grant),
+            capability_context=grant.context,
+            deleter=fresh_deleter,
         )
         assert worker.process_one_item() is True
         assert sorted(fresh_deleter.calls) == sorted([original_key, preview_key])
         observer = Session()
         assert observer.query(ImageAsset).filter_by(id=asset_id).count() == 0
         # 接管后旧 claim 再尝试授权仍为 None（token/generation 已换代）。
-        assert takeover_repo.authorize_delete_call(
-            stale_claim, 'original_delete_started', {'verified': True}, 'original',
+        assert takeover_repo.begin_delete_intent(
+            stale_claim,
+            operation_kind='original',
+            observation=_observation(item, 'original'),
+            grant=grant,
         ) is None
 
 
@@ -203,11 +254,23 @@ def test_finalization_commit_failure_rolls_back_and_retry_finalizes(concurrent_a
         wrapped = _OnceFailingCommit(db.session)
         repo = FormalPurgeRepository(wrapped, manifest_validator=lambda _b, _i: True)
         claim = repo.claim_next_item()
-        assert repo.checkpoint(claim, 'original_delete_started') is True
-        assert repo.authorize_delete_call(
-            claim, 'original_delete_started', {'verified': True}, 'original',
+        grant = formal_grant_for(batch, item)
+        authorization = repo.begin_delete_intent(
+            claim,
+            operation_kind='original',
+            observation=_observation(item, 'original'),
+            grant=grant,
         )
-        assert repo.checkpoint(claim, 'original_deleted') is True
+        assert authorization is not None
+        executing = repo.start_delete_call(authorization)
+        assert executing is not None
+        assert repo.complete_delete_call(
+            executing,
+            DeletionObservation(
+                result='deleted', before=authorization.observation,
+                deleted_at=datetime.now(timezone.utc), after_missing=True,
+            ),
+        ) is True
         assert repo.checkpoint(claim, 'preview_shared') is True
 
         armed_commit = wrapped
@@ -244,12 +307,14 @@ def test_deleted_asset_permanently_absent_from_vector_search(concurrent_app):
         _seed([target, decoy], batch, item)
         target_id, decoy_id = str(target.id), str(decoy.id)
 
+        grant = formal_grant_for(batch, item)
         worker = FormalPurgeWorker(
             repository=FormalPurgeRepository(
                 db.session, manifest_validator=lambda _b, _i: True,
             ),
-            capability=Capability(),
-            deleter=RecordingDeleter(),
+            capability=StaticFormalCapability(grant),
+            capability_context=grant.context,
+            deleter=RecordingDeleter(item),
         )
         assert worker.process_one_item() is True
         db.session.remove()

@@ -33,6 +33,13 @@ FORBIDDEN_EVIDENCE_KEYS = frozenset({
 })
 _SUMMARY_MAX_CHARS = 200
 _FUTURE_SKEW = timedelta(seconds=60)
+CONDITION_MAX_AGES = {
+    "daily_postgres_backup": timedelta(hours=26),
+    "instant_restore_point_capability": timedelta(minutes=60),
+    "object_protection": timedelta(hours=24),
+    "independent_backup_credentials": timedelta(hours=24),
+    "recovery_drill": timedelta(hours=24),
+}
 
 
 @dataclass(frozen=True)
@@ -164,6 +171,17 @@ def _classify(condition_id: str, raw: RawConditionEvidence | None, now: datetime
             expires_at=expires_at,
             summary=_clip_summary(raw.summary),
         )
+    maximum_age = CONDITION_MAX_AGES[condition_id]
+    if now - verified_at > maximum_age:
+        return ConditionSnapshot(
+            id=condition_id,
+            status="expired",
+            checked_at=verified_at,
+            expires_at=expires_at,
+            summary=_clip_summary(raw.summary),
+        )
+    if expires_at <= verified_at or expires_at - verified_at > maximum_age:
+        return _failed(condition_id, raw.summary)
     if expires_at <= now:
         return ConditionSnapshot(
             id=condition_id,

@@ -18,6 +18,7 @@ from services.purge_pipeline_capability import (
     FilePurgePipelineCapabilitySource,
     UnavailablePurgePipelineCapabilitySource,
 )
+from services.fence_composition import validate_formal_writer_deployment
 # 数据库配置（本地 PostgreSQL + pgvector）
 # 优先使用 DATABASE_URL 完整连接串，否则由 DB_* 环境变量拼接
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -38,6 +39,11 @@ def create_app(config_name='development'):
         level=os.getenv('LOG_LEVEL', 'INFO'),
         format='%(asctime)s %(levelname)s %(name)s %(message)s',
     )
+
+    # T14 fail-closed deployment gate: if any environment claims formal
+    # deletion is deployed, every HTTP formal-object writer must fence before
+    # the Flask app can even start accepting requests.
+    validate_formal_writer_deployment(os.environ)
 
     app = Flask(__name__)
 

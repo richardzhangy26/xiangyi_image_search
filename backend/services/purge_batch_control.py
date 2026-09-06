@@ -133,6 +133,10 @@ class PurgeBatchControlService:
                 .join(PurgeBatch, PurgeBatch.id == PurgeBatchItem.batch_id)
                 .where(PurgeBatchItem.target_asset_id.in_(lock_ids))
                 .where(PurgeBatch.status != 'cancelled')
+                .where(or_(
+                    PurgeBatchItem.result_code.is_(None),
+                    PurgeBatchItem.result_code != 'reprotected',
+                ))
                 .limit(1)
             ).scalar_one_or_none()
             if held is not None:
@@ -170,34 +174,80 @@ class PurgeBatchControlService:
             self.session.rollback()
             raise
 
-    def advance_verified_to_pending_if_current(self, batch_id, *, authorizations, manifest_sha256):
-        """Only complete verified item authorizations may enter pending_deletion."""
+    def advance_verified_to_pending_if_current(self, bundle):
+        """Atomically persist one complete typed authorization bundle."""
         from models import ImageAsset, PurgeBatch, PurgeBatchItem
+        from services.purge_formal_authorization import (
+            FormalPurgeAuthorizationBundle,
+        )
+
+        if not isinstance(bundle, FormalPurgeAuthorizationBundle):
+            raise TypeError('typed formal authorization bundle is required')
 
         try:
             batch = self.session.execute(
-                select(PurgeBatch).where(PurgeBatch.id == batch_id, PurgeBatch.status == 'verifying').with_for_update()
+                select(PurgeBatch).where(
+                    PurgeBatch.id == bundle.purge_batch_id,
+                    PurgeBatch.status == 'verifying',
+                ).with_for_update()
             ).scalar_one_or_none()
-            if batch is None or batch.object_manifest_sha256 != manifest_sha256:
+            if (
+                batch is None
+                or batch.database_backup_id != bundle.database_backup_id
+                or batch.database_manifest_sha256 != bundle.database_manifest_sha256
+                or batch.object_manifest_sha256 != bundle.manifest_sha256
+                or batch.retain_until is None
+                or batch.retain_until != bundle.retain_until.replace(tzinfo=None)
+            ):
                 raise ValueError('verified batch/manifest mismatch')
             items = self.session.execute(
                 select(PurgeBatchItem).where(PurgeBatchItem.batch_id == batch.id).order_by(PurgeBatchItem.ordinal).with_for_update()
             ).scalars().all()
-            if set(authorizations) != {item.target_asset_id for item in items}:
+            authorizations = {
+                authorization.target_asset_id: authorization
+                for authorization in bundle.items
+            }
+            if (
+                len(authorizations) != len(bundle.items)
+                or set(authorizations) != {item.target_asset_id for item in items}
+            ):
                 raise ValueError('incomplete item authorization')
             for item in items:
                 asset = self.session.execute(
                     select(ImageAsset).where(ImageAsset.id == item.target_asset_id, ImageAsset.status == 'archived').with_for_update()
                 ).scalar_one_or_none()
                 auth = authorizations[item.target_asset_id]
-                required = ('original_formal_key', 'original_backup_object_id', 'original_backup_sha256', 'preview_formal_key', 'authorization_retain_until')
-                if asset is None or any(not auth.get(field) for field in required):
+                required = (
+                    auth.formal_bucket,
+                    auth.original_formal_key,
+                    auth.original_backup_object_id,
+                    auth.original_backup_sha256,
+                    auth.preview_formal_key,
+                    auth.authorization_retain_until,
+                )
+                if asset is None or any(not value for value in required):
                     raise ValueError('incomplete item authorization')
-                if asset.oss_path != auth['original_formal_key'] or asset.preview_oss_path != auth['preview_formal_key']:
+                if auth.preview_delete_authorized and (
+                    not auth.preview_backup_object_id
+                    or not auth.preview_backup_sha256
+                ):
+                    raise ValueError('incomplete preview authorization')
+                if (
+                    asset.oss_path != auth.original_formal_key
+                    or asset.preview_oss_path != auth.preview_formal_key
+                ):
                     raise ValueError('asset identity mismatch')
-                for field, value in auth.items():
-                    if hasattr(item, field):
-                        setattr(item, field, value)
+                item.formal_bucket = auth.formal_bucket
+                item.original_formal_key = auth.original_formal_key
+                item.original_backup_object_id = auth.original_backup_object_id
+                item.original_backup_sha256 = auth.original_backup_sha256
+                item.preview_formal_key = auth.preview_formal_key
+                item.preview_backup_object_id = auth.preview_backup_object_id
+                item.preview_backup_sha256 = auth.preview_backup_sha256
+                item.preview_delete_authorized = auth.preview_delete_authorized
+                item.authorization_retain_until = (
+                    auth.authorization_retain_until.replace(tzinfo=None)
+                )
                 item.status = 'pending'
                 item.checkpoint = 'pending'
             batch.status = 'pending_deletion'

@@ -64,6 +64,7 @@ class FilePurgePipelineCapabilitySource:
             and isinstance(payload['summary'], str)
             and verified_at is not None
             and expires_at is not None
+            and verified_at <= now.astimezone(timezone.utc) + timedelta(seconds=60)
             and expires_at > now.astimezone(timezone.utc)
             and expires_at <= verified_at + timedelta(seconds=CAPABILITY_TTL_SECONDS)
         )

@@ -8,6 +8,8 @@ disabled the factories behave exactly as before (no fence kwargs).
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from contextlib import contextmanager
 
 from sqlalchemy.orm import sessionmaker
@@ -16,6 +18,23 @@ from services.object_binding_fence import ObjectBindingFenceService
 from services.purge_object_fence import PurgeObjectFenceService
 
 _TRUE_VALUES = ('1', 'true', 'yes', 'on')
+FORMAL_OBJECT_WRITER_INVENTORY = (
+    'http:image_assets.import',
+    'http:image_imports.queue',
+    'http:products.create_update',
+    'operator:kodo_migration',
+    'worker:image_import_promotion',
+    'worker:import_cleanup',
+)
+
+
+def formal_writer_inventory_sha256() -> str:
+    canonical = json.dumps(
+        FORMAL_OBJECT_WRITER_INVENTORY,
+        ensure_ascii=True,
+        separators=(',', ':'),
+    ).encode('ascii')
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def fence_capability_enabled(values) -> bool:
@@ -25,6 +44,14 @@ def fence_capability_enabled(values) -> bool:
     return str(raw).strip().lower() in _TRUE_VALUES
 
 
+def validate_formal_writer_deployment(values) -> None:
+    deployed = str(
+        values.get('PURGE_FORMAL_DELETION_DEPLOYED', '0')
+    ).strip().lower() in _TRUE_VALUES
+    if deployed and not fence_capability_enabled(values):
+        raise ValueError('formal deployment requires binding fence on every writer')
+
+
 def binding_fence_kwargs(values) -> dict:
     """返回入库服务构造围栏 kwargs；未启用时返回空 dict（行为与今日一致）。
 
@@ -32,7 +59,9 @@ def binding_fence_kwargs(values) -> dict:
     围栏自带 session 在 control-factory 模式下不被使用，但仍注入 db.session
     以兼容未启用/回退路径，组合方式与 import worker/cleanup 一致。
     """
-    if not fence_capability_enabled(values):
+    validate_formal_writer_deployment(values)
+    fence_enabled = fence_capability_enabled(values)
+    if not fence_enabled:
         return {}
     formal_bucket = str(values.get('OSS_BUCKET_NAME') or '').strip()
     if not formal_bucket:

@@ -324,3 +324,115 @@ def test_import_queue_duplicate_content_same_request(concurrent_app):
             assert _fence_state_summary(observer) == {
                 'total': 3, 'held': 0, 'completed': 3, 'failed': 0,
             }
+
+
+def test_product_update_mixes_committed_existing_and_new_image_with_fences(concurrent_app):
+    """N2：existing 早退与新写入必须共享安全 request transaction。"""
+    with concurrent_app.app_context():
+        concurrent_app.config['IMAGE_INGEST_EMBEDDING'] = FakeEmbedding()
+        with _fenced_app(concurrent_app) as (storage, Session):
+            client = concurrent_app.test_client()
+            created = client.post(
+                '/api/products',
+                data={
+                    'product': json.dumps({'model_number': 'FENCE-MIXED'}),
+                    'images': _multipart_images([
+                        ('existing.png', _png_bytes('red')),
+                    ]),
+                },
+                content_type='multipart/form-data',
+            )
+            assert created.status_code == 201, created.get_json()
+            initial_puts = tuple(storage.put_calls)
+            observer = Session()
+            existing = observer.query(ImageAsset).one()
+            existing_vector = list(existing.vector)
+            existing_source = (
+                existing.source_provider,
+                existing.source_bucket,
+                existing.source_relative_path,
+                existing.source_revision,
+            )
+            observer.close()
+
+            updated = client.put(
+                '/api/products/FENCE-MIXED',
+                data={
+                    'product': json.dumps({'category': 'mixed'}),
+                    'images': _multipart_images([
+                        ('existing.png', _png_bytes('red')),
+                        ('new.png', _png_bytes('green')),
+                    ]),
+                },
+                content_type='multipart/form-data',
+            )
+
+            assert updated.status_code == 200, updated.get_json()
+            final = Session()
+            assets = final.query(ImageAsset).order_by(ImageAsset.source_relative_path).all()
+            assert len(assets) == 2
+            unchanged = next(row for row in assets if row.id == existing.id)
+            assert list(unchanged.vector) == existing_vector
+            assert (
+                unchanged.source_provider,
+                unchanged.source_bucket,
+                unchanged.source_relative_path,
+                unchanged.source_revision,
+            ) == existing_source
+            assert tuple(storage.put_calls[:len(initial_puts)]) == initial_puts
+            assert len(storage.put_calls) == 4
+            assert _fence_state_summary(final)['held'] == 0
+
+
+def test_import_queue_mixes_committed_existing_and_new_item_with_fences(concurrent_app):
+    with concurrent_app.app_context():
+        with _fenced_app(concurrent_app) as (storage, Session):
+            client = concurrent_app.test_client()
+            first = client.post(
+                '/api/image-imports',
+                data={
+                    'images': _multipart_images([
+                        ('existing.png', _png_bytes('red')),
+                    ]),
+                },
+                content_type='multipart/form-data',
+            )
+            assert first.status_code == 202, first.get_json()
+            initial = Session()
+            existing = initial.query(ImageImportItem).one()
+            existing_identity = (
+                existing.id,
+                existing.source_provider,
+                existing.source_bucket,
+                existing.source_relative_path,
+                existing.source_revision,
+                existing.content_hash,
+            )
+            initial.close()
+
+            mixed = client.post(
+                '/api/image-imports',
+                data={
+                    'images': _multipart_images([
+                        ('existing.png', _png_bytes('red')),
+                        ('new.png', _png_bytes('green')),
+                    ]),
+                },
+                content_type='multipart/form-data',
+            )
+
+            assert mixed.status_code in (200, 202), mixed.get_json()
+            final = Session()
+            rows = final.query(ImageImportItem).order_by(ImageImportItem.created_at).all()
+            assert len(rows) == 2
+            unchanged = final.get(ImageImportItem, existing_identity[0])
+            assert (
+                unchanged.id,
+                unchanged.source_provider,
+                unchanged.source_bucket,
+                unchanged.source_relative_path,
+                unchanged.source_revision,
+                unchanged.content_hash,
+            ) == existing_identity
+            assert len(storage.put_calls) == 4
+            assert _fence_state_summary(final)['held'] == 0

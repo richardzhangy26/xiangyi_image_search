@@ -231,6 +231,10 @@ def restore_image_assets(
             .join(PurgeBatch, PurgeBatch.id == PurgeBatchItem.batch_id)
             .where(PurgeBatchItem.target_asset_id.in_([asset.id for asset in locked]))
             .where(PurgeBatch.status != 'cancelled')
+            .where(or_(
+                PurgeBatchItem.result_code.is_(None),
+                PurgeBatchItem.result_code != 'reprotected',
+            ))
             .order_by(PurgeBatchItem.target_asset_id, PurgeBatch.id)
         ).first()
         if blocking:
